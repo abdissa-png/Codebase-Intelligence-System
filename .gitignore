@@ -1,0 +1,18 @@
+# Local Cargo cache (sandbox / CI without ~/.cargo write)
+.cargo-home/
+target/
+**/*.rs.bk
+
+# Runtime / local state
+.cis
+.env
+.venv-embed
+.tei-data
+.tei_data
+
+# Test fixtures are cloned in CI (see .github/workflows/cis-ci.yml)
+fixtures/
+
+# Python helpers
+__pycache__/
+*.pyc

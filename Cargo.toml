@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["cis-wal", "cis-core", "cis-mcp"]
