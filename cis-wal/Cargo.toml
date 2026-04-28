@@ -1,0 +1,10 @@
+[package]
+name = "cis-wal"
+version = "0.1.0"
+edition = "2021"
+description = "Write-ahead log and mutation-phase tracking (CIS Architecture v2.6)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
