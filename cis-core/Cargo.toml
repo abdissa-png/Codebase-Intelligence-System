@@ -1,0 +1,36 @@
+[package]
+name = "cis-core"
+version = "0.1.0"
+edition = "2021"
+description = "CIS graph, KV, coordinator, recovery (Architecture v2.6)"
+
+[features]
+default = []
+# FR-1.1 — native Python defs via Tree-sitter (`.cis/grammar.lock`); default path stays regex.
+tree-sitter = ["dep:tree-sitter", "dep:tree-sitter-python"]
+# Phase 2 — inotify/kqueue FS watch (falls back to mtime polling when disabled).
+fs-notify = ["dep:notify"]
+# Phase 6 — external HTTP embedding API (OpenAI-compatible `/v1/embeddings`).
+api-embeddings = ["dep:minreq"]
+# Phase 7 — optional SQLite body blob backend (default: files under `.cis/bodies/`).
+body-sqlite = ["dep:rusqlite"]
+# Test-only alias (dev-dependencies cannot enable optional deps directly in all cases).
+test-body-sqlite = ["body-sqlite"]
+
+[dependencies]
+cis-wal = { path = "../cis-wal" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.8.26"
+thiserror = "1"
+regex = "1"
+diffy = "0.4"
+tree-sitter = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+notify = { version = "6", optional = true }
+minreq = { version = "=2.7.0", optional = true, features = ["https-rustls"] }
+rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "=3.13"
