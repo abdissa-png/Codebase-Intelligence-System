@@ -1,0 +1,516 @@
+//! **`cisd`** — CIS daemon: background policy / merge TTL / vector cleanup, optional **`--mcp`** stdio server.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use cis_core::{
+    cis_dir, embedder_from_env, kv_snapshot_path, load_env_file, load_kv_snapshot,
+    open_persisted_coordinator, ActiveRankingPolicy, BodyStore,
+    CisDaemonHandles, CisMcpRuntime, EmbeddingWorker, MemoryKv, MergeRecoveryGate,
+    MergeSagaOrchestrator, PolicyFileReloader, PolicyReloadOutcome, VectorCleanupQueue,
+    VectorCleanupWorker, disk_free_percent, sweep_all_expired_merge_intents,
+};
+use cis_mcp::{build_runtime, run_stdio};
+
+fn policy_path() -> PathBuf {
+    std::env::var_os("CIS_POLICY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".cis/ranking_policy.yaml"))
+}
+
+fn vector_dlq() -> Arc<VectorCleanupQueue> {
+    if let Some(p) = std::env::var_os("CIS_VECTOR_DLQ_PATH") {
+        match VectorCleanupQueue::open_persistent(PathBuf::from(p)) {
+            Ok(q) => return Arc::new(q),
+            Err(e) => {
+                eprintln!(
+                    "cisd: CIS_VECTOR_DLQ_PATH open failed, using in-memory DLQ: {}",
+                    e
+                );
+            }
+        }
+    }
+    Arc::new(VectorCleanupQueue::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_background_threads(
+    coord: Arc<cis_core::WriteCoordinator>,
+    kv: Arc<MemoryKv>,
+    saga: Arc<MergeSagaOrchestrator>,
+    reloader: Option<Arc<PolicyFileReloader>>,
+    default_merge_ttl_hours: u32,
+    dlq: Arc<VectorCleanupQueue>,
+    handles: CisDaemonHandles,
+    repo_root: PathBuf,
+    merge_control: Arc<cis_core::MergeControl>,
+    body_store: Arc<BodyStore>,
+) {
+    let cleaner = VectorCleanupWorker::new(Arc::clone(&dlq));
+    let _gate = MergeRecoveryGate::new(Arc::clone(&kv));
+    let audit_epoch = Arc::clone(&handles.audit);
+    let kv_epoch = Arc::clone(&kv);
+    let worker_hb = Arc::clone(&handles.worker_heartbeats);
+    let embed_metrics = Arc::clone(&handles.embedding_metrics);
+    let last_consistency = handles.last_consistency.clone();
+    std::thread::Builder::new()
+        .name("cis-audit-epoch".into())
+        .spawn(move || loop {
+            worker_hb.tick("cis-audit-epoch");
+            if let Some(digest) = audit_epoch.maybe_seal_epoch(&kv_epoch) {
+                eprintln!("cisd: audit epoch sealed digest={digest}");
+            }
+            std::thread::sleep(Duration::from_secs(300));
+        })
+        .expect("spawn audit epoch");
+
+    let coord_wal = Arc::clone(&coord);
+    let kv_wal = Arc::clone(&kv);
+    let saga_wal = Arc::clone(&saga);
+    let audit_wal = Arc::clone(&handles.audit);
+    let gate_wal = MergeRecoveryGate::new(Arc::clone(&kv));
+    let wal_sched = handles.wal_compaction.clone();
+    let policy_wal = reloader.clone();
+    let disk_flag_wal = Arc::clone(&handles.disk_pressure);
+    let worker_hb_wal = Arc::clone(&handles.worker_heartbeats);
+    std::thread::Builder::new()
+        .name("cis-wal-compaction".into())
+        .spawn(move || loop {
+            worker_hb_wal.tick("cis-wal-compaction");
+            let wal_max = policy_wal
+                .as_ref()
+                .map(|r| r.active().snapshot().wal_max_bytes)
+                .unwrap_or(256 * 1024 * 1024);
+            if let Some(rep) = wal_sched.run_once(
+                coord_wal.wal().as_ref(),
+                wal_max,
+                &kv_wal,
+                &saga_wal,
+                &gate_wal,
+                &audit_wal,
+            ) {
+                eprintln!(
+                    "cisd: wal_compaction dropped={} freed_est={}",
+                    rep.records_dropped, rep.bytes_estimated_freed
+                );
+            }
+            let interval = if disk_flag_wal.disk_pressure() {
+                Duration::from_secs(60)
+            } else {
+                wal_sched.interval
+            };
+            std::thread::sleep(interval);
+        })
+        .expect("spawn wal compaction");
+
+    let coord_rec = Arc::clone(&coord);
+    let kv_rec = Arc::clone(&kv);
+    let saga_rec = Arc::clone(&saga);
+    let audit_rec = Arc::clone(&handles.audit);
+    let gate_rec = MergeRecoveryGate::new(Arc::clone(&kv));
+    let periodic = handles.periodic_reconciler.clone();
+    let merge_ctl = Arc::clone(&merge_control);
+    let body_rec = Arc::clone(&body_store);
+    let worker_hb_rec = Arc::clone(&handles.worker_heartbeats);
+    let last_consistency_rec = last_consistency.clone();
+    std::thread::Builder::new()
+        .name("cis-periodic-reconciler".into())
+        .spawn(move || loop {
+            worker_hb_rec.tick("cis-periodic-reconciler");
+            let branches: Vec<cis_wal::BranchId> = kv_rec
+                .scan_prefix("branch_reg:")
+                .into_iter()
+                .filter_map(|(_k, v)| {
+                    if v.len() == 16 {
+                        let mut b = [0u8; 16];
+                        b.copy_from_slice(&v);
+                        Some(cis_wal::BranchId(b))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let rep = periodic.run_once(
+                &coord_rec,
+                &saga_rec,
+                &kv_rec,
+                &merge_ctl,
+                &body_rec,
+                &gate_rec,
+                &audit_rec,
+                &branches,
+                Some(&last_consistency_rec),
+            );
+            if rep.sagas_compensated > 0 || rep.wal_replayed > 0 {
+                eprintln!("cisd: periodic_reconcile {:?}", rep);
+            }
+            std::thread::sleep(periodic.interval);
+        })
+        .expect("spawn periodic reconciler");
+
+    let coord_gc = Arc::clone(&coord);
+    let kv_gc = Arc::clone(&kv);
+    let dlq_gc = Arc::clone(&dlq);
+    let delete_q = Arc::clone(&handles.graph_delete_queue);
+    let audit_gc = Arc::clone(&handles.audit);
+    let tombstone = handles.tombstone_gc.clone();
+    let policy_gc = reloader.clone();
+    let disk_flag = Arc::clone(&handles.disk_pressure);
+    let worker_hb_gc = Arc::clone(&handles.worker_heartbeats);
+    std::thread::Builder::new()
+        .name("cis-tombstone-gc".into())
+        .spawn(move || loop {
+            worker_hb_gc.tick("cis-tombstone-gc");
+            let policy = policy_gc
+                .as_ref()
+                .map(|r| r.active().snapshot())
+                .unwrap_or_else(|| cis_core::RankingPolicy::default().snapshot());
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let branch = cis_wal::BranchId([0u8; 16]);
+            let eligible = tombstone.scan_eligible(
+                coord_gc.graph(),
+                &kv_gc,
+                &coord_gc,
+                &policy,
+                now_ms,
+            );
+            if !eligible.is_empty() {
+                tombstone.enqueue_deletes(&eligible, &delete_q, branch);
+                audit_gc.record_sync(
+                    0,
+                    format!("tombstone_gc_scan eligible={}", eligible.len()),
+                );
+            }
+            let mut fail_streak = 0u32;
+            loop {
+                let rep = tombstone.drain_batch(
+                    coord_gc.graph(),
+                    &kv_gc,
+                    &dlq_gc,
+                    &delete_q,
+                    32,
+                );
+                if rep.attempted == 0 {
+                    break;
+                }
+                if rep.requeued > 0 {
+                    fail_streak = fail_streak.saturating_add(1);
+                    std::thread::sleep(Duration::from_millis(
+                        VectorCleanupWorker::next_backoff_ms(fail_streak.min(8), 30_000),
+                    ));
+                } else {
+                    fail_streak = 0;
+                }
+            }
+            let interval = if disk_flag.disk_pressure() {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_secs(1800)
+            };
+            std::thread::sleep(interval);
+        })
+        .expect("spawn tombstone gc");
+
+    let disk_flag_mon = Arc::clone(&handles.disk_pressure);
+    let policy_disk = reloader.clone();
+    let data_dir = repo_root.join(".cis");
+    let worker_hb_disk = Arc::clone(&handles.worker_heartbeats);
+    std::thread::Builder::new()
+        .name("cis-disk-monitor".into())
+        .spawn(move || loop {
+            worker_hb_disk.tick("cis-disk-monitor");
+            let min_free = policy_disk
+                .as_ref()
+                .map(|r| r.active().snapshot().disk_min_free_pct as f64)
+                .unwrap_or(10.0);
+            let free_pct = disk_free_percent(&data_dir);
+            let under = free_pct < min_free;
+            let was = disk_flag_mon.disk_pressure();
+            disk_flag_mon.set_disk_pressure(under);
+            if under && !was {
+                eprintln!(
+                    "cisd: disk pressure ON (free={free_pct:.1}% < min={min_free}%)"
+                );
+            } else if !under && was {
+                eprintln!("cisd: disk pressure OFF (free={free_pct:.1}%)");
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        })
+        .expect("spawn disk monitor");
+
+    let kv_merge = Arc::clone(&kv);
+    let merge_ttl_reloader = reloader.clone();
+    let worker_hb_merge = Arc::clone(&handles.worker_heartbeats);
+    std::thread::Builder::new()
+        .name("cis-merge-ttl-sweep".into())
+        .spawn(move || {
+            loop {
+                worker_hb_merge.tick("cis-merge-ttl-sweep");
+                let ttl_hours = merge_ttl_reloader
+                    .as_ref()
+                    .map(|r| r.active().snapshot().merge_ttl_hours)
+                    .unwrap_or(default_merge_ttl_hours);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let n = sweep_all_expired_merge_intents(kv_merge.as_ref(), now_ms, ttl_hours);
+                if n > 0 {
+                    eprintln!("cisd: merge_ttl_sweep released {} stale merge lock(s)", n);
+                }
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        })
+        .expect("spawn merge ttl sweep");
+
+    let coord_bg = Arc::clone(&coord);
+    let worker_hb_vec = Arc::clone(&handles.worker_heartbeats);
+    std::thread::Builder::new()
+        .name("cis-vector-cleanup".into())
+        .spawn(move || {
+            let mut fail_streak: u32 = 0;
+            loop {
+                worker_hb_vec.tick("cis-vector-cleanup");
+                let rep = cleaner.drain_batch(coord_bg.vector_chunk_store(), 64);
+                let delay = if rep.attempted == 0 {
+                    fail_streak = 0;
+                    Duration::from_millis(500)
+                } else if rep.requeued > 0 {
+                    fail_streak = fail_streak.saturating_add(1);
+                    Duration::from_millis(VectorCleanupWorker::next_backoff_ms(
+                        fail_streak.min(8),
+                        30_000,
+                    ))
+                } else {
+                    fail_streak = 0;
+                    Duration::from_millis(250)
+                };
+                std::thread::sleep(delay);
+            }
+        })
+        .expect("spawn vector cleanup");
+
+    let coord_embed = Arc::clone(&coord);
+    let kv_embed = Arc::clone(&kv);
+    let vector_deg = Arc::clone(&handles.vector_degraded);
+    let embedder = embedder_from_env();
+    eprintln!(
+        "cisd: embedding worker model_id={} api={}",
+        embedder.model_id(),
+        cis_core::api_embedder_configured()
+    );
+    let worker_hb_embed = Arc::clone(&handles.worker_heartbeats);
+    std::thread::Builder::new()
+        .name("cis-embedding-worker".into())
+        .spawn(move || {
+            let body_store = BodyStore::new(Arc::clone(&kv_embed));
+            let mut fail_streak: u32 = 0;
+            loop {
+                worker_hb_embed.tick("cis-embedding-worker");
+                let rep = EmbeddingWorker::drain_batch(
+                    &coord_embed,
+                    embedder.as_ref(),
+                    &body_store,
+                    coord_embed.vector(),
+                    16,
+                );
+                embed_metrics.record_drain(rep);
+                vector_deg.set_queue_depth(coord_embed.embedding_queue_depth() as u64);
+                let delay = if rep.attempted == 0 {
+                    fail_streak = 0;
+                    Duration::from_millis(500)
+                } else if rep.requeued > 0 {
+                    fail_streak = fail_streak.saturating_add(1);
+                    Duration::from_millis(EmbeddingWorker::next_backoff_ms(
+                        fail_streak.min(8),
+                        30_000,
+                    ))
+                } else {
+                    fail_streak = 0;
+                    Duration::from_millis(250)
+                };
+                std::thread::sleep(delay);
+            }
+        })
+        .expect("spawn embedding worker");
+
+    if let Some(rel) = reloader {
+        let path = rel.path().to_path_buf();
+        let coord_policy = Arc::clone(&coord);
+        let worker_hb_policy = Arc::clone(&handles.worker_heartbeats);
+        std::thread::Builder::new()
+            .name("cis-policy-watch".into())
+            .spawn(move || {
+                let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                loop {
+                    worker_hb_policy.tick("cis-policy-watch");
+                    std::thread::sleep(Duration::from_secs(1));
+                    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    if mtime == last_mtime {
+                        continue;
+                    }
+                    last_mtime = mtime;
+                    match rel.reload_now() {
+                        PolicyReloadOutcome::Applied => {
+                            let snap = rel.active().snapshot();
+                            eprintln!(
+                                "cisd: ranking policy applied (version={})",
+                                rel.active().current_version_label()
+                            );
+                            coord_embed_policy_thresholds(&coord_policy, &snap);
+                        }
+                        PolicyReloadOutcome::RejectedInvalid(e) => {
+                            eprintln!("cisd: policy reload rejected (keeping prior): {}", e)
+                        }
+                        PolicyReloadOutcome::ReadError(e) => {
+                            eprintln!("cisd: policy read error: {}", e)
+                        }
+                    }
+                }
+            })
+            .expect("spawn policy watch");
+    }
+}
+
+fn coord_embed_policy_thresholds(coord: &cis_core::WriteCoordinator, policy: &cis_core::RankingPolicySnapshot) {
+    coord.set_embedding_queue_thresholds(policy.embedding_queue_hwm, policy.embedding_queue_lwm);
+}
+
+fn main() {
+    load_env_file(None);
+    let mcp_mode = std::env::args().any(|a| a == "--mcp" || a == "-mcp");
+
+    let path = policy_path();
+    let (_policy, reloader): (ActiveRankingPolicy, Option<Arc<PolicyFileReloader>>) =
+        if path.exists() {
+            match PolicyFileReloader::from_file(&path) {
+                Ok(r) => {
+                    let r = Arc::new(r);
+                    (r.active(), Some(r))
+                }
+                Err(e) => {
+                    eprintln!("cisd: cannot load policy {:?}: {:?}", path, e);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!(
+                "cisd: no policy file at {:?}; using built-in default (override with CIS_POLICY_PATH)",
+                path
+            );
+            (ActiveRankingPolicy::with_system_default(), None)
+        };
+
+    let version_label = _policy.current_version_label();
+    let policy_snap = _policy.snapshot();
+
+    let repo = std::env::var_os("CIS_REPO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let coord = match open_persisted_coordinator(&repo) {
+        Ok(c) => {
+            if let Some(dir) = c.persistence_dir() {
+                eprintln!("cisd: persistence at {:?}", dir);
+            }
+            c
+        }
+        Err(e) => {
+            eprintln!("cisd: cannot open persisted coordinator: {}", e);
+            std::process::exit(1);
+        }
+    };
+    coord.set_embedding_queue_thresholds(
+        policy_snap.embedding_queue_hwm,
+        policy_snap.embedding_queue_lwm,
+    );
+    let kv = Arc::new(MemoryKv::new());
+    let cis = cis_dir(&repo);
+    if cis.is_dir() {
+        let kpath = kv_snapshot_path(&cis);
+        if kpath.exists() {
+            if let Err(e) = load_kv_snapshot(&kpath, kv.as_ref()) {
+                eprintln!("cisd: kv snapshot load failed: {e}");
+            }
+        }
+    }
+    let saga = Arc::new(MergeSagaOrchestrator::new(Arc::clone(&kv)));
+    let rep = coord.reconcile_on_startup(saga.as_ref());
+    eprintln!("cisd: startup recovery {:?}", rep);
+
+    let handles = CisDaemonHandles::open(&repo, &policy_snap);
+    handles.audit.resume_from_kv(&kv);
+    let branches: Vec<cis_wal::BranchId> = kv
+        .scan_prefix("branch_reg:")
+        .into_iter()
+        .filter_map(|(_k, v)| {
+            if v.len() == 16 {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&v);
+                Some(cis_wal::BranchId(b))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let body_store_startup = BodyStore::new(Arc::clone(&kv));
+    let consistency = cis_core::check_consistency(
+        coord.graph(),
+        &kv,
+        &body_store_startup,
+        &branches,
+    );
+    let startup_now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    handles.last_consistency.update(&consistency, startup_now_ms);
+    if !consistency.is_clean() {
+        handles.audit.record_sync(0, format!("startup_consistency {}", consistency.summary()));
+        eprintln!("cisd: startup consistency check: {}", consistency.summary());
+    }
+    let merge_control = Arc::new(cis_core::MergeControl::new(Arc::clone(&kv)));
+    let body_store = Arc::new(BodyStore::new(Arc::clone(&kv)));
+
+    let dlq = vector_dlq();
+    spawn_background_threads(
+        Arc::clone(&coord),
+        Arc::clone(&kv),
+        saga,
+        reloader,
+        policy_snap.merge_ttl_hours,
+        Arc::clone(&dlq),
+        handles.clone(),
+        repo.clone(),
+        merge_control,
+        body_store,
+    );
+
+    if mcp_mode {
+        eprintln!(
+            "cisd: MCP stdio mode (policy_version={} dlq_depth={})",
+            version_label,
+            dlq.depth()
+        );
+        let rt = CisMcpRuntime::attach_coordinator(&repo, coord, kv, Some(handles));
+        let rt = build_runtime(Some(rt)).unwrap_or_else(|e| {
+            eprintln!("cisd: MCP bootstrap failed: {}", e);
+            std::process::exit(1);
+        });
+        if let Err(e) = run_stdio(rt) {
+            eprintln!("cisd: MCP stdio exited: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    eprintln!(
+        "cisd: ready policy_version={} vector_dlq_depth={} (Ctrl+C to exit; use --mcp for stdio MCP)",
+        version_label,
+        dlq.depth()
+    );
+    std::thread::park();
+}
