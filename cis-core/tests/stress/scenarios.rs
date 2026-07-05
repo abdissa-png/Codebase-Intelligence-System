@@ -249,10 +249,11 @@ pub fn scenario_merge_preflight_vs_speculative(h: &StressHarness, _cfg: &StressC
                 );
                 hh.log(thread, 0, format!("preflight:{err:?}"));
             } else {
-                let r = hh
-                    .rt
-                    .patcher()
-                    .apply_speculative(SessionId(1), vec![rel.clone()]);
+                let r = hh.rt.patcher().apply_speculative(
+                    SessionId(1),
+                    vec![rel.clone()],
+                    Some((hh.rt.kv().as_ref(), branch)),
+                );
                 hh.log(thread, 0, format!("speculative:{r:?}"));
             }
             quiesce.wait();
@@ -455,7 +456,7 @@ pub fn scenario_lease_storm(h: &StressHarness, cfg: &StressConfig) {
             barrier.wait();
             let p = format!("lease/{thread}.py");
             for op in 0..ops {
-                if let Ok(id) = patcher.apply_speculative(SessionId(thread as u64), vec![p.clone()]) {
+                if let Ok(id) = patcher.apply_speculative(SessionId(thread as u64), vec![p.clone()], None) {
                     let _ = patcher.revert(id, SessionId(thread as u64));
                     hh.log(thread, op, format!("lease_cycle:{id}"));
                 } else {

@@ -47,20 +47,22 @@ impl MergePreflight {
         affected_paths: &[String],
         spec: &SpeculativePathTracker,
     ) -> Result<(), MergePreflightError> {
-        match acquire_merge_lock(kv, branch_id, merge_id) {
-            Ok(()) => {}
-            Err(CasError::Mismatch(_)) => {
-                let holder = merge_lock_holder(kv, branch_id)
-                    .ok_or_else(|| CasError::Mismatch("merge_lock".into()))?;
-                return Err(MergePreflightError::Locked { holder });
+        spec.with_merge_spec_gate(|| {
+            match acquire_merge_lock(kv, branch_id, merge_id) {
+                Ok(()) => {}
+                Err(CasError::Mismatch(_)) => {
+                    let holder = merge_lock_holder(kv, branch_id)
+                        .ok_or_else(|| CasError::Mismatch("merge_lock".into()))?;
+                    return Err(MergePreflightError::Locked { holder });
+                }
             }
-        }
-        let conflicts = spec.conflicting_paths(affected_paths);
-        if !conflicts.is_empty() {
-            release_merge_lock(kv, branch_id, merge_id)?;
-            return Err(MergePreflightError::SpeculativeConflict { paths: conflicts });
-        }
-        Ok(())
+            let conflicts = spec.conflicting_paths(affected_paths);
+            if !conflicts.is_empty() {
+                release_merge_lock(kv, branch_id, merge_id)?;
+                return Err(MergePreflightError::SpeculativeConflict { paths: conflicts });
+            }
+            Ok(())
+        })
     }
 }
 

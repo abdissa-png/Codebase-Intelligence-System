@@ -6,12 +6,17 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
+use crate::merge_lock::merge_lock_holder;
+use crate::kv::MemoryKv;
 use crate::path_lease::{LeaseError, PathLeaseManager, SessionId, SpeculativePathTracker};
+use cis_wal::BranchId;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum OptimisticPatchError {
     #[error(transparent)]
     Lease(#[from] LeaseError),
+    #[error("423 Locked — merge preflight in progress")]
+    MergeLocked,
     #[error("unknown patch {0}")]
     UnknownPatch(u64),
     #[error("session mismatch for patch {0}")]
@@ -55,24 +60,47 @@ impl OptimisticPatcher {
     }
 
     /// **FR-4.2:** acquire leases in deterministic sorted order.
+    ///
+    /// When `merge_ctx` is `Some`, refuses new speculative paths while a merge lock is held
+    /// on that branch (EI-5 — exactly one of preflight or speculative may win per path).
     pub fn apply_speculative(
         &self,
         session: SessionId,
         mut paths: Vec<String>,
+        merge_ctx: Option<(&MemoryKv, BranchId)>,
     ) -> Result<u64, OptimisticPatchError> {
         paths.sort();
-        for p in &paths {
-            self.leases.acquire(p, session)?;
-        }
-        for p in &paths {
-            self.spec_paths.register(p.clone());
-        }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.patches
-            .lock()
-            .unwrap()
-            .insert(id, PatchRecord { session, paths, created_ms: now_ms() });
-        Ok(id)
+        self.spec_paths.with_merge_spec_gate(|| {
+            if let Some((kv, branch)) = merge_ctx {
+                if merge_lock_holder(kv, branch).is_some() {
+                    return Err(OptimisticPatchError::MergeLocked);
+                }
+            }
+            for p in &paths {
+                self.leases.acquire(p, session)?;
+            }
+            if let Some((kv, branch)) = merge_ctx {
+                if merge_lock_holder(kv, branch).is_some() {
+                    for p in &paths {
+                        self.leases.release(p, session);
+                    }
+                    return Err(OptimisticPatchError::MergeLocked);
+                }
+            }
+            for p in &paths {
+                self.spec_paths.register(p.clone());
+            }
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            self.patches.lock().unwrap().insert(
+                id,
+                PatchRecord {
+                    session,
+                    paths,
+                    created_ms: now_ms(),
+                },
+            );
+            Ok(id)
+        })
     }
 
     pub fn revert(&self, patch_id: u64, session: SessionId) -> Result<(), OptimisticPatchError> {
@@ -236,7 +264,7 @@ mod tests {
         let branch = BranchId([9u8; 16]);
         let mid = MergeId([10u8; 16]);
         patcher
-            .apply_speculative(SessionId(1), vec!["src/m.rs".into()])
+            .apply_speculative(SessionId(1), vec!["src/m.rs".into()], None)
             .unwrap();
         let err = MergePreflight::begin_with_snapshot(
             Arc::clone(&kv),
@@ -263,5 +291,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merge_lock_holder(&kv, branch), Some(mid));
+    }
+
+    #[test]
+    fn speculative_blocked_while_merge_lock_held() {
+        let leases = Arc::new(PathLeaseManager::new());
+        let spec = Arc::new(SpeculativePathTracker::new());
+        let patcher = OptimisticPatcher::new(Arc::clone(&leases), Arc::clone(&spec));
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let branch = BranchId([11u8; 16]);
+        let mid = MergeId([12u8; 16]);
+        crate::merge_lock::acquire_merge_lock(&kv, branch, mid).unwrap();
+        let err = patcher
+            .apply_speculative(
+                SessionId(1),
+                vec!["src/m.rs".into()],
+                Some((&kv, branch)),
+            )
+            .unwrap_err();
+        assert_eq!(err, OptimisticPatchError::MergeLocked);
+        assert!(!spec.intersects(&["src/m.rs".into()]));
+        crate::merge_lock::release_merge_lock(&kv, branch, mid).unwrap();
+        patcher
+            .apply_speculative(
+                SessionId(1),
+                vec!["src/m.rs".into()],
+                Some((&kv, branch)),
+            )
+            .unwrap();
     }
 }

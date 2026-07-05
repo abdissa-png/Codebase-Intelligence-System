@@ -667,6 +667,7 @@ fn is_probably_unified_diff(s: &str) -> bool {
 fn patch_err(e: OptimisticPatchError) -> AuthError {
     match e {
         OptimisticPatchError::Lease(LeaseError::Conflict { .. }) => AuthError::Forbidden,
+        OptimisticPatchError::MergeLocked => AuthError::Forbidden,
         _ => AuthError::InvalidInput,
     }
 }
@@ -2812,7 +2813,11 @@ impl CisMcpRuntime {
         self.auth.validate_path(session_id, &abs_s)?;
         let patch_id = self
             .patcher
-            .apply_speculative(SessionId(session_id), vec![abs_s.clone()])
+            .apply_speculative(
+                SessionId(session_id),
+                vec![abs_s.clone()],
+                Some((self.kv.as_ref(), self.active_branch())),
+            )
             .map_err(patch_err)?;
         let pre_bytes = std::fs::read(&abs).unwrap_or_default();
         if self.pre_write_snapshots.capture_if_absent(patch_id, path, pre_bytes.clone()).is_err() {
@@ -2864,7 +2869,11 @@ impl CisMcpRuntime {
         self.auth.validate_path(session_id, &abs_s)?;
         let patch_id = self
             .patcher
-            .apply_speculative(SessionId(session_id), vec![abs_s.clone()])
+            .apply_speculative(
+                SessionId(session_id),
+                vec![abs_s.clone()],
+                Some((self.kv.as_ref(), self.active_branch())),
+            )
             .map_err(patch_err)?;
         let pre_bytes = std::fs::read(&abs).unwrap_or_default();
         if self.pre_write_snapshots.capture_if_absent(patch_id, path, pre_bytes.clone()).is_err() {

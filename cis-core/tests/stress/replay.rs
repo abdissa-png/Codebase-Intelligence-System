@@ -111,10 +111,11 @@ pub fn merge_preflight(prefix: &[OpRecord]) -> bool {
                 &[],
             );
         } else if op.label.starts_with("speculative:") {
-            let _ = h
-                .rt
-                .patcher()
-                .apply_speculative(SessionId(1), vec![rel.to_string()]);
+            let _ = h.rt.patcher().apply_speculative(
+                SessionId(1),
+                vec![rel.to_string()],
+                Some((h.rt.kv().as_ref(), branch)),
+            );
         }
     }
     h.invariants_dirty()
@@ -269,7 +270,7 @@ pub fn lease_storm(prefix: &[OpRecord], cfg: &StressConfig) -> bool {
 
     for op in prefix {
         let p = format!("lease/{}.py", op.thread);
-        if let Ok(id) = patcher.apply_speculative(SessionId(op.thread as u64), vec![p]) {
+        if let Ok(id) = patcher.apply_speculative(SessionId(op.thread as u64), vec![p], None) {
             let _ = patcher.revert(id, SessionId(op.thread as u64));
         }
     }

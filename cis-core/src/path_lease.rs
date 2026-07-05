@@ -64,14 +64,34 @@ impl PathLeaseManager {
 
 /// Paths touched by unconfirmed speculative patches (agent write-back).
 /// Reference-counted: multiple open patches on the same path increment the count.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SpeculativePathTracker {
     paths: Mutex<HashMap<String, u32>>,
+    /// Serializes merge-preflight lock acquisition vs speculative path registration (EI-5).
+    merge_spec_gate: Mutex<()>,
+}
+
+impl Default for SpeculativePathTracker {
+    fn default() -> Self {
+        Self {
+            paths: Mutex::new(HashMap::new()),
+            merge_spec_gate: Mutex::new(()),
+        }
+    }
 }
 
 impl SpeculativePathTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Run `f` while holding the merge/speculative race gate.
+    pub fn with_merge_spec_gate<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self
+            .merge_spec_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        f()
     }
 
     pub fn register(&self, path: impl Into<String>) {
