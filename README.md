@@ -236,4 +236,4 @@ cis/
 
 ## License
 
-Add your license here before publishing.
+MIT
