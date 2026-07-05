@@ -1,0 +1,96 @@
+name: CIS CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clone chess fixture
+        run: |
+          git clone --depth 1 https://github.com/abdissa-png/A-chess-game-using-Pygame.git fixtures/chess_pygame
+      - name: Unit tests (tree-sitter)
+        run: cargo test -p cis-core --features tree-sitter --lib
+      - name: Chess cross-file calls
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_cross_file_calls
+      - name: Chess SQLite exploration
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_sqlite_exploration -- --nocapture
+      - name: Chess semantic search (stub embedder)
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_semantic_search
+      - name: TypeScript cross-file calls
+        run: cargo test -p cis-core --test typescript_cross_file_calls
+      - name: Restart survival
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test restart_survival
+      - name: Write path correctness (Phase 0)
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test write_path_correctness
+      - name: Confirm token integration
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test epic33_confirm_token
+      - name: WAL crash recovery
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test wal_crash_recovery
+      - name: Branch fork bindings (Phase 1)
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test branch_fork_bindings
+      - name: Merge fork e2e (Phase 2)
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test merge_fork_e2e
+      - name: Phase 2 reconciliation tracker
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test phase2_reconciliation
+      - name: Core integration tests
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --tests -- --skip chess_query_engine_eval
+
+  stress-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: stress_paths
+        with:
+          filters: |
+            stress:
+              - 'cis-core/src/path_lease.rs'
+              - 'cis-core/src/optimistic_patcher.rs'
+              - 'cis-core/src/confirm*.rs'
+              - 'cis-core/src/merge_*.rs'
+              - 'cis-core/src/saga.rs'
+              - 'cis-core/src/merge_saga_batch.rs'
+              - 'cis-core/src/ingest.rs'
+              - 'cis-core/src/identity*.rs'
+              - 'cis-core/src/revision*.rs'
+              - 'cis-core/src/invariants.rs'
+              - 'cis-core/src/fault_injection.rs'
+              - 'cis-core/src/mcp_runtime.rs'
+              - 'cis-core/src/fs_sync.rs'
+              - 'cis-core/src/coordinator.rs'
+              - 'cis-core/tests/stress/**'
+              - 'cis-core/tests/stress_*.rs'
+              - '.github/workflows/cis-ci.yml'
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'push' || steps.stress_paths.outputs.stress == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'push' || steps.stress_paths.outputs.stress == 'true'
+      - name: Clone chess fixture
+        if: github.event_name == 'push' || steps.stress_paths.outputs.stress == 'true'
+        run: |
+          git clone --depth 1 https://github.com/abdissa-png/A-chess-game-using-Pygame.git fixtures/chess_pygame
+      - name: Stress tests fast debug (Phase 4)
+        if: github.event_name == 'push' || steps.stress_paths.outputs.stress == 'true'
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test stress_fast -- --test-threads=4
+      - name: Stress tests fast release (Phase 4)
+        if: github.event_name == 'push' || steps.stress_paths.outputs.stress == 'true'
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test stress_fast --release -- --test-threads=4
+
+  build-mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build cisd
+        run: cargo build -p cis-mcp --features python-ast,body-sqlite,api-embeddings --bin cisd --bin cis
+      - name: WAL crate tests
+        run: cargo test -p cis-wal

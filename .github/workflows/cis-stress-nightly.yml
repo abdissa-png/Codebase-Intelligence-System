@@ -1,0 +1,19 @@
+name: CIS Stress Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  stress-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clone chess fixture
+        run: |
+          git clone --depth 1 https://github.com/abdissa-png/A-chess-game-using-Pygame.git fixtures/chess_pygame
+      - name: Stress tests (full, release)
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test stress_full --release -- --ignored --test-threads=4
