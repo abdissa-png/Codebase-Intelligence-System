@@ -19,16 +19,28 @@ fn is_context_edge(ty: EdgeType) -> bool {
     )
 }
 
+fn revision_on_chain(chain: &[BranchId], branch_id: BranchId) -> bool {
+    chain.iter().any(|b| *b == branch_id)
+}
+
 /// File hub revision (`$file`) for import edges on a path.
+///
+/// Probes each branch in the ancestry chain because hub revision ids are
+/// derived from `branch` via [`stable_rev_id_bytes`].
 pub fn file_hub_revision_for_path(
     g: &InMemoryGraph,
-    branch: BranchId,
+    chain: &[BranchId],
     file_path: &str,
 ) -> Option<NodeRevisionId> {
-    let rid = NodeRevisionId(stable_rev_id_bytes(branch, file_path, "$file"));
-    g.get_revision(rid)
-        .filter(|r| r.branch_id == branch)
-        .map(|_| rid)
+    for &branch in chain {
+        let rid = NodeRevisionId(stable_rev_id_bytes(branch, file_path, "$file"));
+        if let Some(r) = g.get_revision(rid) {
+            if revision_on_chain(chain, r.branch_id) {
+                return Some(rid);
+            }
+        }
+    }
+    None
 }
 
 fn is_file_hub_revision(g: &InMemoryGraph, rid: NodeRevisionId) -> bool {
@@ -40,7 +52,7 @@ fn is_file_hub_revision(g: &InMemoryGraph, rid: NodeRevisionId) -> bool {
 /// Outbound edges for context traversal, including file-hub import hop (imports not duplicated on symbols).
 pub fn outbound_context_edges<'a>(
     g: &'a InMemoryGraph,
-    branch: BranchId,
+    chain: &[BranchId],
     source_revision: NodeRevisionId,
 ) -> Vec<&'a GraphEdge> {
     let mut out: Vec<&GraphEdge> = g
@@ -50,7 +62,7 @@ pub fn outbound_context_edges<'a>(
         .collect();
     if !is_file_hub_revision(g, source_revision) {
         if let Some(rev) = g.get_revision(source_revision) {
-            if let Some(fr) = file_hub_revision_for_path(g, branch, &rev.file_path) {
+            if let Some(fr) = file_hub_revision_for_path(g, chain, &rev.file_path) {
                 for e in g.outbound_edges(fr) {
                     if e.ty == EdgeType::Imports {
                         out.push(e);
@@ -78,33 +90,53 @@ pub fn rename_successor_identity(g: &InMemoryGraph, tombstone_revision: NodeRevi
 }
 
 /// Resolve an identity to the best query target revision, bridging tombstones via **`RENAMED_FROM`**.
+///
+/// `chain` is nearest-first (`[feature, parent, …]`). A tombstone on a nearer branch hides
+/// parent revisions for that identity until a successor is bridged.
+///
+/// **Active** and **Speculative** revisions are both queryable (speculative covers in-flight
+/// `write_file` / patch edits on the editing branch).
 pub fn resolve_identity_revision<'a>(
     g: &'a InMemoryGraph,
-    branch: BranchId,
+    chain: &[BranchId],
     identity_id: IdentityId,
 ) -> Option<&'a NodeRevision> {
-    let primary = g.primary_revision_for_identity(branch, identity_id)?;
-    if matches!(primary.status, RevisionStatus::Active) {
+    let primary = g.primary_revision_for_identity_in_chain(chain, identity_id)?;
+    if matches!(
+        primary.status,
+        RevisionStatus::Active | RevisionStatus::Speculative
+    ) {
         return Some(primary);
     }
     if matches!(primary.status, RevisionStatus::Tombstone) {
         let successor = rename_successor_identity(g, primary.revision_id)?;
         return g
-            .primary_revision_for_identity(branch, successor)
-            .filter(|r| matches!(r.status, RevisionStatus::Active));
+            .primary_revision_for_identity_in_chain(chain, successor)
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    RevisionStatus::Active | RevisionStatus::Speculative
+                )
+            });
     }
     None
 }
 
 /// Effective target identity (ETO) then revision resolution with tombstone bridging.
+///
+/// ETO overrides are resolved nearest-first across `chain` so a parent-branch override
+/// on an inherited edge is visible unless the child overrides it.
 pub fn resolve_edge_target<'a>(
     g: &'a InMemoryGraph,
     eto: &EdgeTargetOverrideStore,
-    branch: BranchId,
+    chain: &[BranchId],
     edge: &GraphEdge,
 ) -> Option<&'a NodeRevision> {
-    let target_id = eto.effective_target_identity(branch, edge);
-    resolve_identity_revision(g, branch, target_id)
+    if chain.is_empty() {
+        return None;
+    }
+    let target_id = eto.effective_target_identity_in_chain(chain, edge);
+    resolve_identity_revision(g, chain, target_id)
 }
 
 fn min_source_on_path(current: SourceType, edge: &GraphEdge) -> SourceType {
@@ -118,14 +150,14 @@ fn min_source_on_path(current: SourceType, edge: &GraphEdge) -> SourceType {
 
 fn inbound_edge_confidences(
     g: &InMemoryGraph,
-    branch: BranchId,
+    chain: &[BranchId],
     identity_id: IdentityId,
     now_ms: u64,
     half_life_ms: u64,
 ) -> Vec<f64> {
     let mut confs = Vec::new();
     for sid in g.source_identities_targeting(identity_id) {
-        let Some(src) = g.primary_revision_for_identity(branch, sid) else {
+        let Some(src) = resolve_identity_revision(g, chain, sid) else {
             continue;
         };
         for e in g.outbound_edges(src.revision_id) {
@@ -141,11 +173,11 @@ fn inbound_edge_confidences(
 pub fn node_hit_confidence(
     g: &InMemoryGraph,
     rev: &NodeRevision,
-    branch: BranchId,
+    chain: &[BranchId],
     now_ms: u64,
     half_life_ms: u64,
 ) -> f64 {
-    let inbound = inbound_edge_confidences(g, branch, rev.identity_id, now_ms, half_life_ms);
+    let inbound = inbound_edge_confidences(g, chain, rev.identity_id, now_ms, half_life_ms);
     node_confidence_from_inbound(&inbound, SourceType::Ast)
 }
 
@@ -161,7 +193,7 @@ pub fn expand_context_bfs(
     g: &InMemoryGraph,
     eto: &EdgeTargetOverrideStore,
     policy: &RankingPolicySnapshot,
-    branch: BranchId,
+    chain: &[BranchId],
     start: NodeRevisionId,
     depth: u32,
     now_ms: u64,
@@ -179,11 +211,11 @@ pub fn expand_context_bfs(
             continue;
         }
         let Some(r) = g.get_revision(rid) else { continue };
-        if r.branch_id != branch {
+        if !revision_on_chain(chain, r.branch_id) {
             continue;
         }
         let node_conf = if rid == start {
-            node_hit_confidence(g, r, branch, now_ms, half_life_ms)
+            node_hit_confidence(g, r, chain, now_ms, half_life_ms)
         } else {
             path_confidence(&path_edge_confs, min_src)
         };
@@ -197,7 +229,7 @@ pub fn expand_context_bfs(
             continue;
         }
 
-        for e in outbound_context_edges(g, branch, rid) {
+        for e in outbound_context_edges(g, chain, rid) {
             let ec = edge_confidence(e, now_ms, half_life_ms);
             let mut next_confs = path_edge_confs.clone();
             next_confs.push(ec);
@@ -207,7 +239,7 @@ pub fn expand_context_bfs(
                 pruned += 1;
                 continue;
             }
-            let Some(next_rev) = resolve_edge_target(g, eto, branch, e) else {
+            let Some(next_rev) = resolve_edge_target(g, eto, chain, e) else {
                 pruned += 1;
                 continue;
             };
@@ -225,19 +257,19 @@ pub fn expand_context_bfs(
 pub fn resolve_definition_target<'a>(
     g: &'a InMemoryGraph,
     eto: &EdgeTargetOverrideStore,
-    branch: BranchId,
+    chain: &[BranchId],
     source_revision: NodeRevisionId,
 ) -> Option<&'a NodeRevision> {
-    for e in outbound_context_edges(g, branch, source_revision) {
+    for e in outbound_context_edges(g, chain, source_revision) {
         if e.ty == EdgeType::Calls {
-            if let Some(trev) = resolve_edge_target(g, eto, branch, e) {
+            if let Some(trev) = resolve_edge_target(g, eto, chain, e) {
                 return Some(trev);
             }
         }
     }
-    for e in outbound_context_edges(g, branch, source_revision) {
+    for e in outbound_context_edges(g, chain, source_revision) {
         if matches!(e.ty, EdgeType::Imports | EdgeType::Extends) {
-            if let Some(trev) = resolve_edge_target(g, eto, branch, e) {
+            if let Some(trev) = resolve_edge_target(g, eto, chain, e) {
                 return Some(trev);
             }
         }
@@ -249,16 +281,16 @@ pub fn resolve_definition_target<'a>(
 pub fn count_unresolved_definition_edges(
     g: &InMemoryGraph,
     eto: &EdgeTargetOverrideStore,
-    branch: BranchId,
+    chain: &[BranchId],
     source_revision: NodeRevisionId,
 ) -> usize {
-    outbound_context_edges(g, branch, source_revision)
+    outbound_context_edges(g, chain, source_revision)
         .iter()
         .filter(|e| {
             matches!(
                 e.ty,
                 EdgeType::Imports | EdgeType::Extends | EdgeType::Calls
-            ) && resolve_edge_target(g, eto, branch, e).is_none()
+            ) && resolve_edge_target(g, eto, chain, e).is_none()
         })
         .count()
 }
@@ -268,12 +300,13 @@ pub fn count_pruned_expand_neighbors(
     g: &InMemoryGraph,
     eto: &EdgeTargetOverrideStore,
     policy: &RankingPolicySnapshot,
-    branch: BranchId,
+    chain: &[BranchId],
     source_revision: NodeRevisionId,
     depth: u32,
     now_ms: u64,
 ) -> usize {
-    expand_context_bfs(g, eto, policy, branch, source_revision, depth, now_ms).pruned_low_confidence_count
+    expand_context_bfs(g, eto, policy, chain, source_revision, depth, now_ms)
+        .pruned_low_confidence_count
 }
 
 #[cfg(test)]
@@ -363,7 +396,8 @@ mod tests {
         let tomb_rev = g.primary_revision_for_identity(b, old_i).unwrap();
         assert!(matches!(tomb_rev.status, RevisionStatus::Tombstone));
         assert_eq!(rename_successor_identity(&g, tomb_rev.revision_id), Some(new_i));
-        let bridged = resolve_identity_revision(&g, b, old_i).unwrap();
+        let chain = [b];
+        let bridged = resolve_identity_revision(&g, &chain, old_i).unwrap();
         assert_eq!(bridged.qualified_name, "bar");
         assert_eq!(bridged.revision_id, NodeRevisionId([2u8; 16]));
     }
@@ -374,6 +408,7 @@ mod tests {
         let eto = EdgeTargetOverrideStore::new(kv);
         let mut g = InMemoryGraph::default();
         let b = branch();
+        let chain = [b];
         let caller = rev(&mut g, 10, 10, "caller", RevisionStatus::Active);
         let wrong = IdentityId([20u8; 16]);
         let right = IdentityId([30u8; 16]);
@@ -394,7 +429,79 @@ mod tests {
         };
         g.replace_edges_for_revision(caller, vec![e]).unwrap();
         eto.set_override(b, caller, edge_id, right);
-        let target = resolve_definition_target(&g, &eto, b, caller).unwrap();
+        let target = resolve_definition_target(&g, &eto, &chain, caller).unwrap();
+        assert_eq!(target.qualified_name, "right");
+    }
+
+    #[test]
+    fn eto_parent_override_visible_on_feature_chain() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let caller_i = IdentityId([10u8; 16]);
+        let wrong = IdentityId([20u8; 16]);
+        let right = IdentityId([30u8; 16]);
+        let caller = NodeRevisionId([10u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: caller_i,
+            kind: NodeKind::Function,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: caller,
+            identity_id: caller_i,
+            branch_id: main,
+            status: RevisionStatus::Active,
+            qualified_name: "caller".into(),
+            file_path: "m.py".into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        for (id, name) in [(20u8, "wrong"), (30u8, "right")] {
+            let iid = IdentityId([id; 16]);
+            g.put_identity(NodeIdentity {
+                identity_id: iid,
+                kind: NodeKind::Function,
+            });
+            g.put_revision(NodeRevision {
+                revision_id: NodeRevisionId([id; 16]),
+                identity_id: iid,
+                branch_id: main,
+                status: RevisionStatus::Active,
+                qualified_name: name.into(),
+                file_path: "m.py".into(),
+                body_hash: [0u8; 32],
+                signature_hash: [0u8; 32],
+                language: Language::Python,
+                parent_revision_id: None,
+                rename_source_id: None,
+                span: SourceSpan::UNKNOWN,
+                tombstoned_at_ms: None,
+            });
+        }
+        let edge_id = [7u8; 16];
+        let e = GraphEdge {
+            edge_id,
+            ty: EdgeType::Calls,
+            source_revision_id: caller,
+            target_identity_id: wrong,
+            resolution: EdgeResolution {
+                target_signature_hash: [0u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: SourceSpan::UNKNOWN,
+        };
+        g.replace_edges_for_revision(caller, vec![e]).unwrap();
+        eto.set_override(main, caller, edge_id, right);
+        let chain = [feature, main];
+        let target = resolve_definition_target(&g, &eto, &chain, caller).unwrap();
         assert_eq!(target.qualified_name, "right");
     }
 
@@ -404,13 +511,14 @@ mod tests {
         let eto = EdgeTargetOverrideStore::new(kv);
         let mut g = InMemoryGraph::default();
         let b = branch();
+        let chain = [b];
         let seed = rev(&mut g, 1, 1, "seed", RevisionStatus::Active);
         let leaf = rev(&mut g, 2, 2, "leaf", RevisionStatus::Active);
         call_edge(&mut g, seed, IdentityId([2u8; 16]), 1);
         let _ = leaf;
         let mut policy = RankingPolicy::default();
         policy.min_path_confidence = 0.99;
-        let out = expand_context_bfs(&g, &eto, &policy, b, seed, 1, 1_000_000);
+        let out = expand_context_bfs(&g, &eto, &policy, &chain, seed, 1, 1_000_000);
         assert_eq!(out.hits.len(), 1, "only seed should survive strict floor");
         assert!(out.pruned_low_confidence_count >= 1);
     }
@@ -421,6 +529,7 @@ mod tests {
         let eto = EdgeTargetOverrideStore::new(kv);
         let mut g = InMemoryGraph::default();
         let b = branch();
+        let chain = [b];
         let seed = rev(&mut g, 1, 1, "seed", RevisionStatus::Active);
         let stub_i = IdentityId([5u8; 16]);
         let stub_rid = NodeRevisionId([5u8; 16]);
@@ -448,10 +557,95 @@ mod tests {
         call_edge(&mut g, stub_rid, IdentityId([6u8; 16]), 3);
         let _ = beyond;
         let policy = RankingPolicy::default();
-        let out = expand_context_bfs(&g, &eto, &policy, b, seed, 2, 1_000_000);
+        let out = expand_context_bfs(&g, &eto, &policy, &chain, seed, 2, 1_000_000);
         let ids: HashSet<_> = out.hits.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&seed));
         assert!(ids.contains(&stub_rid));
         assert!(!ids.contains(&NodeRevisionId([6u8; 16])));
+    }
+
+    #[test]
+    fn primary_in_chain_nearest_wins() {
+        let mut g = InMemoryGraph::default();
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let iid = IdentityId([7u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: iid,
+            kind: NodeKind::Function,
+        });
+        let main_rid = NodeRevisionId([71u8; 16]);
+        g.put_revision(NodeRevision {
+            revision_id: main_rid,
+            identity_id: iid,
+            branch_id: main,
+            status: RevisionStatus::Active,
+            qualified_name: "alpha".into(),
+            file_path: "a.py".into(),
+            body_hash: [1u8; 32],
+            signature_hash: [1u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let feat_rid = NodeRevisionId([72u8; 16]);
+        g.put_revision(NodeRevision {
+            revision_id: feat_rid,
+            identity_id: iid,
+            branch_id: feature,
+            status: RevisionStatus::Active,
+            qualified_name: "alpha".into(),
+            file_path: "a.py".into(),
+            body_hash: [2u8; 32],
+            signature_hash: [2u8; 32],
+            language: Language::Python,
+            parent_revision_id: Some(main_rid),
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let chain = [feature, main];
+        let resolved = resolve_identity_revision(&g, &chain, iid).unwrap();
+        assert_eq!(resolved.revision_id, feat_rid);
+        assert_eq!(
+            g.primary_revision_for_identity_in_chain(&chain, iid)
+                .unwrap()
+                .revision_id,
+            feat_rid
+        );
+    }
+
+    #[test]
+    fn chain_inherits_parent_when_child_has_no_primary() {
+        let mut g = InMemoryGraph::default();
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let iid = IdentityId([8u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: iid,
+            kind: NodeKind::Function,
+        });
+        let main_rid = NodeRevisionId([81u8; 16]);
+        g.put_revision(NodeRevision {
+            revision_id: main_rid,
+            identity_id: iid,
+            branch_id: main,
+            status: RevisionStatus::Active,
+            qualified_name: "beta".into(),
+            file_path: "b.py".into(),
+            body_hash: [3u8; 32],
+            signature_hash: [3u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let chain = [feature, main];
+        let resolved = resolve_identity_revision(&g, &chain, iid).unwrap();
+        assert_eq!(resolved.revision_id, main_rid);
+        assert_eq!(resolved.branch_id, main);
     }
 }

@@ -45,7 +45,8 @@ fn expand_context_assigns_per_hit_confidence() {
     let rid = NodeRevisionId(stable_rev_id_bytes(BRANCH, "a.py", "f"));
     let eto = EdgeTargetOverrideStore::new(kv);
     let policy = RankingPolicy::default();
-    let out = expand_context_bfs(&g, &eto, &policy, BRANCH, rid, 1, 1_000_000);
+    let chain = [BRANCH];
+    let out = expand_context_bfs(&g, &eto, &policy, &chain, rid, 1, 1_000_000);
     assert!(!out.hits.is_empty());
     for (_, conf) in &out.hits {
         assert!(*conf > 0.0 && *conf <= 1.0);
@@ -69,7 +70,8 @@ fn rename_preserves_identity_and_bridges_tombstone_query() {
             .any(|e| e.ty == EdgeType::RenamedFrom),
         "RENAMED_FROM on tombstone"
     );
-    let bridged = resolve_identity_revision(&g, BRANCH, foo.identity_id).unwrap();
+    let chain = [BRANCH];
+    let bridged = resolve_identity_revision(&g, &chain, foo.identity_id).unwrap();
     assert!(
         bridged.qualified_name.ends_with("bar"),
         "bridged to active successor, got {}",
@@ -132,6 +134,7 @@ fn eto_overrides_definition_resolution() {
     drop(g);
 
     let g = coord.graph().read();
-    let resolved = resolve_definition_target(&g, &eto, BRANCH, caller_rid).unwrap();
+    let chain = [BRANCH];
+    let resolved = resolve_definition_target(&g, &eto, &chain, caller_rid).unwrap();
     assert_eq!(resolved.identity_id, right_i);
 }

@@ -288,6 +288,20 @@ impl InMemoryGraph {
         self.revisions.get(&rid)
     }
 
+    /// Nearest-first primary across a branch ancestry chain (`[child, parent, …]`).
+    pub fn primary_revision_for_identity_in_chain(
+        &self,
+        chain: &[BranchId],
+        identity_id: IdentityId,
+    ) -> Option<&NodeRevision> {
+        for &branch_id in chain {
+            if let Some(rev) = self.primary_revision_for_identity(branch_id, identity_id) {
+                return Some(rev);
+            }
+        }
+        None
+    }
+
     /// All revision ids on `(branch, file_path)` (any status).
     pub fn revision_ids_for_file(&self, branch_id: BranchId, file_path: &str) -> &[NodeRevisionId] {
         self.revisions_by_file

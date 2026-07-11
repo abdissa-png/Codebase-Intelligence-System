@@ -267,7 +267,9 @@ pub use time_travel::{
 };
 pub use reconciliation::{PeriodicReconciler, RecoveryReport, ReconciliationEngine};
 pub use revision_cow::{ris_snapshot_kv_key, RevisionIndexCow};
-pub use revision_index::{fork_branch_bindings, revision_binding_kv_key, RevisionIndex};
+pub use revision_index::{
+    branch_ancestry, fork_branch_bindings, revision_binding_kv_key, RevisionIndex,
+};
 pub use saga::{MergeSagaOrchestrator, SagaPhase};
 pub use security::{
     append_audit_epoch, verify_audit_chain, AuditChainVerification, AuditLog, AuditRecord,

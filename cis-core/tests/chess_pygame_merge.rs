@@ -188,8 +188,11 @@ fn chess_pygame_merge_engine_demo() {
     std::fs::write(root.join(rel_path), &original).expect("restore BoardUtils.py");
 
     assert_eq!(resp.saga_phase, "Committed");
-    // After source-only reindex, sync_revision_index_from_graph drops forked ri: rows
-    // for identities without Active/Speculative revisions on the source branch.
+    // After source-only reindex, sync_revision_index_from_graph may drop forked ri: rows for
+    // identities without Active/Speculative revisions on the source branch. This is harmless to
+    // interactive queries: they resolve via the branch ancestry chain against primary_by_identity
+    // (see query_engine::resolve_identity_revision + revision_index::branch_ancestry), not the
+    // ephemeral ri: copies. Inherited-symbol query visibility is covered by branch_inherited_queries.rs.
     assert!(
         source_bindings.len() >= 1,
         "source branch should retain bindings for reindexed paths"

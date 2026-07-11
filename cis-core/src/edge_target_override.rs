@@ -55,6 +55,10 @@ impl EdgeTargetOverrideStore {
         Some(IdentityId(a))
     }
 
+    /// Resolve the effective target for `edge` on a single `branch_id`.
+    ///
+    /// Prefer [`Self::effective_target_identity_in_chain`] for interactive queries so
+    /// parent-branch overrides on inherited edges are visible.
     pub fn effective_target_identity(
         &self,
         branch_id: BranchId,
@@ -62,6 +66,25 @@ impl EdgeTargetOverrideStore {
     ) -> IdentityId {
         self.get_override(branch_id, edge.source_revision_id, edge.edge_id)
             .unwrap_or(edge.target_identity_id)
+    }
+
+    /// Nearest-first ETO lookup across a branch ancestry chain (`[child, parent, …]`).
+    ///
+    /// A child override wins over a parent override for the same `(source_rev, edge_id)`.
+    /// If no chain member has an override, falls back to `edge.target_identity_id`.
+    pub fn effective_target_identity_in_chain(
+        &self,
+        chain: &[BranchId],
+        edge: &crate::graph::GraphEdge,
+    ) -> IdentityId {
+        for &branch_id in chain {
+            if let Some(id) =
+                self.get_override(branch_id, edge.source_revision_id, edge.edge_id)
+            {
+                return id;
+            }
+        }
+        edge.target_identity_id
     }
 
     pub fn delete_override(
@@ -114,5 +137,67 @@ mod tests {
             anchor: crate::graph::SourceSpan::UNKNOWN,
         };
         assert_eq!(s.effective_target_identity(b, &edge), alt);
+    }
+
+    #[test]
+    fn chain_inherits_parent_override() {
+        use crate::graph::{EdgeResolution, EdgeType, GraphEdge, SourceType};
+        let kv = Arc::new(MemoryKv::new());
+        let s = EdgeTargetOverrideStore::new(kv);
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let r = NodeRevisionId([2u8; 16]);
+        let e = [3u8; 16];
+        let orig = IdentityId([4u8; 16]);
+        let parent_alt = IdentityId([5u8; 16]);
+        s.set_override(main, r, e, parent_alt);
+        let edge = GraphEdge {
+            edge_id: e,
+            ty: EdgeType::Calls,
+            source_revision_id: r,
+            target_identity_id: orig,
+            resolution: EdgeResolution {
+                target_signature_hash: [0u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: crate::graph::SourceSpan::UNKNOWN,
+        };
+        assert_eq!(
+            s.effective_target_identity_in_chain(&[feature, main], &edge),
+            parent_alt
+        );
+    }
+
+    #[test]
+    fn chain_child_override_wins_over_parent() {
+        use crate::graph::{EdgeResolution, EdgeType, GraphEdge, SourceType};
+        let kv = Arc::new(MemoryKv::new());
+        let s = EdgeTargetOverrideStore::new(kv);
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let r = NodeRevisionId([2u8; 16]);
+        let e = [3u8; 16];
+        let orig = IdentityId([4u8; 16]);
+        let parent_alt = IdentityId([5u8; 16]);
+        let child_alt = IdentityId([6u8; 16]);
+        s.set_override(main, r, e, parent_alt);
+        s.set_override(feature, r, e, child_alt);
+        let edge = GraphEdge {
+            edge_id: e,
+            ty: EdgeType::Calls,
+            source_revision_id: r,
+            target_identity_id: orig,
+            resolution: EdgeResolution {
+                target_signature_hash: [0u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: crate::graph::SourceSpan::UNKNOWN,
+        };
+        assert_eq!(
+            s.effective_target_identity_in_chain(&[feature, main], &edge),
+            child_alt
+        );
     }
 }

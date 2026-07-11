@@ -384,7 +384,9 @@ fn do_tombstone(graph: &mut InMemoryGraph, rids: Vec<NodeRevisionId>) {
     }
 }
 
-/// Tombstone active revisions for `file_path` whose qualified name is not in `retained_names`.
+/// Tombstone active/speculative revisions for `file_path` whose qualified name is not in
+/// `retained_names`, and plant branch-local tombstones that hide **inherited** symbols
+/// removed from this file (parent revisions keep their own `branch_id`).
 pub fn tombstone_orphaned_file_symbols(
     graph: &mut InMemoryGraph,
     branch: BranchId,
@@ -396,12 +398,78 @@ pub fn tombstone_orphaned_file_symbols(
         .filter(|r| {
             r.branch_id == branch
                 && r.file_path == file_path
-                && matches!(r.status, RevisionStatus::Active)
+                && matches!(
+                    r.status,
+                    RevisionStatus::Active | RevisionStatus::Speculative
+                )
                 && !retained_qualified_names.contains(&r.qualified_name)
         })
         .map(|r| r.revision_id)
         .collect();
     do_tombstone(graph, to_tombstone);
+
+    // Inherited (other-branch) symbols on this path that are no longer retained must be
+    // hidden on `branch` via a local Tombstone primary — otherwise ancestry-chain queries
+    // would keep surfacing the parent Active revision.
+    let inherited: Vec<NodeRevision> = graph
+        .revisions()
+        .filter(|r| {
+            r.branch_id != branch
+                && r.file_path == file_path
+                && matches!(
+                    r.status,
+                    RevisionStatus::Active | RevisionStatus::Speculative
+                )
+                && !retained_qualified_names.contains(&r.qualified_name)
+        })
+        .cloned()
+        .collect();
+
+    let ts = now_ms();
+    for parent_rev in inherited {
+        if let Some(local) = graph.primary_revision_for_identity(branch, parent_rev.identity_id) {
+            if matches!(
+                local.status,
+                RevisionStatus::Active | RevisionStatus::Speculative
+            ) {
+                continue;
+            }
+            if matches!(local.status, RevisionStatus::Tombstone) {
+                continue;
+            }
+        }
+        let tomb_rid = NodeRevisionId(crate::index_model::stable_rev_id_bytes(
+            branch,
+            file_path,
+            &format!("$tomb:{}", parent_rev.qualified_name),
+        ));
+        if graph.get_revision(tomb_rid).is_some() {
+            if let Some(existing) = graph.get_revision(tomb_rid).cloned() {
+                if !matches!(existing.status, RevisionStatus::Tombstone) {
+                    let mut updated = existing;
+                    updated.status = RevisionStatus::Tombstone;
+                    updated.tombstoned_at_ms = Some(ts);
+                    graph.put_revision(updated);
+                }
+            }
+            continue;
+        }
+        graph.put_revision(NodeRevision {
+            revision_id: tomb_rid,
+            identity_id: parent_rev.identity_id,
+            branch_id: branch,
+            status: RevisionStatus::Tombstone,
+            qualified_name: parent_rev.qualified_name.clone(),
+            file_path: file_path.to_string(),
+            body_hash: parent_rev.body_hash,
+            signature_hash: parent_rev.signature_hash,
+            language: parent_rev.language,
+            parent_revision_id: Some(parent_rev.revision_id),
+            rename_source_id: None,
+            span: parent_rev.span,
+            tombstoned_at_ms: Some(ts),
+        });
+    }
 }
 
 /// Tombstone **all** active revisions for `file_path` (used when the file is deleted).

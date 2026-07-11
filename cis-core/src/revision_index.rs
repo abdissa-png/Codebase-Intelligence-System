@@ -1,11 +1,15 @@
 //! **`RevisionIndex`** — thin branch-facing API over [`RevisionIndexCow`] (**C-2**, **FR-2.6**).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
 use crate::kv::MemoryKv;
 use crate::revision_cow::RevisionIndexCow;
+
+/// Matches [`RevisionIndexCow`] compaction depth — ancestry walks stop here.
+const BRANCH_ANCESTRY_MAX_DEPTH: usize = 10;
 
 pub fn revision_binding_kv_key(branch_id: BranchId, identity_id: IdentityId) -> String {
     let hex_branch = branch_id
@@ -51,6 +55,36 @@ pub fn fork_branch_bindings(kv: &MemoryKv, parent: BranchId, child: BranchId) ->
         kv.set(&parent_meta, parent.0.to_vec());
     }
     count
+}
+
+/// Walk `branch_parent:{child}` from `branch` toward the root.
+///
+/// Returns `[branch, parent, grandparent, …]` (nearest first). Cycles and depth beyond
+/// [`BRANCH_ANCESTRY_MAX_DEPTH`] are truncated.
+pub fn branch_ancestry(kv: &MemoryKv, branch: BranchId) -> Vec<BranchId> {
+    let mut chain = Vec::with_capacity(BRANCH_ANCESTRY_MAX_DEPTH + 1);
+    let mut seen = HashSet::new();
+    let mut cur = branch;
+    loop {
+        if !seen.insert(cur) {
+            break;
+        }
+        chain.push(cur);
+        if chain.len() > BRANCH_ANCESTRY_MAX_DEPTH {
+            break;
+        }
+        let key = format!("branch_parent:{}", hex_branch_id(cur));
+        let Some(bytes) = kv.get(&key) else {
+            break;
+        };
+        if bytes.len() != 16 {
+            break;
+        }
+        let mut parent = [0u8; 16];
+        parent.copy_from_slice(&bytes);
+        cur = BranchId(parent);
+    }
+    chain
 }
 
 #[derive(Debug)]
@@ -116,5 +150,34 @@ mod tests {
         assert_eq!(fork_branch_bindings(kv.as_ref(), parent, child), 1);
         let chex = child.0.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         assert!(kv.get(&format!("ri:{chex}:{idhex}")).is_some());
+    }
+
+    #[test]
+    fn branch_ancestry_single_root() {
+        let kv = MemoryKv::new();
+        let main = BranchId([1u8; 16]);
+        assert_eq!(branch_ancestry(&kv, main), vec![main]);
+    }
+
+    #[test]
+    fn branch_ancestry_multi_level() {
+        let kv = MemoryKv::new();
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let sub = BranchId([3u8; 16]);
+        fork_branch_bindings(&kv, main, feature);
+        fork_branch_bindings(&kv, feature, sub);
+        assert_eq!(branch_ancestry(&kv, sub), vec![sub, feature, main]);
+    }
+
+    #[test]
+    fn branch_ancestry_cycle_guard() {
+        let kv = MemoryKv::new();
+        let a = BranchId([0x0a; 16]);
+        let b = BranchId([0x0b; 16]);
+        kv.set(&format!("branch_parent:{}", hex_branch_id(a)), b.0.to_vec());
+        kv.set(&format!("branch_parent:{}", hex_branch_id(b)), a.0.to_vec());
+        let chain = branch_ancestry(&kv, a);
+        assert_eq!(chain, vec![a, b]);
     }
 }
