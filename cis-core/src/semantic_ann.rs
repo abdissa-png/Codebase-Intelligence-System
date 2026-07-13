@@ -32,21 +32,27 @@ impl FlatAnnIndex {
     }
 
     pub fn upsert(&mut self, body_hash: [u8; 32], vec: Vec<f32>) {
+        let _ = self.try_upsert(body_hash, vec);
+    }
+
+    /// Insert or replace. Returns `false` when `vec` is empty or dimension mismatches.
+    pub fn try_upsert(&mut self, body_hash: [u8; 32], vec: Vec<f32>) -> bool {
         if vec.is_empty() {
-            return;
+            return false;
         }
         if self.dim == 0 {
             self.dim = vec.len();
         } else if vec.len() != self.dim {
-            return;
+            return false;
         }
         if let Some(&i) = self.by_hash.get(&body_hash) {
             self.entries[i].1 = vec;
-            return;
+            return true;
         }
         let i = self.entries.len();
         self.entries.push((body_hash, vec));
         self.by_hash.insert(body_hash, i);
+        true
     }
 
     pub fn remove(&mut self, body_hash: &[u8; 32]) {
@@ -113,5 +119,13 @@ mod tests {
         idx.upsert(h2, vec![0.0, 1.0]);
         let hits = idx.search(&[0.9, 0.1], 2);
         assert_eq!(hits[0].0, h1);
+    }
+
+    #[test]
+    fn try_upsert_rejects_dimension_mismatch() {
+        let mut idx = FlatAnnIndex::new();
+        assert!(idx.try_upsert([1u8; 32], vec![1.0, 0.0]));
+        assert!(!idx.try_upsert([2u8; 32], vec![1.0, 0.0, 0.0]));
+        assert_eq!(idx.len(), 1);
     }
 }
