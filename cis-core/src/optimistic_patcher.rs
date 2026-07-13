@@ -104,16 +104,16 @@ impl OptimisticPatcher {
     }
 
     pub fn revert(&self, patch_id: u64, session: SessionId) -> Result<(), OptimisticPatchError> {
-        let rec = self
-            .patches
-            .lock()
-            .unwrap()
-            .remove(&patch_id)
-            .ok_or(OptimisticPatchError::UnknownPatch(patch_id))?;
-        if rec.session != session {
-            self.patches.lock().unwrap().insert(patch_id, rec);
-            return Err(OptimisticPatchError::SessionMismatch(patch_id));
-        }
+        let rec = {
+            let mut patches = self.patches.lock().unwrap();
+            let Some(rec) = patches.get(&patch_id) else {
+                return Err(OptimisticPatchError::UnknownPatch(patch_id));
+            };
+            if rec.session != session {
+                return Err(OptimisticPatchError::SessionMismatch(patch_id));
+            }
+            patches.remove(&patch_id).expect("patch present after get")
+        };
         for p in &rec.paths {
             self.spec_paths.unregister(p);
             self.leases.release(p, session);
@@ -124,16 +124,16 @@ impl OptimisticPatcher {
     /// **Epic 3.3 promote:** release leases + unregister speculative paths, returning the affected paths.
     /// Callers (MCP `confirm_patch`, FS sync) then transition graph revisions to `Active`.
     pub fn promote(&self, patch_id: u64, session: SessionId) -> Result<Vec<String>, OptimisticPatchError> {
-        let rec = self
-            .patches
-            .lock()
-            .unwrap()
-            .remove(&patch_id)
-            .ok_or(OptimisticPatchError::UnknownPatch(patch_id))?;
-        if rec.session != session {
-            self.patches.lock().unwrap().insert(patch_id, rec);
-            return Err(OptimisticPatchError::SessionMismatch(patch_id));
-        }
+        let rec = {
+            let mut patches = self.patches.lock().unwrap();
+            let Some(rec) = patches.get(&patch_id) else {
+                return Err(OptimisticPatchError::UnknownPatch(patch_id));
+            };
+            if rec.session != session {
+                return Err(OptimisticPatchError::SessionMismatch(patch_id));
+            }
+            patches.remove(&patch_id).expect("patch present after get")
+        };
         for p in &rec.paths {
             self.spec_paths.unregister(p);
             self.leases.release(p, session);
@@ -319,5 +319,27 @@ mod tests {
                 Some((&kv, branch)),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn session_mismatch_leaves_patch_intact() {
+        let leases = Arc::new(PathLeaseManager::new());
+        let spec = Arc::new(SpeculativePathTracker::new());
+        let patcher = OptimisticPatcher::new(Arc::clone(&leases), Arc::clone(&spec));
+        let id = patcher
+            .apply_speculative(SessionId(1), vec!["a.rs".into()], None)
+            .unwrap();
+        assert_eq!(
+            patcher.revert(id, SessionId(99)),
+            Err(OptimisticPatchError::SessionMismatch(id))
+        );
+        assert_eq!(patcher.open_patch_count(), 1);
+        assert_eq!(
+            patcher.promote(id, SessionId(99)),
+            Err(OptimisticPatchError::SessionMismatch(id))
+        );
+        assert_eq!(patcher.open_patch_count(), 1);
+        patcher.revert(id, SessionId(1)).unwrap();
+        assert_eq!(patcher.open_patch_count(), 0);
     }
 }
