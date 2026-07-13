@@ -13,6 +13,17 @@ use crate::index_model::{
     ImportStyle, ParsedCall, ParsedImport,
 };
 
+fn path_matches_stripped_module(path: &str, stripped: &str) -> bool {
+    const EXTS: &[&str] = &[".ts", ".tsx", ".py", ".rs", ".go", ".js", ".jsx"];
+    for ext in EXTS {
+        let file = format!("{stripped}{ext}");
+        if path == file || path.ends_with(&format!("/{file}")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Resolve an import module string to a repo-relative file path via `mod_map`.
 fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Option<String> {
     if let Some(p) = mod_map.get(module) {
@@ -27,13 +38,15 @@ fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Optio
     if let Some(p) = mod_map.get(stripped) {
         return Some(p.clone());
     }
+    // Path-segment / file-suffix match only — never bare `ends_with("utils")`
+    // (that would incorrectly match `my_utils`, `test_utils`, …).
     mod_map
         .iter()
         .find(|(k, v)| {
-            k.ends_with(stripped)
-                || v.ends_with(&format!("{stripped}.ts"))
-                || v.ends_with(&format!("{stripped}.tsx"))
-                || v.ends_with(&format!("{stripped}.py"))
+            *k == stripped
+                || k.ends_with(&format!("/{stripped}"))
+                || k.ends_with(&format!(".{stripped}"))
+                || path_matches_stripped_module(v, stripped)
         })
         .map(|(_, v)| v.clone())
 }
@@ -713,6 +726,28 @@ mod tests {
         assert_eq!(
             resolve_module_path("./util", &mod_map),
             Some("src/util.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_module_path_does_not_match_suffix_sibling() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert("my_utils".to_string(), "lib/my_utils.py".to_string());
+        mod_map.insert("test_utils".to_string(), "lib/test_utils.py".to_string());
+        assert_eq!(
+            resolve_module_path("utils", &mod_map),
+            None,
+            "bare ends_with must not pick my_utils/test_utils"
+        );
+    }
+
+    #[test]
+    fn resolve_module_path_matches_path_suffix_file() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert("pkg.helpers".to_string(), "pkg/helpers.py".to_string());
+        assert_eq!(
+            resolve_module_path("helpers", &mod_map),
+            Some("pkg/helpers.py".to_string())
         );
     }
 
