@@ -912,13 +912,16 @@ fn detect_renames(graph: &InMemoryGraph, classified: &mut [ClassifiedMergeIdenti
                 | MergeIdentityClass::TheirsNew
                 | MergeIdentityClass::OursOnly
                 | MergeIdentityClass::TheirsOnly
+                | MergeIdentityClass::BothNewDivergent
+                | MergeIdentityClass::BothModifiedUnresolved
         ) {
             continue;
         }
-        let rev_id = ci.ours_revision.or(ci.theirs_revision);
-        let rename_src = rev_id
-            .and_then(|r| graph.get_revision(r))
-            .and_then(|r| r.rename_source_id);
+        // Check both sides — `ours.or(theirs)` misses theirs.rename_source_id when ours exists.
+        let rename_src = [ci.ours_revision, ci.theirs_revision]
+            .into_iter()
+            .flatten()
+            .find_map(|r| graph.get_revision(r).and_then(|rev| rev.rename_source_id));
         if let Some(src_identity) = rename_src {
             if deleted_set.contains(&src_identity) {
                 rename_pairs.push((src_identity, ci.identity_id));

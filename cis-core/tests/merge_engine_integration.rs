@@ -572,6 +572,84 @@ fn rename_detected_and_unified() {
     assert!(kv.get(&key_old).is_none());
 }
 
+/// Theirs renamed; ours independently created the same new identity without rename_source_id.
+/// Must still detect rename via theirs revision (not `ours.or(theirs)` alone).
+#[test]
+fn rename_detected_when_ours_lacks_rename_source() {
+    let kv = Arc::new(MemoryKv::new());
+    let mut g = InMemoryGraph::default();
+    let base = BranchId([1u8; 16]);
+    let ours = BranchId([2u8; 16]);
+    let theirs = BranchId([3u8; 16]);
+
+    let old_id = iid(1);
+    let new_id = iid(2);
+    let r_old = rid(1);
+    g.put_identity(NodeIdentity {
+        identity_id: old_id,
+        kind: NodeKind::Function,
+    });
+    g.put_revision(make_rev(
+        r_old,
+        old_id,
+        base,
+        "old_fn",
+        [10u8; 32],
+        [0u8; 32],
+    ));
+    bind(&kv, base, old_id, r_old);
+
+    // Ours: deleted old, created new without rename link
+    let r_ours_new = rid(2);
+    g.put_identity(NodeIdentity {
+        identity_id: new_id,
+        kind: NodeKind::Function,
+    });
+    g.put_revision(make_rev(
+        r_ours_new,
+        new_id,
+        ours,
+        "new_fn",
+        [21u8; 32],
+        [0u8; 32],
+    ));
+    bind(&kv, ours, new_id, r_ours_new);
+
+    // Theirs: deleted old, created new WITH rename_source_id
+    let r_theirs_new = rid(3);
+    let mut theirs_new = make_rev(
+        r_theirs_new,
+        new_id,
+        theirs,
+        "new_fn",
+        [22u8; 32],
+        [0u8; 32],
+    );
+    theirs_new.rename_source_id = Some(old_id);
+    g.put_revision(theirs_new);
+    bind(&kv, theirs, new_id, r_theirs_new);
+
+    let pa = phase_a_classify(&g, &kv, ours, theirs, base);
+
+    let old_class = pa
+        .classified
+        .iter()
+        .find(|c| c.identity_id == old_id)
+        .unwrap();
+    assert_eq!(old_class.class, MergeIdentityClass::BothDeleted);
+
+    let new_class = pa
+        .classified
+        .iter()
+        .find(|c| c.identity_id == new_id)
+        .unwrap();
+    assert_eq!(
+        new_class.class,
+        MergeIdentityClass::RenamedCandidate,
+        "theirs rename_source_id must win even when ours revision exists without it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 12: Saga crash-resume from Classifying phase
 // ---------------------------------------------------------------------------
