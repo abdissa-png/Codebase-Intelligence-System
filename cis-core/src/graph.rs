@@ -152,6 +152,8 @@ pub struct InMemoryGraph {
     primary_by_identity: HashMap<(BranchId, IdentityId), NodeRevisionId>,
     /// **Phase 1.2** — `(branch, file_path) → all revision ids on that path`.
     revisions_by_file: HashMap<(BranchId, String), Vec<NodeRevisionId>>,
+    /// `(branch, identity) → revision ids` for O(k) primary recompute.
+    revisions_by_identity: HashMap<(BranchId, IdentityId), Vec<NodeRevisionId>>,
 }
 
 impl InMemoryGraph {
@@ -165,6 +167,9 @@ impl InMemoryGraph {
             if o.branch_id != rev.branch_id || o.file_path != rev.file_path {
                 Self::remove_from_file_index_map(&mut self.revisions_by_file, o);
             }
+            if o.branch_id != rev.branch_id || o.identity_id != rev.identity_id {
+                Self::remove_from_identity_index_map(&mut self.revisions_by_identity, o);
+            }
         }
         self.revisions.insert(rev.revision_id, rev.clone());
         if old.is_none()
@@ -174,6 +179,14 @@ impl InMemoryGraph {
                 .unwrap_or(true)
         {
             Self::add_to_file_index_map(&mut self.revisions_by_file, &rev);
+        }
+        if old.is_none()
+            || old
+                .as_ref()
+                .map(|o| o.branch_id != rev.branch_id || o.identity_id != rev.identity_id)
+                .unwrap_or(true)
+        {
+            Self::add_to_identity_index_map(&mut self.revisions_by_identity, &rev);
         }
         self.recompute_primary(rev.branch_id, rev.identity_id);
         if let Some(o) = old {
@@ -213,13 +226,39 @@ impl InMemoryGraph {
         }
     }
 
+    fn add_to_identity_index_map(
+        map: &mut HashMap<(BranchId, IdentityId), Vec<NodeRevisionId>>,
+        rev: &NodeRevision,
+    ) {
+        let key = (rev.branch_id, rev.identity_id);
+        let entry = map.entry(key).or_default();
+        if !entry.contains(&rev.revision_id) {
+            entry.push(rev.revision_id);
+        }
+    }
+
+    fn remove_from_identity_index_map(
+        map: &mut HashMap<(BranchId, IdentityId), Vec<NodeRevisionId>>,
+        rev: &NodeRevision,
+    ) {
+        let key = (rev.branch_id, rev.identity_id);
+        if let Some(v) = map.get_mut(&key) {
+            v.retain(|id| *id != rev.revision_id);
+            if v.is_empty() {
+                map.remove(&key);
+            }
+        }
+    }
+
     /// Rebuild **Phase 1** secondary indices from all revisions (snapshot load / recovery).
     pub fn rebuild_secondary_indices(&mut self) {
         self.primary_by_identity.clear();
         self.revisions_by_file.clear();
+        self.revisions_by_identity.clear();
         let revs: Vec<NodeRevision> = self.revisions.values().cloned().collect();
         for rev in &revs {
             Self::add_to_file_index_map(&mut self.revisions_by_file, rev);
+            Self::add_to_identity_index_map(&mut self.revisions_by_identity, rev);
         }
         let mut identities: HashSet<(BranchId, IdentityId)> = HashSet::new();
         for rev in &revs {
@@ -236,18 +275,45 @@ impl InMemoryGraph {
             return false;
         };
         Self::remove_from_file_index_map(&mut self.revisions_by_file, &rev);
-        self.edges_by_revision.remove(&revision_id);
+        Self::remove_from_identity_index_map(&mut self.revisions_by_identity, &rev);
+        if let Some(old) = self.edges_by_revision.remove(&revision_id) {
+            Self::unlink_source_from_target_reverse(
+                &mut self.target_reverse,
+                rev.identity_id,
+                &old,
+            );
+        }
         self.recompute_primary(rev.branch_id, rev.identity_id);
         true
+    }
+
+    fn unlink_source_from_target_reverse(
+        target_reverse: &mut HashMap<IdentityId, HashSet<IdentityId>>,
+        source_identity: IdentityId,
+        edges: &[GraphEdge],
+    ) {
+        for e in edges {
+            if let Some(set) = target_reverse.get_mut(&e.target_identity_id) {
+                set.remove(&source_identity);
+                if set.is_empty() {
+                    target_reverse.remove(&e.target_identity_id);
+                }
+            }
+        }
     }
 
     fn recompute_primary(&mut self, branch_id: BranchId, identity_id: IdentityId) {
         let key = (branch_id, identity_id);
         let mut fallback: Option<NodeRevisionId> = None;
-        for r in self.revisions.values() {
-            if r.branch_id != branch_id || r.identity_id != identity_id {
+        let candidates = self
+            .revisions_by_identity
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        for rid in candidates {
+            let Some(r) = self.revisions.get(&rid) else {
                 continue;
-            }
+            };
             if matches!(r.status, RevisionStatus::Active) {
                 self.primary_by_identity.insert(key, r.revision_id);
                 return;
@@ -306,6 +372,18 @@ impl InMemoryGraph {
     pub fn revision_ids_for_file(&self, branch_id: BranchId, file_path: &str) -> &[NodeRevisionId] {
         self.revisions_by_file
             .get(&(branch_id, file_path.to_string()))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// All revision ids for `(branch, identity)` (any status).
+    pub fn revision_ids_for_identity(
+        &self,
+        branch_id: BranchId,
+        identity_id: IdentityId,
+    ) -> &[NodeRevisionId] {
+        self.revisions_by_identity
+            .get(&(branch_id, identity_id))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -398,14 +476,11 @@ impl InMemoryGraph {
             .ok_or("unknown revision")?;
         validate_edge_cardinality(&new_edges).map_err(|_| "cardinality_violation")?;
         if let Some(old) = self.edges_by_revision.get(&revision_id) {
-            for e in old {
-                if let Some(set) = self.target_reverse.get_mut(&e.target_identity_id) {
-                    set.remove(&source_identity);
-                    if set.is_empty() {
-                        self.target_reverse.remove(&e.target_identity_id);
-                    }
-                }
-            }
+            Self::unlink_source_from_target_reverse(
+                &mut self.target_reverse,
+                source_identity,
+                old,
+            );
         }
         for e in &new_edges {
             if e.source_revision_id != revision_id {
@@ -701,6 +776,57 @@ mod tests {
         assert!(g.source_identities_targeting(i_tgt).contains(&i_src));
         g.replace_edges_for_revision(r, vec![]).unwrap();
         assert!(!g.source_identities_targeting(i_tgt).contains(&i_src));
+    }
+
+    #[test]
+    fn remove_revision_clears_target_reverse() {
+        let mut g = InMemoryGraph::default();
+        let i_src = id(1);
+        let i_tgt = id(2);
+        g.put_identity(NodeIdentity {
+            identity_id: i_src,
+            kind: NodeKind::Function,
+        });
+        g.put_identity(NodeIdentity {
+            identity_id: i_tgt,
+            kind: NodeKind::Function,
+        });
+        let r = rid(1);
+        g.put_revision(NodeRevision {
+            revision_id: r,
+            identity_id: i_src,
+            branch_id: BranchId([0u8; 16]),
+            status: RevisionStatus::Tombstone,
+            qualified_name: "f".into(),
+            file_path: "a.py".into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: Some(1),
+        });
+        let edge = GraphEdge {
+            edge_id: [7u8; 16],
+            ty: EdgeType::RenamedFrom,
+            source_revision_id: r,
+            target_identity_id: i_tgt,
+            resolution: EdgeResolution {
+                target_signature_hash: [1u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: SourceSpan::UNKNOWN,
+        };
+        g.replace_edges_for_revision(r, vec![edge]).unwrap();
+        assert!(g.source_identities_targeting(i_tgt).contains(&i_src));
+        assert!(g.remove_revision(r));
+        assert!(
+            !g.source_identities_targeting(i_tgt).contains(&i_src),
+            "GC must unlink source from target_reverse"
+        );
+        assert!(g.source_identities_targeting(i_tgt).is_empty());
     }
 
     #[test]
