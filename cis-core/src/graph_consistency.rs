@@ -53,15 +53,17 @@ pub fn check_consistency(
     let g = graph.read();
     let mut report = ConsistencyReport::default();
 
-    let mut bound_revisions: HashSet<NodeRevisionId> = HashSet::new();
+    let mut bound_on_branch: HashSet<(BranchId, IdentityId)> = HashSet::new();
     for (key, val) in kv.scan_prefix("ri:") {
+        if key.starts_with("ri:provisional:") {
+            continue;
+        }
         if val.len() != 16 {
             continue;
         }
         let mut rev_bytes = [0u8; 16];
         rev_bytes.copy_from_slice(&val);
         let rev_id = NodeRevisionId(rev_bytes);
-        bound_revisions.insert(rev_id);
 
         let parts: Vec<&str> = key.split(':').collect();
         if parts.len() != 3 {
@@ -73,6 +75,7 @@ pub fn check_consistency(
             (Some(b), Some(i)) => (b, i),
             _ => continue,
         };
+        bound_on_branch.insert((branch, identity));
 
         let Some(rev) = g.get_revision(rev_id) else {
             report.dangling_bindings.push((branch, identity));
@@ -93,7 +96,9 @@ pub fn check_consistency(
             *active_per_identity
                 .entry((rev.branch_id, rev.identity_id))
                 .or_insert(0) += 1;
-            if !bound_revisions.contains(&rev.revision_id) {
+            // Require a binding on this revision's own branch, not any branch that
+            // happens to point at the same revision_id (e.g. after fork).
+            if !bound_on_branch.contains(&(rev.branch_id, rev.identity_id)) {
                 report.orphaned_active_without_binding.push(rev.revision_id);
             }
         }
@@ -227,6 +232,30 @@ mod tests {
         let kv = MemoryKv::new();
         let body = crate::BodyStore::new(std::sync::Arc::new(kv.clone()));
         let rep = check_consistency(&graph, &kv, &body, &[branch]);
+        assert_eq!(rep.orphaned_active_without_binding.len(), 1);
+    }
+
+    #[test]
+    fn orphaned_active_not_masked_by_other_branch_binding() {
+        let branch_a = BranchId([1u8; 16]);
+        let branch_b = BranchId([2u8; 16]);
+        let identity = IdentityId([2u8; 16]);
+        let mut g = InMemoryGraph::default();
+        let rev = mk_rev(3, 2, 1, RevisionStatus::Active);
+        g.put_identity(NodeIdentity {
+            identity_id: identity,
+            kind: NodeKind::Function,
+        });
+        g.put_revision(rev.clone());
+        let graph = SharedInMemoryGraph::new(g);
+        let kv = MemoryKv::new();
+        // Binding only on branch B — must not satisfy Active on branch A.
+        kv.set(
+            &revision_binding_kv_key(branch_b, identity),
+            rev.revision_id.0.to_vec(),
+        );
+        let body = crate::BodyStore::new(std::sync::Arc::new(kv.clone()));
+        let rep = check_consistency(&graph, &kv, &body, &[branch_a]);
         assert_eq!(rep.orphaned_active_without_binding.len(), 1);
     }
 
