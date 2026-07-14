@@ -49,9 +49,11 @@ impl TombstoneGcWorker {
         g.revisions()
             .filter(|r| matches!(r.status, RevisionStatus::Tombstone))
             .filter(|r| {
+                // Missing timestamp → treat as ancient / eligible for GC (aligned with
+                // rename window excluding untimestamped tombs from candidates).
                 r.tombstoned_at_ms
                     .map(|t| now_ms.saturating_sub(t) >= retention_ms)
-                    .unwrap_or(false)
+                    .unwrap_or(true)
             })
             .filter(|r| !bound.contains(&r.revision_id))
             .filter(|r| !protected_snapshots.contains(&r.revision_id))
@@ -98,7 +100,11 @@ impl TombstoneGcWorker {
 
 fn bound_revision_ids(kv: &MemoryKv) -> HashSet<NodeRevisionId> {
     let mut out = HashSet::new();
-    for (_, val) in kv.scan_prefix("ri:") {
+    for (key, val) in kv.scan_prefix("ri:") {
+        // Skip provisional CAS rows (`ri:provisional:...`); only real bindings are 16-byte rev ids.
+        if key.starts_with("ri:provisional:") {
+            continue;
+        }
         if val.len() == 16 {
             let mut b = [0u8; 16];
             b.copy_from_slice(&val);
@@ -147,32 +153,37 @@ fn delete_revision(
     vector_queue: &VectorCleanupQueue,
     revision_id: NodeRevisionId,
 ) -> Result<(), &'static str> {
-    let body_hash = {
+    let (identity_id, _body_hash) = {
         let g = graph.read();
         let rev = g.get_revision(revision_id).ok_or("missing revision")?;
         if !matches!(rev.status, RevisionStatus::Tombstone) {
             return Err("not tombstone");
         }
-        rev.body_hash
+        (rev.identity_id, rev.body_hash)
     };
     {
         let mut g = graph.write();
         g.remove_revision(revision_id);
     }
     for (key, val) in kv.scan_prefix("ri:") {
+        if key.starts_with("ri:provisional:") {
+            continue;
+        }
         if val.len() == 16 && val == revision_id.0.to_vec() {
             kv.delete(&key);
         }
     }
-    let _ = body_hash;
-    vector_queue.enqueue_delete(body_hash);
+    crate::edge_target_override::delete_eto_for_source_revision(kv, revision_id);
+    // Queue the lifecycle chunk_id (not body_hash) so VectorStore refcounting works.
+    let cid = crate::chunk_id::chunk_id(identity_id, revision_id, 0);
+    vector_queue.enqueue_delete(cid);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Language, NodeIdentity, NodeKind, NodeRevision, SourceType};
+    use crate::graph::{Language, NodeKind, NodeRevision};
     use cis_wal::MutationLog;
 
     fn tombstone_rev(id: u8, tombstoned_ms: u64) -> NodeRevision {
@@ -208,5 +219,30 @@ mod tests {
         let now = 10_000u64;
         let ids = worker.scan_eligible(&graph, &kv, &coord, &policy, now);
         assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn delete_revision_clears_eto_rows() {
+        let mut g = InMemoryGraph::default();
+        let rid = NodeRevisionId([7u8; 16]);
+        let mut rev = tombstone_rev(7, 0);
+        rev.revision_id = rid;
+        g.put_identity(crate::graph::NodeIdentity {
+            identity_id: rev.identity_id,
+            kind: NodeKind::Function,
+        });
+        g.put_revision(rev);
+        let graph = SharedInMemoryGraph::new(g);
+        let kv = MemoryKv::new();
+        let branch = BranchId([0u8; 16]);
+        let edge_id = [3u8; 16];
+        let key = crate::edge_target_override::eto_key(branch, rid, edge_id);
+        kv.set(&key, cis_wal::IdentityId([4u8; 16]).0.to_vec());
+        assert!(kv.get(&key).is_some());
+
+        let vq = VectorCleanupQueue::default();
+        delete_revision(&graph, &kv, &vq, rid).unwrap();
+        assert!(kv.get(&key).is_none());
+        assert!(graph.read().get_revision(rid).is_none());
     }
 }

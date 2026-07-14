@@ -19,6 +19,24 @@ pub fn eto_key(branch_id: BranchId, source_revision: NodeRevisionId, edge_id: [u
     )
 }
 
+/// Remove every `eto:*:{source_rev}:*` row (all branches) for a GC'd revision.
+pub fn delete_eto_for_source_revision(kv: &MemoryKv, source_rev: NodeRevisionId) -> usize {
+    let rev_hex = hex16(&source_rev.0);
+    let mut keys = Vec::new();
+    for (k, _) in kv.scan_prefix("eto:") {
+        let parts: Vec<&str> = k.split(':').collect();
+        // eto:{branch}:{source_rev}:{edge_id}
+        if parts.len() == 4 && parts[2] == rev_hex {
+            keys.push(k);
+        }
+    }
+    let n = keys.len();
+    for k in keys {
+        kv.delete(&k);
+    }
+    n
+}
+
 #[derive(Debug)]
 pub struct EdgeTargetOverrideStore {
     kv: Arc<MemoryKv>,
@@ -95,6 +113,51 @@ impl EdgeTargetOverrideStore {
     ) {
         self.kv.delete(&eto_key(branch_id, source_rev, edge_id));
     }
+
+    /// Remove every `eto:*:{source_rev}:*` row (all branches) for a GC'd revision.
+    pub fn delete_overrides_for_source_revision(&self, source_rev: NodeRevisionId) -> usize {
+        delete_eto_for_source_revision(&self.kv, source_rev)
+    }
+
+    /// `(branch, source_rev, edge_id)` for every ETO whose override target is `target`.
+    pub fn overrides_targeting(
+        &self,
+        target: IdentityId,
+    ) -> Vec<(BranchId, NodeRevisionId, [u8; 16])> {
+        let want = target.0.as_slice();
+        let mut out = Vec::new();
+        for (k, v) in self.kv.scan_prefix("eto:") {
+            if v.as_slice() != want {
+                continue;
+            }
+            let parts: Vec<&str> = k.split(':').collect();
+            if parts.len() != 4 {
+                continue;
+            }
+            let Some(branch) = parse_hex16_id(parts[1]).map(BranchId) else {
+                continue;
+            };
+            let Some(source_rev) = parse_hex16_id(parts[2]).map(NodeRevisionId) else {
+                continue;
+            };
+            let Some(edge_id) = parse_hex16_id(parts[3]) else {
+                continue;
+            };
+            out.push((branch, source_rev, edge_id));
+        }
+        out
+    }
+}
+
+fn parse_hex16_id(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut b = [0u8; 16];
+    for i in 0..16 {
+        b[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(b)
 }
 
 #[cfg(test)]
@@ -199,5 +262,38 @@ mod tests {
             s.effective_target_identity_in_chain(&[feature, main], &edge),
             child_alt
         );
+    }
+
+    #[test]
+    fn delete_overrides_for_source_revision_clears_all_branches() {
+        let kv = Arc::new(MemoryKv::new());
+        let s = EdgeTargetOverrideStore::new(Arc::clone(&kv));
+        let b1 = BranchId([1u8; 16]);
+        let b2 = BranchId([2u8; 16]);
+        let r = NodeRevisionId([9u8; 16]);
+        let other = NodeRevisionId([8u8; 16]);
+        let e = [3u8; 16];
+        let t = IdentityId([4u8; 16]);
+        s.set_override(b1, r, e, t);
+        s.set_override(b2, r, e, t);
+        s.set_override(b1, other, e, t);
+        assert_eq!(s.delete_overrides_for_source_revision(r), 2);
+        assert!(s.get_override(b1, r, e).is_none());
+        assert!(s.get_override(b2, r, e).is_none());
+        assert_eq!(s.get_override(b1, other, e), Some(t));
+    }
+
+    #[test]
+    fn overrides_targeting_finds_eto_rows() {
+        let kv = Arc::new(MemoryKv::new());
+        let s = EdgeTargetOverrideStore::new(kv);
+        let b = BranchId([1u8; 16]);
+        let r = NodeRevisionId([2u8; 16]);
+        let e = [3u8; 16];
+        let t = IdentityId([9u8; 16]);
+        s.set_override(b, r, e, t);
+        let hits = s.overrides_targeting(t);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0], (b, r, e));
     }
 }
