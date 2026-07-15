@@ -25,7 +25,10 @@ pub struct QueryMeta {
     pub query_latency_ms: u64,
     pub node_count: usize,
     pub stale_count: usize,
-    pub speculative_count: usize,
+    /// Orphaned revision rows observed for the query subject.
+    /// Serde alias keeps older clients that still send/expect `speculative_count` for this slot.
+    #[serde(alias = "speculative_count")]
+    pub orphaned_count: usize,
     pub pruned_low_confidence_count: usize,
     pub tokenizer_mode: String,
     pub speculative_excluded_from_vector: bool,
@@ -62,7 +65,7 @@ impl Default for QueryMeta {
             query_latency_ms: 0,
             node_count: 0,
             stale_count: 0,
-            speculative_count: 0,
+            orphaned_count: 0,
             pruned_low_confidence_count: 0,
             tokenizer_mode: "char_approximation".into(),
             speculative_excluded_from_vector: true,

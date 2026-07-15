@@ -155,6 +155,7 @@ pub const DURABLE_KV_PREFIXES: &[&str] = &[
     "ri:",
     "ris:",
     "tt:",
+    "deleted:",
     "merge_ctx:",
     "saga_state:",
     "saga_batch:",

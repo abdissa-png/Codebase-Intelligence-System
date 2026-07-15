@@ -5,6 +5,7 @@ use std::collections::{HashSet, VecDeque};
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
 use crate::confidence::{edge_confidence, node_confidence_from_inbound, path_confidence, path_floor};
+use crate::deletion_absence::DeletionAbsenceStore;
 use crate::edge_target_override::EdgeTargetOverrideStore;
 use crate::graph::{
     EdgeType, GraphEdge, InMemoryGraph, NodeKind, NodeRevision, RevisionStatus, SourceType,
@@ -96,11 +97,32 @@ pub fn rename_successor_identity(g: &InMemoryGraph, tombstone_revision: NodeRevi
 ///
 /// **Active** and **Speculative** revisions are both queryable (speculative covers in-flight
 /// `write_file` / patch edits on the editing branch).
+///
+/// Prefer [`resolve_identity_revision_with_absence`] for interactive queries so durable
+/// `deleted:` markers survive tombstone GC.
 pub fn resolve_identity_revision<'a>(
     g: &'a InMemoryGraph,
     chain: &[BranchId],
     identity_id: IdentityId,
 ) -> Option<&'a NodeRevision> {
+    resolve_identity_revision_with_absence(g, chain, identity_id, None)
+}
+
+/// Like [`resolve_identity_revision`], but honors durable deletion absence markers.
+///
+/// Nearest-first: if any branch in `chain` has `deleted:{branch}:{identity}`, the identity
+/// is treated as absent (does not fall through to an ancestor Active revision).
+pub fn resolve_identity_revision_with_absence<'a>(
+    g: &'a InMemoryGraph,
+    chain: &[BranchId],
+    identity_id: IdentityId,
+    absence: Option<&DeletionAbsenceStore>,
+) -> Option<&'a NodeRevision> {
+    if let Some(store) = absence {
+        if store.is_deleted_in_chain(chain, identity_id) {
+            return None;
+        }
+    }
     let primary = g.primary_revision_for_identity_in_chain(chain, identity_id)?;
     if matches!(
         primary.status,
@@ -110,6 +132,12 @@ pub fn resolve_identity_revision<'a>(
     }
     if matches!(primary.status, RevisionStatus::Tombstone) {
         let successor = rename_successor_identity(g, primary.revision_id)?;
+        // Successor may itself be marked deleted on a nearer branch.
+        if let Some(store) = absence {
+            if store.is_deleted_in_chain(chain, successor) {
+                return None;
+            }
+        }
         return g
             .primary_revision_for_identity_in_chain(chain, successor)
             .filter(|r| {
@@ -132,11 +160,22 @@ pub fn resolve_edge_target<'a>(
     chain: &[BranchId],
     edge: &GraphEdge,
 ) -> Option<&'a NodeRevision> {
+    resolve_edge_target_with_absence(g, eto, chain, edge, None)
+}
+
+/// Like [`resolve_edge_target`] with deletion absence.
+pub fn resolve_edge_target_with_absence<'a>(
+    g: &'a InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
+    chain: &[BranchId],
+    edge: &GraphEdge,
+    absence: Option<&DeletionAbsenceStore>,
+) -> Option<&'a NodeRevision> {
     if chain.is_empty() {
         return None;
     }
     let target_id = eto.effective_target_identity_in_chain(chain, edge);
-    resolve_identity_revision(g, chain, target_id)
+    resolve_identity_revision_with_absence(g, chain, target_id, absence)
 }
 
 fn min_source_on_path(current: SourceType, edge: &GraphEdge) -> SourceType {
@@ -150,19 +189,43 @@ fn min_source_on_path(current: SourceType, edge: &GraphEdge) -> SourceType {
 
 fn inbound_edge_confidences(
     g: &InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     identity_id: IdentityId,
     now_ms: u64,
     half_life_ms: u64,
+    absence: Option<&DeletionAbsenceStore>,
 ) -> Vec<f64> {
     let mut confs = Vec::new();
+    let mut seen_edges: HashSet<[u8; 16]> = HashSet::new();
+
+    let mut push_if_effective = |e: &GraphEdge| {
+        if eto.effective_target_identity_in_chain(chain, e) != identity_id {
+            return;
+        }
+        if !seen_edges.insert(e.edge_id) {
+            return;
+        }
+        confs.push(edge_confidence(e, now_ms, half_life_ms));
+    };
+
     for sid in g.source_identities_targeting(identity_id) {
-        let Some(src) = resolve_identity_revision(g, chain, sid) else {
+        let Some(src) = resolve_identity_revision_with_absence(g, chain, sid, absence) else {
             continue;
         };
         for e in g.outbound_edges(src.revision_id) {
-            if e.target_identity_id == identity_id {
-                confs.push(edge_confidence(e, now_ms, half_life_ms));
+            push_if_effective(e);
+        }
+    }
+
+    // ETO may retarget an edge whose raw target is not `identity_id`.
+    for (eto_branch, source_rev, edge_id) in eto.overrides_targeting(identity_id) {
+        if !chain.iter().any(|b| *b == eto_branch) {
+            continue;
+        }
+        for e in g.outbound_edges(source_rev) {
+            if e.edge_id == edge_id {
+                push_if_effective(e);
             }
         }
     }
@@ -172,12 +235,27 @@ fn inbound_edge_confidences(
 /// Node confidence for MCP hits (**§01.1**).
 pub fn node_hit_confidence(
     g: &InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
     rev: &NodeRevision,
     chain: &[BranchId],
     now_ms: u64,
     half_life_ms: u64,
 ) -> f64 {
-    let inbound = inbound_edge_confidences(g, chain, rev.identity_id, now_ms, half_life_ms);
+    node_hit_confidence_with_absence(g, eto, rev, chain, now_ms, half_life_ms, None)
+}
+
+/// Like [`node_hit_confidence`] with deletion absence for inbound source resolution.
+pub fn node_hit_confidence_with_absence(
+    g: &InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
+    rev: &NodeRevision,
+    chain: &[BranchId],
+    now_ms: u64,
+    half_life_ms: u64,
+    absence: Option<&DeletionAbsenceStore>,
+) -> f64 {
+    let inbound =
+        inbound_edge_confidences(g, eto, chain, rev.identity_id, now_ms, half_life_ms, absence);
     node_confidence_from_inbound(&inbound, SourceType::Ast)
 }
 
@@ -198,6 +276,20 @@ pub fn expand_context_bfs(
     depth: u32,
     now_ms: u64,
 ) -> ExpandContextResult {
+    expand_context_bfs_with_absence(g, eto, policy, chain, start, depth, now_ms, None)
+}
+
+/// Like [`expand_context_bfs`] with deletion absence.
+pub fn expand_context_bfs_with_absence(
+    g: &InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
+    policy: &RankingPolicySnapshot,
+    chain: &[BranchId],
+    start: NodeRevisionId,
+    depth: u32,
+    now_ms: u64,
+    absence: Option<&DeletionAbsenceStore>,
+) -> ExpandContextResult {
     let half_life_ms = policy.recency.half_life_days as u64 * 24 * 60 * 60 * 1000;
     let min_path = policy.min_path_confidence;
     let mut seen_rev: HashSet<NodeRevisionId> = HashSet::new();
@@ -215,7 +307,7 @@ pub fn expand_context_bfs(
             continue;
         }
         let node_conf = if rid == start {
-            node_hit_confidence(g, r, chain, now_ms, half_life_ms)
+            node_hit_confidence_with_absence(g, eto, r, chain, now_ms, half_life_ms, absence)
         } else {
             path_confidence(&path_edge_confs, min_src)
         };
@@ -239,7 +331,7 @@ pub fn expand_context_bfs(
                 pruned += 1;
                 continue;
             }
-            let Some(next_rev) = resolve_edge_target(g, eto, chain, e) else {
+            let Some(next_rev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) else {
                 pruned += 1;
                 continue;
             };
@@ -260,16 +352,27 @@ pub fn resolve_definition_target<'a>(
     chain: &[BranchId],
     source_revision: NodeRevisionId,
 ) -> Option<&'a NodeRevision> {
+    resolve_definition_target_with_absence(g, eto, chain, source_revision, None)
+}
+
+/// Like [`resolve_definition_target`] with deletion absence.
+pub fn resolve_definition_target_with_absence<'a>(
+    g: &'a InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
+    chain: &[BranchId],
+    source_revision: NodeRevisionId,
+    absence: Option<&DeletionAbsenceStore>,
+) -> Option<&'a NodeRevision> {
     for e in outbound_context_edges(g, chain, source_revision) {
         if e.ty == EdgeType::Calls {
-            if let Some(trev) = resolve_edge_target(g, eto, chain, e) {
+            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) {
                 return Some(trev);
             }
         }
     }
     for e in outbound_context_edges(g, chain, source_revision) {
         if matches!(e.ty, EdgeType::Imports | EdgeType::Extends) {
-            if let Some(trev) = resolve_edge_target(g, eto, chain, e) {
+            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) {
                 return Some(trev);
             }
         }
@@ -647,5 +750,93 @@ mod tests {
         let resolved = resolve_identity_revision(&g, &chain, iid).unwrap();
         assert_eq!(resolved.revision_id, main_rid);
         assert_eq!(resolved.branch_id, main);
+    }
+
+    #[test]
+    fn absence_hides_parent_even_without_local_tombstone() {
+        use crate::deletion_absence::DeletionAbsenceStore;
+        use crate::MemoryKv;
+
+        let mut g = InMemoryGraph::default();
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let iid = IdentityId([42u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: iid,
+            kind: NodeKind::Function,
+        });
+        let main_rid = NodeRevisionId([81u8; 16]);
+        g.put_revision(NodeRevision {
+            revision_id: main_rid,
+            identity_id: iid,
+            branch_id: main,
+            status: RevisionStatus::Active,
+            qualified_name: "gone".into(),
+            file_path: "t.py".into(),
+            body_hash: [3u8; 32],
+            signature_hash: [3u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        // No feature revision at all (tombstone already GC'd) — only the absence marker.
+        let kv = Arc::new(MemoryKv::new());
+        let absence = DeletionAbsenceStore::new(kv);
+        absence.mark_deleted(feature, iid);
+        let chain = [feature, main];
+        assert!(
+            resolve_identity_revision_with_absence(&g, &chain, iid, Some(&absence)).is_none(),
+            "absence must hide parent Active after overlay GC"
+        );
+        // Without absence, parent would be visible:
+        assert_eq!(
+            resolve_identity_revision(&g, &chain, iid)
+                .unwrap()
+                .revision_id,
+            main_rid
+        );
+        // Parent branch alone still sees it:
+        assert!(
+            resolve_identity_revision_with_absence(&g, &[main], iid, Some(&absence)).is_some()
+        );
+    }
+
+    #[test]
+    fn clearing_absence_restores_inheritance() {
+        use crate::deletion_absence::DeletionAbsenceStore;
+        use crate::MemoryKv;
+
+        let mut g = InMemoryGraph::default();
+        let main = BranchId([1u8; 16]);
+        let feature = BranchId([2u8; 16]);
+        let iid = IdentityId([43u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: iid,
+            kind: NodeKind::Function,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: NodeRevisionId([83u8; 16]),
+            identity_id: iid,
+            branch_id: main,
+            status: RevisionStatus::Active,
+            qualified_name: "restored".into(),
+            file_path: "r.py".into(),
+            body_hash: [4u8; 32],
+            signature_hash: [4u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let kv = Arc::new(MemoryKv::new());
+        let absence = DeletionAbsenceStore::new(kv);
+        absence.mark_deleted(feature, iid);
+        let chain = [feature, main];
+        assert!(resolve_identity_revision_with_absence(&g, &chain, iid, Some(&absence)).is_none());
+        absence.clear_deleted(feature, iid);
+        assert!(resolve_identity_revision_with_absence(&g, &chain, iid, Some(&absence)).is_some());
     }
 }

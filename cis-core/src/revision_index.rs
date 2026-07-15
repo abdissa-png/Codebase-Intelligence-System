@@ -34,6 +34,9 @@ fn hex_branch_id(branch_id: BranchId) -> String {
 }
 
 /// Copy every `ri:{parent}:{identity}` row to `ri:{child}:{identity}` at branch creation.
+///
+/// ETO rows (`eto:{branch}:…`) are **not** copied: interactive queries inherit parent
+/// overrides via [`crate::edge_target_override::EdgeTargetOverrideStore::effective_target_identity_in_chain`].
 pub fn fork_branch_bindings(kv: &MemoryKv, parent: BranchId, child: BranchId) -> usize {
     let parent_hex = hex_branch_id(parent);
     let child_hex = hex_branch_id(child);

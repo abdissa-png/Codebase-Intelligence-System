@@ -290,3 +290,54 @@ fn find_symbol_at_sees_inherited_overlay_bindings() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn deleted_file_hides_inherited_symbols_on_feature() {
+    use cis_core::{apply_index_events, FsChangeKind, IndexEvent, IndexEventQueue};
+    use std::sync::Arc;
+
+    let root = temp_repo("filedel");
+    let rt = CisMcpRuntime::new_dev(&root.to_string_lossy());
+    let rel = "gone.py";
+    fs::write(root.join(rel), "def survivor():\n    return 1\n").unwrap();
+    rt.reindex_python_paths(&[rel]).expect("ingest");
+    rt.create_branch(0, "feature", Some("main")).unwrap();
+    rt.switch_branch(0, "feature").unwrap();
+
+    fs::remove_file(root.join(rel)).unwrap();
+    let q = IndexEventQueue::new();
+    let branch = rt.active_branch();
+    apply_index_events(
+        &q,
+        rt.coordinator(),
+        Arc::clone(rt.kv()),
+        vec![IndexEvent {
+            branch_id: branch,
+            path: rel.into(),
+            kind: FsChangeKind::Deleted,
+            old_path: None,
+        }],
+        |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")),
+        None,
+        None,
+    )
+    .expect("delete ingest");
+
+    let found = rt.find_symbol(0, "survivor", None, 10, false).unwrap();
+    assert!(
+        !names(&found.matches).iter().any(|n| n.contains("survivor")),
+        "deleted file must hide inherited symbols on feature: {:?}",
+        names(&found.matches)
+    );
+
+    rt.switch_branch(0, "main").unwrap();
+    let on_main = rt.find_symbol(0, "survivor", None, 10, false).unwrap();
+    assert!(
+        names(&on_main.matches)
+            .iter()
+            .any(|n| n.contains("survivor")),
+        "main must still see the symbol"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

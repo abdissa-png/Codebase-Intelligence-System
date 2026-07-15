@@ -16,6 +16,7 @@ mod confirm_token;
 mod coordinator;
 mod daemon_handles;
 mod degraded;
+mod deletion_absence;
 mod edge_target_override;
 mod embedder;
 mod env_file;
@@ -66,6 +67,7 @@ mod repo_bootstrap;
 mod reconciliation;
 mod revision_cow;
 mod revision_index;
+mod revision_lineage;
 mod shared_graph;
 mod time_travel;
 mod tombstone_gc;
@@ -80,7 +82,8 @@ mod vector_store;
 
 pub use body_blob::{
     bodies_dir, bodies_db_path, body_backend_from_env, body_blob_path, gc_bodies,
-    gc_bodies_with_store, gc_body_blob_files, gc_body_blobs, hydrate_bodies_from_disk,
+    gc_bodies_for_branch, gc_bodies_with_store, gc_body_blob_files, gc_body_blobs,
+    hydrate_bodies_from_disk,
     hydrate_bodies_from_store, load_body_blob, load_body_blob_with_fallback,
     open_body_blob_store, referenced_body_hashes, save_body_blob, sync_bodies_to_disk,
     sync_bodies_to_store, walk_body_files_pub, BodyBackendKind, BodyBlobStore,
@@ -119,14 +122,17 @@ pub use confidence::{
 };
 pub use query_engine::{
     count_pruned_expand_neighbors, count_unresolved_definition_edges, expand_context_bfs,
-    file_hub_revision_for_path, is_opaque_traversal_gate, node_hit_confidence,
-    outbound_context_edges, rename_successor_identity, resolve_definition_target, resolve_edge_target,
-    resolve_identity_revision, ExpandContextResult,
+    expand_context_bfs_with_absence, file_hub_revision_for_path, is_opaque_traversal_gate,
+    node_hit_confidence, node_hit_confidence_with_absence, outbound_context_edges,
+    rename_successor_identity, resolve_definition_target, resolve_definition_target_with_absence,
+    resolve_edge_target, resolve_edge_target_with_absence, resolve_identity_revision,
+    resolve_identity_revision_with_absence, ExpandContextResult,
 };
 pub use coordinator::{CoordinatorError, CoordinatorPersistence, WriteCoordinator};
 pub use daemon_handles::CisDaemonHandles;
 pub use degraded::{disk_free_percent, DiskPressureFlag, VectorDegradedController};
-pub use edge_target_override::{eto_key, EdgeTargetOverrideStore};
+pub use deletion_absence::{deleted_key, DeletionAbsenceStore};
+pub use edge_target_override::{delete_eto_for_source_revision, eto_key, EdgeTargetOverrideStore};
 pub use embedder::{
     api_embedder_configured, cosine_similarity, embedder_from_env, embeddings_endpoint_url,
     l2_normalize, EmbedError, Embedder, StubEmbedder, STUB_EMBED_DIM,
@@ -171,7 +177,8 @@ pub use language_indexer::{
     default_indexers, indexer_for_path, IndexError, LanguageIndexer, PythonIndexer,
 };
 pub use identity_resolution::{
-    best_tombstone_rename, tombstone_all_file_symbols, RenameConfig, ResolveOutcome,
+    best_tombstone_rename, tombstone_all_file_symbols, tombstone_all_file_symbols_with_absence,
+    tombstone_orphaned_file_symbols_with_absence, RenameConfig, ResolveOutcome,
 };
 pub use identity_resolver::{
     IdentityResolver, RenameEvidence, RenameSignalKind,
@@ -181,9 +188,9 @@ pub use ingest::{
     load_file_body, module_map_from_paths, module_map_for_paths, path_to_python_module_key,
     paths_on_branch, python_paths_on_branch,
     body_store_slot_key, branch_id_tag, content_checksum_32, file_body_hash_key,
-    regen_edges_for_file_with_graph,
+    identity_cas_semantic_hash, regen_edges_for_file_with_graph,
     regen_edges_for_python_file, regen_edges_for_python_file_with_graph, stable_id_bytes,
-    stable_rev_id_bytes, FsChangeKind,
+    stable_rev_id_bytes, content_rev_id_bytes, FsChangeKind,
     IdentityResolverShell,
     IngestApplyReport, IndexEvent, IndexEventQueue,
 };
@@ -269,6 +276,10 @@ pub use reconciliation::{PeriodicReconciler, RecoveryReport, ReconciliationEngin
 pub use revision_cow::{ris_snapshot_kv_key, RevisionIndexCow};
 pub use revision_index::{
     branch_ancestry, fork_branch_bindings, revision_binding_kv_key, RevisionIndex,
+};
+pub use revision_lineage::{
+    lineage_for_identity, lineage_from_revision, merge_base_revision,
+    retire_revision_to_tombstone, LineageLink, LineageOptions, LineageStep,
 };
 pub use saga::{MergeSagaOrchestrator, SagaPhase};
 pub use security::{
