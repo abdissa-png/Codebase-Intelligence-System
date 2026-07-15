@@ -61,11 +61,15 @@ pub fn body_backend_from_env() -> BodyBackendKind {
     }
 }
 
-/// Collect `body_hash` values referenced by live graph revisions on `branch`.
+/// Collect `body_hash` values referenced by graph revisions on `branch`.
+///
+/// When `include_tombstones` is true, tombstone bodies are kept/hydrated so rename
+/// detection and consistency checks survive process restart.
 pub fn referenced_body_hashes(
     graph: &InMemoryGraph,
     branch: BranchId,
     include_speculative: bool,
+    include_tombstones: bool,
 ) -> HashSet<[u8; 32]> {
     let mut out = HashSet::new();
     for r in graph.revisions() {
@@ -73,7 +77,8 @@ pub fn referenced_body_hashes(
             continue;
         }
         let live = matches!(r.status, RevisionStatus::Active)
-            || (include_speculative && matches!(r.status, RevisionStatus::Speculative));
+            || (include_speculative && matches!(r.status, RevisionStatus::Speculative))
+            || (include_tombstones && matches!(r.status, RevisionStatus::Tombstone));
         if live {
             out.insert(r.body_hash);
             if r.qualified_name == r.file_path {
@@ -429,9 +434,8 @@ pub fn gc_bodies_with_store(
     keep: &HashSet<[u8; 32]>,
 ) -> io::Result<usize> {
     let mut removed = store.gc_except(keep)?;
-    if body_backend_from_env() == BodyBackendKind::File {
-        removed += gc_body_blob_files(cis_dir, keep)?;
-    }
+    // File backend's gc_except already walks `.cis/bodies/`; do not double-walk.
+    let _ = cis_dir;
     for (k, _) in kv.scan_prefix("body:") {
         let Some(hex) = k.strip_prefix("body:") else {
             continue;
@@ -445,6 +449,24 @@ pub fn gc_bodies_with_store(
         }
     }
     Ok(removed)
+}
+
+/// GC bodies while keeping hashes referenced by `graph` on `branch`.
+///
+/// Prefer this over building a live-only `keep` set by hand: omitting tombstones
+/// (`include_tombstones = false`) deletes rename-candidate bodies from the in-memory store.
+pub fn gc_bodies_for_branch(
+    store: &dyn BodyBlobStore,
+    cis_dir: &Path,
+    body_store: &BodyStore,
+    kv: &crate::kv::MemoryKv,
+    graph: &crate::graph::InMemoryGraph,
+    branch: BranchId,
+    include_speculative: bool,
+    include_tombstones: bool,
+) -> io::Result<usize> {
+    let keep = referenced_body_hashes(graph, branch, include_speculative, include_tombstones);
+    gc_bodies_with_store(store, cis_dir, body_store, kv, &keep)
 }
 
 /// GC in-memory `body:` keys and blob store.

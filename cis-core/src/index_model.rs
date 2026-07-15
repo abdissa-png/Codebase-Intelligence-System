@@ -52,6 +52,18 @@ pub fn stable_rev_id_bytes(branch: BranchId, path: &str, stable_key: &str) -> [u
     stable_id_bytes("rev", &tag, &format!("{path}\x1f{stable_key}"))
 }
 
+/// Content-addressed revision id for append-only symbol history (distinct body per slot).
+pub fn content_rev_id_bytes(
+    branch: BranchId,
+    path: &str,
+    stable_key: &str,
+    body_hash: [u8; 32],
+) -> [u8; 16] {
+    let hex: String = body_hash.iter().map(|b| format!("{:02x}", b)).collect();
+    let tag = branch_id_tag(branch);
+    stable_id_bytes("revgen", &tag, &format!("{path}\x1f{stable_key}\x1f{hex}"))
+}
+
 /// Stable edge id including source revision + anchor (Option B — restart-safe SQLite rows).
 pub(crate) fn edge_id_bytes(
     tag: &str,
@@ -63,6 +75,12 @@ pub(crate) fn edge_id_bytes(
     let src_hex: String = src.0.iter().map(|b| format!("{:02x}", b)).collect();
     let key = format!("{src_hex}:{label}:{}:{}", anchor.start_line, anchor.start_col);
     stable_id_bytes(tag, path, &key)
+}
+
+/// Structural CAS key for identity provisional allocation — **path + stable_key**, not body text.
+/// Body-identical stubs in different files must not share a CAS slot.
+pub fn identity_cas_semantic_hash(path: &str, stable_key: &str) -> [u8; 32] {
+    hash32_key("cas", path, stable_key)
 }
 
 /// Structural BodyStore slot for a symbol (distinct from [`NodeRevision::body_hash`] content checksum).

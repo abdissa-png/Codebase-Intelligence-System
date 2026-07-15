@@ -51,6 +51,26 @@ pub trait GraphStore: Send + Sync {
         let _ = (source, edges);
         Ok(())
     }
+    /// Batch upsert affected revisions (+ optional blob refresh) in one connection when supported.
+    fn apply_delta(&self, graph: &InMemoryGraph, affected: &[NodeRevisionId]) -> io::Result<()> {
+        let mut seen_identities = std::collections::HashSet::new();
+        for rid in affected {
+            if let Some(rev) = graph.get_revision(*rid) {
+                if seen_identities.insert(rev.identity_id) {
+                    if let Some(kind) = graph.identity_kind(rev.identity_id) {
+                        self.upsert_identity(&NodeIdentity {
+                            identity_id: rev.identity_id,
+                            kind,
+                        })?;
+                    }
+                }
+                self.upsert_revision(rev)?;
+                let edges: Vec<_> = graph.outbound_edges(*rid).into_iter().cloned().collect();
+                self.upsert_edges(*rid, &edges)?;
+            }
+        }
+        Ok(())
+    }
     fn tombstone_file(&self, branch: BranchId, path: &str) -> io::Result<()> {
         let _ = (branch, path);
         Ok(())
@@ -472,6 +492,19 @@ mod sqlite {
             Ok(())
         }
 
+        fn write_blob(conn: &Connection, graph: &InMemoryGraph) -> io::Result<()> {
+            let snap = graph.to_snapshot();
+            let payload = serde_json::to_vec(&snap)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            conn.execute(
+                "INSERT INTO graph_snapshot (id, version, payload) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET version = excluded.version, payload = excluded.payload",
+                params![snap.version, payload],
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(())
+        }
+
         fn write_normalized(conn: &Connection, graph: &InMemoryGraph) -> io::Result<()> {
             let snap = graph.to_snapshot();
             conn.execute_batch("DELETE FROM edges; DELETE FROM revisions; DELETE FROM identities;")
@@ -512,12 +545,12 @@ mod sqlite {
                     if let Ok(Some(blob_n)) = Self::blob_edge_count(conn) {
                         let norm_n = Self::edge_count(conn)? as usize;
                         if norm_n != blob_n {
+                            // Prefer normalized rows (source of truth after incremental deltas);
+                            // refresh the blob so a later load does not discard them.
                             eprintln!(
-                                "cis: graph.db normalized edge count ({norm_n}) != blob ({blob_n}); rebuilding normalized rows"
+                                "cis: graph.db normalized edge count ({norm_n}) != blob ({blob_n}); refreshing blob from normalized"
                             );
-                            if Self::load_from_blob(conn, graph)? {
-                                Self::write_normalized(conn, graph)?;
-                            }
+                            Self::write_blob(conn, graph)?;
                         }
                     }
                     return Ok(true);
@@ -535,15 +568,7 @@ mod sqlite {
                     .unchecked_transaction()
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 Self::write_normalized(&tx, graph)?;
-                let snap = graph.to_snapshot();
-                let payload = serde_json::to_vec(&snap)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                tx.execute(
-                    "INSERT INTO graph_snapshot (id, version, payload) VALUES (1, ?1, ?2)
-                     ON CONFLICT(id) DO UPDATE SET version = excluded.version, payload = excluded.payload",
-                    params![snap.version, payload],
-                )
-                .map_err(|e| io::Error::other(e.to_string()))?;
+                Self::write_blob(&tx, graph)?;
                 tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
                 Ok(())
             })
@@ -571,13 +596,88 @@ mod sqlite {
             })
         }
 
+        fn apply_delta(&self, graph: &InMemoryGraph, affected: &[NodeRevisionId]) -> io::Result<()> {
+            self.with_conn(|conn| {
+                let tx = conn
+                    .unchecked_transaction()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut seen_identities = std::collections::HashSet::new();
+                for rid in affected {
+                    let Some(rev) = graph.get_revision(*rid) else {
+                        continue;
+                    };
+                    if seen_identities.insert(rev.identity_id) {
+                        if let Some(kind) = graph.identity_kind(rev.identity_id) {
+                            Self::insert_identity(
+                                &tx,
+                                &NodeIdentity {
+                                    identity_id: rev.identity_id,
+                                    kind,
+                                },
+                            )?;
+                        }
+                    }
+                    Self::insert_revision(&tx, rev)?;
+                    tx.execute(
+                        "DELETE FROM edges WHERE source_revision_id = ?1",
+                        params![rid.0.as_slice()],
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                    for e in graph.outbound_edges(*rid) {
+                        Self::insert_edge(&tx, e)?;
+                    }
+                }
+                // Keep blob in sync so load_into mismatch logic cannot discard deltas.
+                Self::write_blob(&tx, graph)?;
+                tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
+                Ok(())
+            })
+        }
+
         fn tombstone_file(&self, branch: BranchId, path: &str) -> io::Result<()> {
             self.with_conn(|conn| {
-                conn.execute(
-                    "UPDATE revisions SET status = 2 WHERE branch_id = ?1 AND file_path = ?2",
-                    params![branch.0.as_slice(), path],
-                )
-                .map_err(|e| io::Error::other(e.to_string()))?;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT revision_id, extra FROM revisions WHERE branch_id = ?1 AND file_path = ?2",
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let rows: Vec<(Vec<u8>, Vec<u8>)> = stmt
+                    .query_map(params![branch.0.as_slice(), path], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                drop(stmt);
+                for (rev_id, extra_bytes) in rows {
+                    let mut extra: RevisionExtra = if extra_bytes.is_empty() {
+                        RevisionExtra {
+                            parent_revision_id: None,
+                            rename_source_id: None,
+                            span: SourceSpan::UNKNOWN,
+                            tombstoned_at_ms: None,
+                        }
+                    } else {
+                        serde_json::from_slice(&extra_bytes).unwrap_or(RevisionExtra {
+                            parent_revision_id: None,
+                            rename_source_id: None,
+                            span: SourceSpan::UNKNOWN,
+                            tombstoned_at_ms: None,
+                        })
+                    };
+                    extra.tombstoned_at_ms = Some(now_ms);
+                    let new_extra = serde_json::to_vec(&extra)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    conn.execute(
+                        "UPDATE revisions SET status = 2, extra = ?1 WHERE revision_id = ?2",
+                        params![new_extra, rev_id],
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                }
                 Ok(())
             })
         }
@@ -626,23 +726,7 @@ pub fn save_graph_delta(
 ) -> io::Result<()> {
     if graph_backend_from_env() == GraphBackendKind::Sqlite && !affected.is_empty() {
         let store = open_graph_store(cis);
-        let mut seen_identities = std::collections::HashSet::new();
-        for rid in affected {
-            if let Some(rev) = graph.get_revision(*rid) {
-                if seen_identities.insert(rev.identity_id) {
-                    if let Some(kind) = graph.identity_kind(rev.identity_id) {
-                        store.upsert_identity(&NodeIdentity {
-                            identity_id: rev.identity_id,
-                            kind,
-                        })?;
-                    }
-                }
-                store.upsert_revision(rev)?;
-                let edges: Vec<_> = graph.outbound_edges(*rid).into_iter().cloned().collect();
-                store.upsert_edges(*rid, &edges)?;
-            }
-        }
-        return Ok(());
+        return store.apply_delta(graph, affected);
     }
     save_graph_with_backend(cis, graph)
 }

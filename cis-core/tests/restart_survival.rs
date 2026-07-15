@@ -78,6 +78,7 @@ fn ingest_survives_simulated_process_restart() {
                 branch_id: branch,
                 path: "hello.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }],
             |rel| fs::read_to_string(root.join(rel)),
             None,
@@ -166,6 +167,7 @@ fn mcp_bootstrap_skips_reindex_when_snapshot_warm() {
                 branch_id: branch,
                 path: "m.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }],
             |rel| fs::read_to_string(root.join(rel)),
             None,
@@ -212,6 +214,7 @@ fn mcp_skip_index_loads_snapshot_only() {
                 branch_id: branch,
                 path: "snap.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }],
             |rel| fs::read_to_string(root.join(rel)),
             None,
@@ -400,6 +403,7 @@ fn body_gc_drops_orphan_hashes() {
             branch_id: branch,
             path: "x.py".into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         }],
         |rel| fs::read_to_string(root.join(rel)),
         None,
@@ -408,7 +412,7 @@ fn body_gc_drops_orphan_hashes() {
     .unwrap();
     let keep = {
         let g = coord.graph().read();
-        referenced_body_hashes(&g, branch, true)
+        referenced_body_hashes(&g, branch, true, false)
     };
     let cis = cis_core::cis_dir(&root);
     let store = FileBodyBlobStore::new(&cis);
