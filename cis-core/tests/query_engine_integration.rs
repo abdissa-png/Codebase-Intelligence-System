@@ -27,6 +27,7 @@ fn ingest(path: &str, src: &str, coord: &WriteCoordinator, kv: Arc<MemoryKv>) {
             branch_id: BRANCH,
             path: path.into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         }],
         move |_p| Ok(src.to_string()),
         None,

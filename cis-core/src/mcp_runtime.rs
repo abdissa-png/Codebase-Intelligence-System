@@ -162,7 +162,9 @@ pub struct AxisWeightBreakdown {
 #[derive(Debug, serde::Serialize)]
 pub struct ExplainCounts {
     pub stale_count: usize,
-    pub speculative_count: usize,
+    /// Orphaned revision rows for the explained identity (misnamed historically as speculative).
+    #[serde(alias = "speculative_count")]
+    pub orphaned_count: usize,
     pub pruned_low_confidence_count: usize,
 }
 
@@ -455,6 +457,7 @@ struct IndexStatusSnapshot {
     embed_chunks_registered: usize,
     unique_vectors: usize,
     body_blobs_stored: usize,
+    ann_dim_mismatch_drops: usize,
 }
 
 fn active_ingest_mode() -> &'static str {
@@ -586,6 +589,12 @@ fn hit_from_rev_and_edge(rev: &NodeRevision, edge: &GraphEdge, confidence: f64) 
 
 fn eto_for_runtime(kv: &std::sync::Arc<MemoryKv>) -> crate::edge_target_override::EdgeTargetOverrideStore {
     crate::edge_target_override::EdgeTargetOverrideStore::new(std::sync::Arc::clone(kv))
+}
+
+fn absence_for_runtime(
+    kv: &std::sync::Arc<MemoryKv>,
+) -> crate::deletion_absence::DeletionAbsenceStore {
+    crate::deletion_absence::DeletionAbsenceStore::new(std::sync::Arc::clone(kv))
 }
 
 fn query_now_ms() -> u64 {
@@ -951,27 +960,21 @@ impl CisMcpRuntime {
 
     /// **Phase 7** — GC + persist referenced bodies; rebuild ANN index.
     pub fn sync_bodies_after_commit(&self, branch: BranchId) {
+        let cis = self.cis_path();
         let keep = {
             let g = self.coordinator.graph().read();
-            let mut keep = crate::body_blob::referenced_body_hashes(&g, branch, true);
-            for r in g.revisions() {
-                if r.branch_id == branch && matches!(r.status, RevisionStatus::Tombstone) {
-                    keep.insert(r.body_hash);
-                    if r.qualified_name == r.file_path {
-                        keep.insert(crate::ingest::file_body_hash_key(&r.file_path));
-                    }
-                }
-            }
-            keep
+            let _ = crate::body_blob::gc_bodies_for_branch(
+                self.body_blob_store.as_ref(),
+                &cis,
+                &self.body_store,
+                self.kv.as_ref(),
+                &g,
+                branch,
+                true,
+                true,
+            );
+            crate::body_blob::referenced_body_hashes(&g, branch, true, true)
         };
-        let cis = self.cis_path();
-        let _ = crate::body_blob::gc_bodies_with_store(
-            self.body_blob_store.as_ref(),
-            &cis,
-            &self.body_store,
-            self.kv.as_ref(),
-            &keep,
-        );
         let _ = crate::body_blob::sync_bodies_to_store(
             self.body_blob_store.as_ref(),
             &self.body_store,
@@ -984,11 +987,35 @@ impl CisMcpRuntime {
     pub fn rebuild_ann_index(&self) {
         let vector = self.coordinator.vector();
         let snap = vector.export_snapshot();
-        let mut ann = self.ann_index.lock().unwrap();
-        ann.clear();
-        for v in snap.vectors {
-            ann.upsert(v.body_hash, v.embedding);
+        // Prefer the most common embedding dimension when models are mixed.
+        let mut dim_counts: HashMap<usize, usize> = HashMap::new();
+        for v in &snap.vectors {
+            if !v.embedding.is_empty() {
+                *dim_counts.entry(v.embedding.len()).or_insert(0) += 1;
+            }
         }
+        let preferred_dim = dim_counts
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(d, _)| d);
+        let (ann_len, dropped) = {
+            let mut ann = self.ann_index.lock().unwrap();
+            ann.clear();
+            let mut dropped = 0usize;
+            for v in snap.vectors {
+                if preferred_dim.is_some_and(|d| v.embedding.len() != d) {
+                    dropped += 1;
+                    continue;
+                }
+                if !ann.try_upsert(v.body_hash, v.embedding) {
+                    dropped += 1;
+                }
+            }
+            (ann.len(), dropped)
+        };
+        let mut st = self.index_status.lock().unwrap();
+        st.ann_dim_mismatch_drops = dropped;
+        st.ann_index_size = ann_len;
     }
 
     fn query_branch_chain(&self, branch: BranchId) -> Vec<BranchId> {
@@ -1022,7 +1049,12 @@ impl CisMcpRuntime {
                     continue;
                 }
                 if let Some(resolved) =
-                    crate::query_engine::resolve_identity_revision(&g, &chain, rev.identity_id)
+                    crate::query_engine::resolve_identity_revision_with_absence(
+                        &g,
+                        &chain,
+                        rev.identity_id,
+                        Some(&absence_for_runtime(&self.kv)),
+                    )
                 {
                     if resolved.qualified_name.contains(needle) {
                         return Ok(resolved.clone());
@@ -1102,28 +1134,31 @@ impl CisMcpRuntime {
         let g = self.coordinator.graph().read();
         report.graph_loaded = g.revision_count() > 0;
         report.graph_identities = g.identity_count();
-        let bindings: Vec<_> = g
-            .revisions()
-            .filter(|r| r.branch_id == self.active_branch())
-            .map(|r| (r.identity_id, r.revision_id))
-            .collect();
         drop(g);
-        for (identity_id, revision_id) in bindings {
-            self.revision_index.read().unwrap().bind(identity_id, revision_id);
-        }
+        // Re-hydrate from KV after snapshot load (construction may have run before kv.json).
+        *self.revision_index.write().unwrap() = RevisionIndexCow::root_hydrated(
+            self.active_branch(),
+            std::sync::Arc::clone(&self.kv),
+        );
+        self.sync_revision_index_from_graph();
         report
     }
 
     /// Refresh MCP index counters from the in-memory graph (after snapshot load or ingest).
     pub fn sync_index_status_from_graph(&self) {
         let g = self.coordinator.graph().read();
-        let symbols_indexed = g.revisions().count();
+        let symbols_indexed = g
+            .revisions()
+            .filter(|r| matches!(r.status, RevisionStatus::Active))
+            .count();
         let edges_indexed: usize = g
             .revisions()
+            .filter(|r| matches!(r.status, RevisionStatus::Active))
             .map(|r| g.outbound_edges(r.revision_id).len())
             .sum();
         let files: HashSet<String> = g
             .revisions()
+            .filter(|r| matches!(r.status, RevisionStatus::Active))
             .map(|r| r.file_path.clone())
             .filter(|p| {
                 p.ends_with(".py") || p.ends_with(".ts") || p.ends_with(".tsx")
@@ -1140,7 +1175,7 @@ impl CisMcpRuntime {
         let embed_chunks_registered = snap.chunks.len();
         let mut embedded = 0usize;
         let mut stale = 0usize;
-        for r in g.revisions() {
+        for r in g.revisions().filter(|r| matches!(r.status, RevisionStatus::Active)) {
             match vector.vector_for_body(&r.body_hash) {
                 Some(entry) if entry.model_id == model_id => embedded += 1,
                 Some(_) | None => stale += 1,
@@ -1241,23 +1276,30 @@ impl CisMcpRuntime {
             self.active_branch(),
         )?;
         let g = self.coordinator.graph().read();
-        let symbols_indexed = g.revisions().count();
+        let symbols_indexed = g
+            .revisions()
+            .filter(|r| matches!(r.status, RevisionStatus::Active))
+            .count();
         let edges_indexed: usize = g
             .revisions()
+            .filter(|r| matches!(r.status, RevisionStatus::Active))
             .map(|r| g.outbound_edges(r.revision_id).len())
             .sum();
         drop(g);
-        let mut st = self.index_status.lock().unwrap();
-        st.last_index_epoch_ms = Some(now_ms());
-        st.files_scanned = rep.applied
-            + rep.requeued_merge_lock
-            + rep.skipped_non_py
-            + rep.skipped_empty_py
-            + rep.skipped_delete_stub
-            + rep.parse_errors;
-        st.symbols_indexed = symbols_indexed;
-        st.edges_indexed = edges_indexed;
-        st.parse_error_count = rep.parse_errors;
+        {
+            let mut st = self.index_status.lock().unwrap();
+            st.last_index_epoch_ms = Some(now_ms());
+            st.files_scanned = rep.applied
+                + rep.requeued_merge_lock
+                + rep.skipped_non_py
+                + rep.skipped_empty_py
+                + rep.skipped_delete_stub
+                + rep.parse_errors;
+            st.symbols_indexed = symbols_indexed;
+            st.edges_indexed = edges_indexed;
+            st.parse_error_count = rep.parse_errors;
+        }
+        // Must not hold `index_status` — sync_bodies → rebuild_ann_index locks it again.
         self.sync_bodies_after_commit(self.active_branch());
         Ok(rep)
     }
@@ -1337,7 +1379,8 @@ impl CisMcpRuntime {
             self.sync_index_status_from_graph();
             let keep = {
                 let g = self.coordinator.graph().read();
-                crate::body_blob::referenced_body_hashes(&g, self.active_branch(), true)
+                // Include tombstones so rename detection / consistency survive restart.
+                crate::body_blob::referenced_body_hashes(&g, self.active_branch(), true, true)
             };
             let cis = self.cis_path();
             let _ = crate::body_blob::hydrate_bodies_from_store(
@@ -1499,11 +1542,16 @@ impl CisMcpRuntime {
     }
 
     fn mutation_checksum(rids: &[NodeRevisionId]) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        for (i, rid) in rids.iter().enumerate() {
-            out[i % 32] ^= rid.0[i % 16];
+        // Hash all revision id bytes (sorted) — not a single-byte XOR residue.
+        let mut sorted = rids.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut hex = String::with_capacity(sorted.len() * 32);
+        for rid in &sorted {
+            for b in &rid.0 {
+                hex.push_str(&format!("{b:02x}"));
+            }
         }
-        out
+        crate::index_model::hash32_key("mutchk", &hex, &sorted.len().to_string())
     }
 
     fn wal_promote_speculative(
@@ -1547,10 +1595,6 @@ impl CisMcpRuntime {
         if rids.is_empty() {
             return Ok(0);
         }
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         let set = GraphMutationSet::new(rids.clone(), Self::mutation_checksum(&rids));
         let id = self.coordinator.begin_status_mutation(
             MutationKind::RevertSpeculative { patch_id },
@@ -1561,7 +1605,9 @@ impl CisMcpRuntime {
                 if let Some(rev) = g.get_revision(*rid).cloned() {
                     let mut updated = rev;
                     updated.status = RevisionStatus::Tombstone;
-                    updated.tombstoned_at_ms = Some(ts);
+                    // Leave tombstoned_at_ms unset so reverted speculative rows are
+                    // excluded from the rename window (and become GC-eligible).
+                    updated.tombstoned_at_ms = None;
                     g.put_revision(updated);
                 }
             }
@@ -1844,7 +1890,8 @@ impl CisMcpRuntime {
         })
     }
 
-    /// Remove **`ri:{branch}:`** overlay keys from durable KV (post-merge cleanup).
+    /// Remove **`ri:{branch}:`** overlay keys and **`deleted:{branch}:`** absence markers
+    /// from durable KV (post-merge / branch cleanup).
     pub fn purge_branch(&self, session_id: u64, branch_hex: &str) -> Result<PurgeBranchResponse, AuthError> {
         self.require_session(session_id)?;
         let branch = parse_branch_id_hex(branch_hex).ok_or(AuthError::InvalidInput)?;
@@ -1855,10 +1902,11 @@ impl CisMcpRuntime {
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        let n = keys.len();
+        let mut n = keys.len();
         for k in keys {
             self.kv.delete(&k);
         }
+        n += absence_for_runtime(&self.kv).purge_branch(branch);
         let mut meta = QueryMeta::default();
         meta.policy_version = self.policy.current_version_label();
         meta.node_count = n;
@@ -2114,6 +2162,9 @@ impl CisMcpRuntime {
         if self.vector_degraded.is_vector_degraded() {
             meta.degraded_modes.push("vector_degraded".into());
         }
+        if idx.ann_dim_mismatch_drops > 0 {
+            meta.degraded_modes.push("ann_dimension_mismatch".into());
+        }
         meta
     }
 
@@ -2169,6 +2220,8 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
         let g = self.coordinator.graph().read();
+        let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let half = policy_half_life_ms(&self.policy.snapshot());
         let now = query_now_ms();
         let mut matches = Vec::new();
@@ -2180,9 +2233,12 @@ impl CisMcpRuntime {
             if !seen.insert(rev.identity_id) {
                 continue;
             }
-            let Some(resolved) =
-                crate::query_engine::resolve_identity_revision(&g, &chain, rev.identity_id)
-            else {
+            let Some(resolved) = crate::query_engine::resolve_identity_revision_with_absence(
+                &g,
+                &chain,
+                rev.identity_id,
+                Some(&absence),
+            ) else {
                 continue;
             };
             if !resolved.qualified_name.contains(needle) {
@@ -2191,7 +2247,15 @@ impl CisMcpRuntime {
             if !prefer_file_hub && matches.len() >= limit {
                 break;
             }
-            let conf = crate::query_engine::node_hit_confidence(&g, resolved, &chain, now, half);
+            let conf = crate::query_engine::node_hit_confidence_with_absence(
+                &g,
+                &eto,
+                resolved,
+                &chain,
+                now,
+                half,
+                Some(&absence),
+            );
             matches.push(hit_from_rev(resolved, conf));
         }
         if prefer_file_hub {
@@ -2243,23 +2307,38 @@ impl CisMcpRuntime {
             .ok_or(AuthError::InvalidInput)?;
         let chain = self.query_branch_chain(branch);
         let g = self.coordinator.graph().read();
+        let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
+        let half = policy_half_life_ms(&self.policy.snapshot());
+        let now = query_now_ms();
         let mut matches = Vec::new();
-        for (_, rid) in overlay.resolved_bindings() {
-            let Some(rev) = g.get_revision(rid) else {
+        let mut seen = HashSet::new();
+        for (iid, _) in overlay.resolved_bindings() {
+            if !seen.insert(iid) {
+                continue;
+            }
+            let Some(resolved) = crate::query_engine::resolve_identity_revision_with_absence(
+                &g,
+                &chain,
+                iid,
+                Some(&absence),
+            ) else {
                 continue;
             };
             if matches.len() >= limit {
                 break;
             }
-            if rev.qualified_name.contains(needle) {
-                let conf = crate::query_engine::node_hit_confidence(
+            if resolved.qualified_name.contains(needle) {
+                let conf = crate::query_engine::node_hit_confidence_with_absence(
                     &g,
-                    rev,
+                    &eto,
+                    resolved,
                     &chain,
-                    query_now_ms(),
-                    policy_half_life_ms(&self.policy.snapshot()),
+                    now,
+                    half,
+                    Some(&absence),
                 );
-                matches.push(hit_from_rev(rev, conf));
+                matches.push(hit_from_rev(resolved, conf));
             }
         }
         let node_count = matches.len();
@@ -2396,12 +2475,27 @@ impl CisMcpRuntime {
             return Err(AuthError::InvalidInput);
         }
         let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let policy = self.policy.snapshot();
         let now = query_now_ms();
         let half = policy_half_life_ms(&policy);
-        let target = crate::query_engine::resolve_definition_target(&g, &eto, &chain, rid);
+        let target = crate::query_engine::resolve_definition_target_with_absence(
+            &g,
+            &eto,
+            &chain,
+            rid,
+            Some(&absence),
+        );
         let hit = target.map(|r| {
-            let conf = crate::query_engine::node_hit_confidence(&g, r, &chain, now, half);
+            let conf = crate::query_engine::node_hit_confidence_with_absence(
+                &g,
+                &eto,
+                r,
+                &chain,
+                now,
+                half,
+                Some(&absence),
+            );
             hit_from_rev(r, conf)
         });
         self.audit.record_sync(session_id, "go_to_definition");
@@ -2440,6 +2534,7 @@ impl CisMcpRuntime {
             return Err(AuthError::InvalidInput);
         }
         let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
         let sources = g.source_identities_targeting(rev.identity_id);
@@ -2448,9 +2543,12 @@ impl CisMcpRuntime {
             if hits.len() >= limit {
                 break;
             }
-            if let Some(src_rev) =
-                crate::query_engine::resolve_identity_revision(&g, &chain, sid)
-            {
+            if let Some(src_rev) = crate::query_engine::resolve_identity_revision_with_absence(
+                &g,
+                &chain,
+                sid,
+                Some(&absence),
+            ) {
                 for e in g.outbound_edges(src_rev.revision_id) {
                     let effective = eto.effective_target_identity_in_chain(&chain, e);
                     if effective == rev.identity_id {
@@ -2489,6 +2587,7 @@ impl CisMcpRuntime {
             .ok_or(AuthError::InvalidInput)?;
         let g = self.coordinator.graph().read();
         let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
         let chain = self.query_branch_chain(branch);
@@ -2504,9 +2603,12 @@ impl CisMcpRuntime {
             if !seen.insert(r.identity_id) {
                 continue;
             }
-            let Some(src) =
-                crate::query_engine::resolve_identity_revision(&g, &chain, r.identity_id)
-            else {
+            let Some(src) = crate::query_engine::resolve_identity_revision_with_absence(
+                &g,
+                &chain,
+                r.identity_id,
+                Some(&absence),
+            ) else {
                 continue;
             };
             for e in g.outbound_edges(src.revision_id) {
@@ -2546,6 +2648,7 @@ impl CisMcpRuntime {
             return Err(AuthError::InvalidInput);
         }
         let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
         let mut seen: HashSet<NodeRevisionId> = HashSet::new();
@@ -2560,9 +2663,23 @@ impl CisMcpRuntime {
             ) {
                 return;
             }
-            if let Some(trev) = crate::query_engine::resolve_edge_target(&g, &eto, &chain, e) {
+            if let Some(trev) = crate::query_engine::resolve_edge_target_with_absence(
+                &g,
+                &eto,
+                &chain,
+                e,
+                Some(&absence),
+            ) {
                 if seen.insert(trev.revision_id) {
-                    let conf = crate::query_engine::node_hit_confidence(&g, trev, &chain, now, half);
+                    let conf = crate::query_engine::node_hit_confidence_with_absence(
+                        &g,
+                        &eto,
+                        trev,
+                        &chain,
+                        now,
+                        half,
+                        Some(&absence),
+                    );
                     hits.push(hit_from_rev_and_edge(trev, e, conf));
                 }
             }
@@ -2600,6 +2717,7 @@ impl CisMcpRuntime {
         let hub = crate::query_engine::file_hub_revision_for_path(&g, &chain, path)
             .ok_or(AuthError::InvalidInput)?;
         let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
         let mut seen: HashSet<NodeRevisionId> = HashSet::new();
@@ -2611,9 +2729,23 @@ impl CisMcpRuntime {
             if e.ty != EdgeType::Imports {
                 continue;
             }
-            if let Some(trev) = crate::query_engine::resolve_edge_target(&g, &eto, &chain, e) {
+            if let Some(trev) = crate::query_engine::resolve_edge_target_with_absence(
+                &g,
+                &eto,
+                &chain,
+                e,
+                Some(&absence),
+            ) {
                 if seen.insert(trev.revision_id) {
-                    let conf = crate::query_engine::node_hit_confidence(&g, trev, &chain, now, half);
+                    let conf = crate::query_engine::node_hit_confidence_with_absence(
+                        &g,
+                        &eto,
+                        trev,
+                        &chain,
+                        now,
+                        half,
+                        Some(&absence),
+                    );
                     hits.push(hit_from_rev_and_edge(trev, e, conf));
                 }
             }
@@ -2650,9 +2782,16 @@ impl CisMcpRuntime {
         let chain = self.query_branch_chain(branch);
         let start = parse_revision_hex(revision_id_hex).ok_or(AuthError::InvalidInput)?;
         let g = self.coordinator.graph().read();
+        let Some(start_rev) = g.get_revision(start) else {
+            return Err(AuthError::InvalidInput);
+        };
+        if !revision_on_chain(&chain, start_rev.branch_id) {
+            return Err(AuthError::InvalidInput);
+        }
         let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let policy = self.policy.snapshot();
-        let expanded = crate::query_engine::expand_context_bfs(
+        let expanded = crate::query_engine::expand_context_bfs_with_absence(
             &g,
             &eto,
             &policy,
@@ -2660,6 +2799,7 @@ impl CisMcpRuntime {
             start,
             depth,
             query_now_ms(),
+            Some(&absence),
         );
         let hits: Vec<SymbolHit> = expanded
             .hits
@@ -2709,6 +2849,7 @@ impl CisMcpRuntime {
         let mut embedded_count = 0usize;
 
         let chain = self.query_branch_chain(branch);
+        let absence = absence_for_runtime(&self.kv);
         let mut seen_ids = HashSet::new();
         for r in g.revisions() {
             if !revision_on_chain(&chain, r.branch_id) {
@@ -2717,9 +2858,12 @@ impl CisMcpRuntime {
             if !seen_ids.insert(r.identity_id) {
                 continue;
             }
-            let Some(r) =
-                crate::query_engine::resolve_identity_revision(&g, &chain, r.identity_id)
-            else {
+            let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
+                &g,
+                &chain,
+                r.identity_id,
+                Some(&absence),
+            ) else {
                 continue;
             };
             if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
@@ -3049,7 +3193,7 @@ impl CisMcpRuntime {
                     && matches!(r.status, RevisionStatus::Tombstone)
             })
             .count();
-        let speculative_count = g
+        let orphaned_count = g
             .revisions()
             .filter(|r| {
                 revision_on_chain(&chain, r.branch_id)
@@ -3075,11 +3219,11 @@ impl CisMcpRuntime {
         let inbound = g.source_identities_targeting(rev.identity_id).len();
         let counts = ExplainCounts {
             stale_count,
-            speculative_count,
+            orphaned_count,
             pruned_low_confidence_count,
         };
         let notes = format!(
-            "axes §01.2; outbound_edges={outbound}; inbound_source_identities={inbound}; budget_tokens={budget_tokens} (char/4 tokenizer for build_context); tombstone_rows_for_identity={stale_count}; orphaned_rows_for_identity={speculative_count}; unresolved_edge_targets={pruned_low_confidence_count}",
+            "axes §01.2; outbound_edges={outbound}; inbound_source_identities={inbound}; budget_tokens={budget_tokens} (char/4 tokenizer for build_context); tombstone_rows_for_identity={stale_count}; orphaned_rows_for_identity={orphaned_count}; unresolved_edge_targets={pruned_low_confidence_count}",
         );
         drop(g);
         self.audit.record_sync(session_id, "explain_context");
@@ -3095,7 +3239,7 @@ impl CisMcpRuntime {
             None,
         );
         meta.stale_count = stale_count;
-        meta.speculative_count = speculative_count;
+        meta.orphaned_count = orphaned_count;
         meta.pruned_low_confidence_count = pruned_low_confidence_count;
         meta.dangling_edge_count = pruned_low_confidence_count;
         meta.tokenizer_mode = "char_approximation".into();
@@ -3105,7 +3249,7 @@ impl CisMcpRuntime {
         if pruned_low_confidence_count > 0 {
             meta.degraded_modes.push("dangling_edges".into());
         }
-        if speculative_count > 0 {
+        if orphaned_count > 0 {
             meta.degraded_modes.push("orphaned_revisions".into());
         }
         Ok(ExplainContextResponse {
@@ -3375,6 +3519,7 @@ impl CisMcpRuntime {
         let qualified_name = rev.qualified_name.clone();
         let mut reasons = Vec::new();
         let eto = eto_for_runtime(&self.kv);
+        let absence = absence_for_runtime(&self.kv);
         let outbound = g.outbound_edges(rid);
         let mut candidate_target_identities = 0usize;
         for e in outbound {
@@ -3382,7 +3527,15 @@ impl CisMcpRuntime {
                 continue;
             }
             candidate_target_identities += 1;
-            if crate::query_engine::resolve_edge_target(&g, &eto, &chain, e).is_none() {
+            if crate::query_engine::resolve_edge_target_with_absence(
+                &g,
+                &eto,
+                &chain,
+                e,
+                Some(&absence),
+            )
+            .is_none()
+            {
                 reasons.push("target_identity_without_active_revision".into());
             }
         }
@@ -3786,6 +3939,12 @@ mod tests {
     use crate::graph::{Language, NodeIdentity, NodeKind, NodeRevision, RevisionStatus};
     use crate::merge_lock::acquire_merge_lock;
     use cis_wal::MergeId;
+
+    #[test]
+    fn structural_substring_score_is_case_insensitive() {
+        let score = structural_substring_score("authenticate", "auth.Authenticate");
+        assert!(score > 0.0, "needle is lowercased; qn must be too");
+    }
 
     #[test]
     fn find_symbol_at_requires_snapshot() {
