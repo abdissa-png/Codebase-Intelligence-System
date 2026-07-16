@@ -75,8 +75,9 @@ pub fn identity_cas(prefix: &[OpRecord], cfg: &StressConfig) -> bool {
             branch_id: branch,
             path: path.into(),
             kind: cis_core::FsChangeKind::Modified,
+            old_path: None,
         }];
-        let _ = apply_index_events_with_config(
+                let _ = apply_index_events_with_config(
             &q,
             h.rt.coordinator().as_ref(),
             Arc::clone(h.rt.kv()),
@@ -200,6 +201,7 @@ pub fn tombstone_gc_during_rename(prefix: &[OpRecord]) -> bool {
             branch_id: branch,
             path: path.into(),
             kind: cis_core::FsChangeKind::Modified,
+            old_path: None,
         }],
         |_| Ok("def foo():\n    return 1\n".to_string()),
         None,
@@ -227,8 +229,9 @@ pub fn tombstone_gc_during_rename(prefix: &[OpRecord]) -> bool {
                     branch_id: branch,
                     path: path.into(),
                     kind: cis_core::FsChangeKind::Modified,
+                    old_path: None,
                 }],
-                |_| Ok("def bar():\n    return 1\n".to_string()),
+        |_| Ok("def bar():\n    return 1\n".to_string()),
                 None,
                 None,
                 None,

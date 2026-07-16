@@ -67,6 +67,7 @@ fn ingest_chess_paths(
                 branch_id: branch,
                 path: rel.to_string_lossy().replace('\\', "/"),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }
         })
         .collect();
@@ -123,6 +124,7 @@ fn chess_repo_ingest_creates_top_level_function_nodes() {
                 branch_id: branch,
                 path: rel.to_string_lossy().replace('\\', "/"),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }
         })
         .collect();
@@ -201,6 +203,7 @@ fn chess_repo_mcp_find_symbol_after_graph_sync() {
                 branch_id: branch,
                 path: rel.to_string_lossy().replace('\\', "/"),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }
         })
         .collect();
@@ -393,8 +396,9 @@ fn chess_boardutils_dissimilar_replace_avoids_false_rename() {
             branch_id: branch,
             path: path.into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         }];
-        let c = content.to_string();
+                let c = content.to_string();
         apply_index_events(
             &q,
             &coord,

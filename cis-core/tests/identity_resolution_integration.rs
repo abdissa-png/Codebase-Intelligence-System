@@ -34,8 +34,9 @@ fn ingest_file(
         branch_id: BRANCH,
         path: path.into(),
         kind: FsChangeKind::Modified,
+        old_path: None,
     }];
-    let src = src.to_string();
+                let src = src.to_string();
     apply_index_events_with_config(
         &q,
         coord.as_ref(),
@@ -47,6 +48,27 @@ fn ingest_file(
         rename_config,
     )
     .expect("ingest");
+}
+
+fn delete_file(coord: &Arc<WriteCoordinator>, kv: Arc<MemoryKv>, path: &str) {
+    let q = IndexEventQueue::new();
+    let events = vec![IndexEvent {
+        branch_id: BRANCH,
+        path: path.into(),
+        kind: FsChangeKind::Deleted,
+        old_path: None,
+    }];
+    apply_index_events_with_config(
+        &q,
+        coord.as_ref(),
+        kv,
+        events,
+        |_p| Ok(String::new()),
+        None,
+        None,
+        None,
+    )
+    .expect("delete");
 }
 
 #[test]
@@ -63,11 +85,17 @@ fn same_file_rename_preserves_identity_and_emits_renamed_from() {
         None,
     );
     let iid_foo = IdentityId(stable_id_bytes("id", path, "foo"));
-    let foo_body_hash = content_checksum_32("def foo():\n    return 1\n");
-    assert!(
-        BodyStore::new(Arc::clone(&kv)).get(&foo_body_hash).is_some(),
-        "first ingest should persist foo body"
-    );
+    let foo_body_hash = {
+        let g = coord.graph().read();
+        let foo_rev = NodeRevisionId(stable_rev_id_bytes(BRANCH, path, "foo"));
+        let foo = g.get_revision(foo_rev).expect("foo after first ingest");
+        assert!(
+            BodyStore::new(Arc::clone(&kv)).get(&foo.body_hash).is_some(),
+            "first ingest should persist foo body"
+        );
+        foo.body_hash
+    };
+    let _ = foo_body_hash;
 
     ingest_file(
         &coord,
@@ -85,8 +113,14 @@ fn same_file_rename_preserves_identity_and_emits_renamed_from() {
         "foo should be tombstoned, status {:?}",
         foo.status
     );
-    let bar_rev = NodeRevisionId(stable_rev_id_bytes(BRANCH, path, "bar"));
-    let bar = g.get_revision(bar_rev).expect("bar revision");
+    let bar = g
+        .primary_revision_for_identity(BRANCH, iid_foo)
+        .expect("bar revision via preserved foo identity");
+    assert!(
+        bar.qualified_name.contains("bar"),
+        "expected bar qn, got {}",
+        bar.qualified_name
+    );
     assert_eq!(
         bar.identity_id, iid_foo,
         "rename should reuse foo identity, got {:?} vs {:?}",
@@ -161,13 +195,7 @@ fn cross_file_move_preserves_identity() {
     ingest_file(&coord, Arc::clone(&kv), "a.py", src, Some(low_thresh));
     let iid_orig = IdentityId(stable_id_bytes("id", "a.py", "big_helper"));
 
-    ingest_file(
-        &coord,
-        Arc::clone(&kv),
-        "a.py",
-        "",
-        Some(low_thresh),
-    );
+    delete_file(&coord, Arc::clone(&kv), "a.py");
 
     ingest_file(&coord, kv, "b.py", src, Some(low_thresh));
 
@@ -243,7 +271,12 @@ fn multi_tombstone_best_score_wins() {
             parent_revision_id: None,
             rename_source_id: None,
             span: SourceSpan::UNKNOWN,
-            tombstoned_at_ms: None,
+            tombstoned_at_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            ),
         });
     }
 
@@ -251,7 +284,17 @@ fn multi_tombstone_best_score_wins() {
     let resolver = cis_core::IdentityResolver::from_policy(0.3);
 
     let new_body = "def compute_v2():\n    x = 1\n    y = 2\n    return x + y\n";
-    let result = best_tombstone_rename(&g, branch, path, "m.compute_v2", new_body, &resolver, &cfg, Some(&bs));
+    let result = best_tombstone_rename(
+        &g,
+        branch,
+        path,
+        "m.compute_v2",
+        new_body,
+        &resolver,
+        &cfg,
+        Some(&bs),
+        &std::collections::HashSet::new(),
+    );
     assert!(result.is_some(), "should find a rename candidate");
     let (matched_iid, _, _) = result.unwrap();
     assert_eq!(matched_iid, iid_high, "higher-scoring tombstone should win");
@@ -274,7 +317,7 @@ fn concurrent_ingest_same_file_produces_one_identity() {
             let src_c = src.to_string();
             thread::spawn(move || {
                 let q = IndexEventQueue::new();
-                let events = vec![IndexEvent { branch_id: branch, path: path.into(), kind: FsChangeKind::Modified }];
+                let events = vec![IndexEvent { branch_id: branch, path: path.into(), kind: FsChangeKind::Modified, old_path: None }];
                 let _ = apply_index_events_with_config(
                     &q,
                     coord_c.as_ref(),
@@ -304,4 +347,181 @@ fn concurrent_ingest_same_file_produces_one_identity() {
         1,
         "all concurrent ingests should converge on one active identity"
     );
+}
+
+#[test]
+fn identical_bodies_in_different_files_keep_distinct_identities() {
+    let kv = Arc::new(MemoryKv::new());
+    let coord = make_coord(&kv);
+    let stub = "def helper():\n    pass\n";
+    ingest_file(&coord, Arc::clone(&kv), "a.py", stub, None);
+    ingest_file(&coord, Arc::clone(&kv), "b.py", stub, None);
+
+    let g = coord.graph().read();
+    let id_a = g
+        .revisions()
+        .find(|r| r.file_path == "a.py" && r.qualified_name.contains("helper") && matches!(r.status, RevisionStatus::Active))
+        .map(|r| r.identity_id)
+        .expect("a.py helper");
+    let id_b = g
+        .revisions()
+        .find(|r| r.file_path == "b.py" && r.qualified_name.contains("helper") && matches!(r.status, RevisionStatus::Active))
+        .map(|r| r.identity_id)
+        .expect("b.py helper");
+    assert_ne!(
+        id_a, id_b,
+        "body-identical stubs in different files must not share CAS identity"
+    );
+}
+
+#[test]
+fn near_name_unrelated_bodies_do_not_rename() {
+    let kv = Arc::new(MemoryKv::new());
+    let coord = make_coord(&kv);
+    let path = "m.py";
+    ingest_file(
+        &coord,
+        Arc::clone(&kv),
+        path,
+        "def compute():\n    alpha = 1\n    beta = 2\n    return alpha + beta\n",
+        None,
+    );
+    let id_before = {
+        let g = coord.graph().read();
+        let found = g
+            .revisions()
+            .find(|r| {
+                r.qualified_name.contains("compute") && matches!(r.status, RevisionStatus::Active)
+            })
+            .map(|r| r.identity_id);
+        found.expect("compute")
+    };
+    // Near name, completely different body — must not inherit identity.
+    ingest_file(
+        &coord,
+        kv,
+        path,
+        "def compute2():\n    print('totally different')\n    return None\n",
+        None,
+    );
+    let g = coord.graph().read();
+    let id_after = g
+        .revisions()
+        .find(|r| r.qualified_name.contains("compute2") && matches!(r.status, RevisionStatus::Active))
+        .map(|r| r.identity_id)
+        .expect("compute2");
+    assert_ne!(
+        id_before, id_after,
+        "name proximity alone must not rename when bodies differ"
+    );
+}
+
+#[test]
+fn stub_pass_functions_do_not_false_rename_under_defaults() {
+    let kv = Arc::new(MemoryKv::new());
+    let coord = make_coord(&kv);
+    let path = "stubs.py";
+    ingest_file(&coord, Arc::clone(&kv), path, "def foo():\n    pass\n", None);
+    let id_foo = {
+        let g = coord.graph().read();
+        let found = g
+            .revisions()
+            .find(|r| r.qualified_name.contains("foo") && matches!(r.status, RevisionStatus::Active))
+            .map(|r| r.identity_id);
+        found.expect("foo")
+    };
+    ingest_file(&coord, kv, path, "def bar():\n    pass\n", None);
+    let g = coord.graph().read();
+    let id_bar = g
+        .revisions()
+        .find(|r| r.qualified_name.contains("bar") && matches!(r.status, RevisionStatus::Active))
+        .map(|r| r.identity_id)
+        .expect("bar");
+    assert_ne!(id_foo, id_bar, "default policy must not merge unrelated stubs");
+}
+
+#[test]
+fn one_tombstone_claimed_once_per_batch() {
+    use cis_core::identity_resolution::{resolve_or_create, RenameConfig as RCfg};
+    use cis_core::{InMemoryGraph, Language, NodeIdentity, NodeKind, NodeRevision, SourceSpan};
+    use cis_wal::NodeRevisionId;
+
+    let kv = Arc::new(MemoryKv::new());
+    let bs = BodyStore::new(Arc::clone(&kv));
+    let mut g = InMemoryGraph::default();
+    let branch = BranchId([0u8; 16]);
+    let path = "m.py";
+    let body = "def shared():\n    x = 1\n    y = 2\n    return x + y\n";
+    let bh = content_checksum_32(body);
+    bs.put(bh, body.as_bytes().to_vec());
+    let iid = IdentityId([7u8; 16]);
+    g.put_identity(NodeIdentity {
+        identity_id: iid,
+        kind: NodeKind::Function,
+    });
+    g.put_revision(NodeRevision {
+        revision_id: NodeRevisionId([7u8; 16]),
+        identity_id: iid,
+        branch_id: branch,
+        status: RevisionStatus::Tombstone,
+        qualified_name: "m.shared".into(),
+        file_path: path.into(),
+        body_hash: bh,
+        signature_hash: [0u8; 32],
+        language: Language::Python,
+        parent_revision_id: None,
+        rename_source_id: None,
+        span: SourceSpan::UNKNOWN,
+        tombstoned_at_ms: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        ),
+    });
+
+    let cfg = RCfg {
+        rename_min_confidence: 0.4,
+        body_similarity_threshold: 0.4,
+        name_proximity_threshold: 0.85,
+        window_days: 30,
+    };
+    let resolver = cis_core::IdentityResolver::from_policy(0.4);
+    let mut claimed = std::collections::HashSet::new();
+    let first = resolve_or_create(
+        &g,
+        branch,
+        path,
+        "m.alpha",
+        body,
+        IdentityId([1u8; 16]),
+        &resolver,
+        &cfg,
+        Some(&bs),
+        None,
+        [1u8; 32],
+        &mut claimed,
+    );
+    let second = resolve_or_create(
+        &g,
+        branch,
+        path,
+        "m.beta",
+        body,
+        IdentityId([2u8; 16]),
+        &resolver,
+        &cfg,
+        Some(&bs),
+        None,
+        [2u8; 32],
+        &mut claimed,
+    );
+    assert_eq!(first.identity_id, iid);
+    assert!(first.rename_link.is_some());
+    assert_ne!(
+        second.identity_id, iid,
+        "second symbol must not re-claim the same tombstone"
+    );
+    assert!(second.rename_link.is_none());
+    assert_eq!(claimed.len(), 1);
 }

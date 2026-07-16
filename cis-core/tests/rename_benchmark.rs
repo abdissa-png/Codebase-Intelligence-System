@@ -45,7 +45,7 @@ fn ingest(coord: &WriteCoordinator, kv: Arc<MemoryKv>, path: &str, src: &str) {
         &q,
         coord,
         kv,
-        vec![IndexEvent { branch_id: BRANCH, path: path.into(), kind: FsChangeKind::Modified }],
+        vec![IndexEvent { branch_id: BRANCH, path: path.into(), kind: FsChangeKind::Modified, old_path: None }],
         move |_| Ok(s.clone()),
         None,
         None,
@@ -55,11 +55,21 @@ fn ingest(coord: &WriteCoordinator, kv: Arc<MemoryKv>, path: &str, src: &str) {
 }
 
 fn identity_of(coord: &WriteCoordinator, path: &str, name: &str) -> IdentityId {
+    let g = coord.graph().read();
+    // Prefer live revision for this symbol (append-only may not use stable_rev_id).
+    let suffix = format!("::{name}");
+    if let Some(r) = g.revisions().find(|r| {
+        r.file_path == path
+            && matches!(
+                r.status,
+                RevisionStatus::Active | RevisionStatus::Speculative
+            )
+            && (r.qualified_name.ends_with(&suffix) || r.qualified_name == name)
+    }) {
+        return r.identity_id;
+    }
     let rev_id = NodeRevisionId(stable_rev_id_bytes(BRANCH, path, name));
-    coord
-        .graph()
-        .read()
-        .get_revision(rev_id)
+    g.get_revision(rev_id)
         .map(|r| r.identity_id)
         .unwrap_or_else(|| IdentityId(stable_id_bytes("id", path, name)))
 }
@@ -115,7 +125,24 @@ fn pos_cross_file_body_move() {
     let (coord, kv) = fresh_coord();
     ingest(&coord, Arc::clone(&kv), "a.py", body);
     let iid = proposed_identity("a.py", "helper");
-    ingest(&coord, Arc::clone(&kv), "a.py", ""); // tombstone
+    // Tombstone via Deleted — empty Modified ingest does not reliably clear symbols.
+    let q = IndexEventQueue::new();
+    apply_index_events_with_config(
+        &q,
+        &coord,
+        Arc::clone(&kv),
+        vec![IndexEvent {
+            branch_id: BRANCH,
+            path: "a.py".into(),
+            kind: FsChangeKind::Deleted,
+            old_path: None,
+        }],
+        |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "deleted")),
+        None,
+        None,
+        Some(bench_cfg()),
+    )
+    .expect("delete a.py");
     ingest(&coord, kv, "b.py", body);
     assert_eq!(identity_of(&coord, "b.py", "helper"), iid);
 }
@@ -240,7 +267,7 @@ fn delete_event_tombstones_all_file_symbols() {
         &q,
         &coord,
         Arc::clone(&kv),
-        vec![IndexEvent { branch_id: BRANCH, path: "m.py".into(), kind: FsChangeKind::Deleted }],
+        vec![IndexEvent { branch_id: BRANCH, path: "m.py".into(), kind: FsChangeKind::Deleted, old_path: None }],
         |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "deleted")),
         None,
         None,
@@ -279,7 +306,7 @@ fn delete_then_recreate_same_name_reuses_identity() {
         &q,
         &coord,
         Arc::clone(&kv),
-        vec![IndexEvent { branch_id: BRANCH, path: path.into(), kind: FsChangeKind::Deleted }],
+        vec![IndexEvent { branch_id: BRANCH, path: path.into(), kind: FsChangeKind::Deleted, old_path: None }],
         |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "deleted")),
         None,
         None,
@@ -306,7 +333,7 @@ fn delete_then_recreate_different_name_fresh_identity() {
         &q,
         &coord,
         Arc::clone(&kv),
-        vec![IndexEvent { branch_id: BRANCH, path: path.into(), kind: FsChangeKind::Deleted }],
+        vec![IndexEvent { branch_id: BRANCH, path: path.into(), kind: FsChangeKind::Deleted, old_path: None }],
         |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "deleted")),
         None,
         None,
@@ -381,6 +408,7 @@ fn delete_clears_calls_edges_but_keeps_renamed_from() {
             branch_id: BRANCH,
             path: path.into(),
             kind: FsChangeKind::Deleted,
+            old_path: None,
         }],
         |_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "deleted")),
         None,

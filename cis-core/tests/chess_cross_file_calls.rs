@@ -6,7 +6,7 @@
 mod support;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cis_core::{
     apply_index_events, collect_py_files, CisMcpRuntime, EdgeType, FsChangeKind, IndexEvent,
@@ -16,6 +16,9 @@ use cis_core::MergeSagaOrchestrator;
 use cis_wal::{BranchId, MutationLog};
 
 use support::chess_fixture_root;
+
+/// Process-global `CIS_*` env + shared fixture `.cis/` — serialize MCP bootstrap tests.
+static CHESS_MCP_LOCK: Mutex<()> = Mutex::new(());
 
 fn chess_root() -> PathBuf {
     chess_fixture_root()
@@ -45,6 +48,7 @@ fn chess_ingest_has_cross_file_calls() {
                 branch_id: branch,
                 path: rel.to_string_lossy().replace('\\', "/"),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }
         })
         .collect();
@@ -102,8 +106,11 @@ fn chess_screen_calls_board_initialize() {
         return;
     }
 
+    let _guard = CHESS_MCP_LOCK.lock().unwrap();
     std::env::set_var("CIS_FORCE_REINDEX", "1");
-    std::env::remove_var("CIS_SKIP_WORKSPACE_LOAD");
+    std::env::set_var("CIS_WAL_MEMORY", "1");
+    std::env::set_var("CIS_SKIP_WORKSPACE_LOAD", "1");
+    std::env::remove_var("CIS_GRAPH_BACKEND");
 
     let rt = CisMcpRuntime::new_dev(&root.to_string_lossy());
     let boot = rt
@@ -258,6 +265,7 @@ fn chess_mcp_queries_after_graph_sync() {
                 branch_id: branch,
                 path: rel.to_string_lossy().replace('\\', "/"),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }
         })
         .collect();
@@ -331,9 +339,17 @@ fn chess_graph_sqlite_restart_query_parity() {
         return;
     }
 
+    let _guard = CHESS_MCP_LOCK.lock().unwrap();
+    // Isolated workspace so parallel chess tests do not fight over fixture `.cis/`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("chess");
+    copy_dir_recursive(&root, &work).expect("copy chess fixture");
+    let _ = std::fs::remove_dir_all(work.join(".cis"));
+
     std::env::set_var("CIS_GRAPH_BACKEND", "sqlite");
     std::env::set_var("CIS_FORCE_REINDEX", "1");
-    std::env::remove_var("CIS_SKIP_WORKSPACE_LOAD");
+    std::env::set_var("CIS_SKIP_WORKSPACE_LOAD", "1");
+    std::env::remove_var("CIS_WAL_MEMORY");
 
     let edge_counts = |rt: &CisMcpRuntime| -> (usize, usize) {
         let g = rt.coordinator().graph().read();
@@ -352,7 +368,7 @@ fn chess_graph_sqlite_restart_query_parity() {
 
     let (calls_before, edges_before);
     {
-        let rt = CisMcpRuntime::new_dev(&root.to_string_lossy());
+        let rt = CisMcpRuntime::new_dev(&work.to_string_lossy());
         rt.bootstrap_python_index_from_repo()
             .expect("full reindex");
         (calls_before, edges_before) = edge_counts(&rt);
@@ -368,7 +384,8 @@ fn chess_graph_sqlite_restart_query_parity() {
     {
         std::env::set_var("CIS_WAL_MEMORY", "1");
         std::env::set_var("CIS_GRAPH_BACKEND", "sqlite");
-        let rt = CisMcpRuntime::new_dev(&root.to_string_lossy());
+        std::env::remove_var("CIS_SKIP_WORKSPACE_LOAD");
+        let rt = CisMcpRuntime::new_dev(&work.to_string_lossy());
         let (calls_after, edges_after) = edge_counts(&rt);
         assert_eq!(
             calls_before, calls_after,
@@ -400,4 +417,24 @@ fn chess_graph_sqlite_restart_query_parity() {
 
     std::env::remove_var("CIS_GRAPH_BACKEND");
     std::env::remove_var("CIS_WAL_MEMORY");
+    std::env::remove_var("CIS_FORCE_REINDEX");
+    std::env::remove_var("CIS_SKIP_WORKSPACE_LOAD");
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            if entry.file_name() == ".git" || entry.file_name() == ".cis" {
+                continue;
+            }
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
 }

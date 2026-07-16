@@ -183,8 +183,9 @@ pub fn scenario_identity_cas_converges(_h: &StressHarness, cfg: &StressConfig) {
                 branch_id: branch,
                 path: path.into(),
                 kind: cis_core::FsChangeKind::Modified,
+                old_path: None,
             }];
-            let body = Arc::clone(&src);
+                let body = Arc::clone(&src);
             let _ = apply_index_events_with_config(
                 &q,
                 hh.rt.coordinator().as_ref(),
@@ -365,6 +366,7 @@ pub fn scenario_tombstone_gc_during_rename(h: &StressHarness, _cfg: &StressConfi
             branch_id: branch,
             path: path.into(),
             kind: cis_core::FsChangeKind::Modified,
+            old_path: None,
         }],
         |_| Ok("def foo():\n    return 1\n".to_string()),
         None,
@@ -396,8 +398,9 @@ pub fn scenario_tombstone_gc_during_rename(h: &StressHarness, _cfg: &StressConfi
                     branch_id: branch,
                     path: path.into(),
                     kind: cis_core::FsChangeKind::Modified,
+                    old_path: None,
                 }],
-                |_| Ok("def bar():\n    return 1\n".to_string()),
+        |_| Ok("def bar():\n    return 1\n".to_string()),
                 None,
                 None,
                 None,

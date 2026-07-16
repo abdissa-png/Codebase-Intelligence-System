@@ -37,6 +37,7 @@ fn seed_graph(coord: &WriteCoordinator, root: &PathBuf, n: usize) {
             branch_id: branch,
             path,
             kind: FsChangeKind::Modified,
+            old_path: None,
         });
     }
     cis_core::apply_index_events(

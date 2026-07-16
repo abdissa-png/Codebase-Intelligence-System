@@ -14,8 +14,10 @@ use crate::graph::{
 };
 use crate::graph_mutation::GraphMutationSet;
 use crate::identity_cas::IdentityProvisionalCas;
+use crate::deletion_absence::DeletionAbsenceStore;
 use crate::identity_resolution::{
-    body_snippet_for_span, tombstone_all_file_symbols, tombstone_orphaned_file_symbols, RenameConfig,
+    body_snippet_for_span, tombstone_all_file_symbols_with_absence,
+    tombstone_orphaned_file_symbols_with_absence, RenameConfig,
 };
 use crate::identity_resolver::IdentityResolver;
 use crate::index_model::hash32_key;
@@ -30,8 +32,8 @@ pub use crate::call_resolve::{
     regen_edges_for_python_file_with_graph,
 };
 pub use crate::index_model::{
-    body_store_slot_key, branch_id_tag, content_checksum_32, stable_id_bytes, stable_rev_id_bytes,
-    FileIndex,
+    body_store_slot_key, branch_id_tag, content_checksum_32, content_rev_id_bytes,
+    identity_cas_semantic_hash, stable_id_bytes, stable_rev_id_bytes, FileIndex,
 };
 pub use crate::python_indexer::{extract_python_top_level_defs, path_to_python_module_key};
 
@@ -49,6 +51,46 @@ pub struct IndexEvent {
     pub branch_id: BranchId,
     pub path: String,
     pub kind: FsChangeKind,
+    /// Prior path for [`FsChangeKind::Renamed`] / [`FsChangeKind::Moved`].
+    /// When set, symbols on this path are tombstoned before indexing `path`.
+    pub old_path: Option<String>,
+}
+
+impl IndexEvent {
+    pub fn new(branch_id: BranchId, path: impl Into<String>, kind: FsChangeKind) -> Self {
+        Self {
+            branch_id,
+            path: path.into(),
+            kind,
+            old_path: None,
+        }
+    }
+
+    pub fn renamed(
+        branch_id: BranchId,
+        old_path: impl Into<String>,
+        new_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            branch_id,
+            path: new_path.into(),
+            kind: FsChangeKind::Renamed,
+            old_path: Some(old_path.into()),
+        }
+    }
+
+    pub fn moved(
+        branch_id: BranchId,
+        old_path: impl Into<String>,
+        new_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            branch_id,
+            path: new_path.into(),
+            kind: FsChangeKind::Moved,
+            old_path: Some(old_path.into()),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -150,6 +192,7 @@ pub fn apply_index_events_with_config(
     let resolver = IdentityResolver::from_policy(rename_config.rename_min_confidence);
     let body_store = BodyStore::new(Arc::clone(&kv));
     let identity_cas = IdentityProvisionalCas::new(Arc::clone(&kv));
+    let absence = DeletionAbsenceStore::new(Arc::clone(&kv));
     let cis_dir = coord.persistence_dir().map(|p| p.to_path_buf());
     coord.set_defer_snapshot_flush(true);
 
@@ -190,14 +233,43 @@ pub fn apply_index_events_with_config(
                 let sentinel_rid = NodeRevisionId(stable_id_bytes("del", &path, "$tombstone"));
                 let set = GraphMutationSet::new(vec![sentinel_rid], [0u8; 32]);
                 let mid = coord.begin_mutation(&set)?;
+                let absence_c = absence.clone();
                 coord.commit_graph(mid, move |g| {
-                    tombstone_all_file_symbols(g, branch, &path);
+                    tombstone_all_file_symbols_with_absence(
+                        g,
+                        branch,
+                        &path,
+                        Some(&absence_c),
+                    );
                     Ok(())
                 })?;
                 rep.applied += 1;
                 continue;
             }
-            FsChangeKind::Created | FsChangeKind::Modified | FsChangeKind::Renamed | FsChangeKind::Moved => {}
+            FsChangeKind::Renamed | FsChangeKind::Moved => {
+                // Tombstone the old path first when the caller supplied it.
+                if let Some(old) = ev.old_path.as_ref() {
+                    if indexer_for_path(old, &indexers).is_some() {
+                        let branch = ev.branch_id;
+                        let old_path = old.clone();
+                        let sentinel_rid =
+                            NodeRevisionId(stable_id_bytes("del", &old_path, "$tombstone"));
+                        let set = GraphMutationSet::new(vec![sentinel_rid], [0u8; 32]);
+                        let mid = coord.begin_mutation(&set)?;
+                        let absence_c = absence.clone();
+                        coord.commit_graph(mid, move |g| {
+                            tombstone_all_file_symbols_with_absence(
+                                g,
+                                branch,
+                                &old_path,
+                                Some(&absence_c),
+                            );
+                            Ok(())
+                        })?;
+                    }
+                }
+            }
+            FsChangeKind::Created | FsChangeKind::Modified => {}
         }
         let Some(indexer) = indexer_for_path(&ev.path, &indexers) else {
             rep.skipped_non_py += 1;
@@ -241,18 +313,33 @@ pub fn apply_index_events_with_config(
         let identity_cas_c = identity_cas.clone();
         let batch_indexes_c = batch_indexes.clone();
         let lang_c = lang;
+        let absence_c = absence.clone();
+        let bindings_out: Arc<Mutex<Vec<(IdentityId, NodeRevisionId)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let bindings_c = Arc::clone(&bindings_out);
         coord.commit_graph(id, move |g| {
             let retained: HashSet<String> = index_c
                 .symbols
                 .iter()
                 .map(|s| s.qualified_name.clone())
                 .collect();
-            tombstone_orphaned_file_symbols(g, branch, &path_c, &retained);
+            tombstone_orphaned_file_symbols_with_absence(
+                g,
+                branch,
+                &path_c,
+                &retained,
+                Some(&absence_c),
+            );
 
             let mut rename_edges: Vec<GraphEdge> = Vec::new();
+            let mut claimed_tomb_ids: std::collections::HashSet<cis_wal::NodeRevisionId> =
+                std::collections::HashSet::new();
+            let mut local_bindings: Vec<(IdentityId, NodeRevisionId)> = Vec::new();
+            let mut rid_remap: HashMap<NodeRevisionId, NodeRevisionId> = HashMap::new();
 
             for s in &index_c.symbols {
-                let rid = NodeRevisionId(stable_rev_id_bytes(branch, &path_c, &s.stable_key));
+                let stable_rid =
+                    NodeRevisionId(stable_rev_id_bytes(branch, &path_c, &s.stable_key));
                 let proposed_iid = if s.kind == NodeKind::File {
                     IdentityId(stable_id_bytes("file", &path_c, "$hub"))
                 } else {
@@ -262,10 +349,13 @@ pub fn apply_index_events_with_config(
                 let body_snip = if s.kind == NodeKind::File {
                     file_content.clone()
                 } else {
+                    // Regex single-line spans continue through the indented block via
+                    // body_snippet_for_span; tree-sitter multi-line spans are trusted as-is.
                     body_snippet_for_span(&file_content, s.span.start_line, s.span.end_line)
                 };
                 let content_hash = content_checksum_32(&body_snip);
-                let sem_hash = content_hash;
+                // CAS key is symbol identity (path+stable_key), never body text.
+                let sem_hash = crate::index_model::identity_cas_semantic_hash(&path_c, &s.stable_key);
 
                 let (iid, rename_source_id) = if s.kind == NodeKind::File {
                     (proposed_iid, None)
@@ -282,6 +372,7 @@ pub fn apply_index_events_with_config(
                         Some(&body_store_c),
                         Some(&identity_cas_c),
                         sem_hash,
+                        &mut claimed_tomb_ids,
                     );
                     let rename_source_id = outcome.rename_link.map(|(tomb_rev, ev)| {
                         rename_edges.push(IdentityResolver::renamed_from_edge(
@@ -297,6 +388,59 @@ pub fn apply_index_events_with_config(
                     (outcome.identity_id, rename_source_id)
                 };
 
+                let (rid, parent_revision_id) =
+                    match g.primary_revision_for_identity(branch, iid).cloned() {
+                        None => (stable_rid, None),
+                        Some(prev)
+                            if matches!(
+                                prev.status,
+                                RevisionStatus::Active | RevisionStatus::Speculative
+                            ) && prev.body_hash == content_hash =>
+                        {
+                            // Idempotent re-index: same live body.
+                            (prev.revision_id, prev.parent_revision_id)
+                        }
+                        Some(prev)
+                            if matches!(
+                                prev.status,
+                                RevisionStatus::Active | RevisionStatus::Speculative
+                            ) =>
+                        {
+                            // In-place edit: append a content-addressed revision.
+                            crate::revision_lineage::retire_revision_to_tombstone(
+                                g,
+                                prev.revision_id,
+                            );
+                            (
+                                NodeRevisionId(content_rev_id_bytes(
+                                    branch,
+                                    &path_c,
+                                    &s.stable_key,
+                                    content_hash,
+                                )),
+                                Some(prev.revision_id),
+                            )
+                        }
+                        Some(prev) => {
+                            // Primary is tombstone/orphaned (typical after rename detection).
+                            // Prefer the stable slot for this symbol key so callers can look
+                            // up by stable_rev_id_bytes; fall back to content id if occupied
+                            // by a different identity.
+                            let rid = match g.get_revision(stable_rid) {
+                                None => stable_rid,
+                                Some(existing) if existing.identity_id == iid => stable_rid,
+                                Some(_) => NodeRevisionId(content_rev_id_bytes(
+                                    branch,
+                                    &path_c,
+                                    &s.stable_key,
+                                    content_hash,
+                                )),
+                            };
+                            (rid, Some(prev.revision_id))
+                        }
+                    };
+                rid_remap.insert(stable_rid, rid);
+
                 let body_bytes = body_snip.into_bytes();
                 body_store_c.put(content_hash, body_bytes.clone());
                 if s.kind == NodeKind::File {
@@ -307,10 +451,8 @@ pub fn apply_index_events_with_config(
                     identity_id: iid,
                     kind: s.kind,
                 });
-                let parent_revision_id = g
-                    .primary_revision_for_identity(branch, iid)
-                    .filter(|prev| prev.revision_id != rid)
-                    .map(|prev| prev.revision_id);
+                // Recreating an Active/Speculative revision clears any prior deletion absence.
+                absence_c.clear_deleted(branch, iid);
                 g.put_revision(NodeRevision {
                     revision_id: rid,
                     identity_id: iid,
@@ -319,13 +461,14 @@ pub fn apply_index_events_with_config(
                     qualified_name: s.qualified_name.clone(),
                     file_path: path_c.clone(),
                     body_hash: content_hash,
-                    signature_hash: sem_hash,
+                    signature_hash: content_hash,
                     language: lang_c,
                     parent_revision_id,
                     rename_source_id,
                     span: s.span,
                     tombstoned_at_ms: None,
                 });
+                local_bindings.push((iid, rid));
             }
 
             let edge_map = attach_import_and_call_edges(
@@ -336,11 +479,20 @@ pub fn apply_index_events_with_config(
                 Some(g),
                 &batch_indexes_c,
             );
-            for (rid, edges) in edge_map {
-                if !edges.is_empty() {
-                    g.replace_edges_for_revision(rid, edges)
-                        .map_err(|_| "edge_replace")?;
+            for (stable_rid, edges) in edge_map {
+                if edges.is_empty() {
+                    continue;
                 }
+                let target_rid = rid_remap.get(&stable_rid).copied().unwrap_or(stable_rid);
+                let remapped: Vec<GraphEdge> = edges
+                    .into_iter()
+                    .map(|mut e| {
+                        e.source_revision_id = target_rid;
+                        e
+                    })
+                    .collect();
+                g.replace_edges_for_revision(target_rid, remapped)
+                    .map_err(|_| "edge_replace")?;
             }
             for e in rename_edges {
                 let rid = e.source_revision_id;
@@ -349,16 +501,12 @@ pub fn apply_index_events_with_config(
                 g.replace_edges_for_revision(rid, list)
                     .map_err(|_| "edge_replace")?;
             }
+            *bindings_c.lock().unwrap() = local_bindings;
             Ok(())
         })?;
         if let Some(ri) = &time_travel_ri {
-            for s in &index.symbols {
-                let rid = NodeRevisionId(stable_rev_id_bytes(branch, &path, &s.stable_key));
-                let iid = if s.kind == NodeKind::File {
-                    IdentityId(stable_id_bytes("file", &path, "$hub"))
-                } else {
-                    IdentityId(stable_id_bytes("id", &path, &s.stable_key))
-                };
+            // Bind the *resolved* identity (post-rename), not the proposed stable_id.
+            for (iid, rid) in bindings_out.lock().unwrap().iter().copied() {
                 ri.bind(iid, rid);
             }
         }
@@ -412,6 +560,7 @@ mod tests {
             branch_id: BranchId([0u8; 16]),
             path: "a.py".into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         });
         assert_eq!(q.depth(), 1);
         let d = q.drain();
@@ -463,11 +612,13 @@ mod tests {
                 branch_id: branch,
                 path: "utils.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
             IndexEvent {
                 branch_id: branch,
                 path: "Board.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
         ];
         let rep = apply_index_events(
@@ -521,11 +672,13 @@ mod tests {
                 branch_id: branch,
                 path: "Board.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
             IndexEvent {
                 branch_id: branch,
                 path: "Screen.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
         ];
         let rep = apply_index_events(
@@ -580,11 +733,13 @@ mod tests {
                 branch_id: branch,
                 path: "Board.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
             IndexEvent {
                 branch_id: branch,
                 path: "Screen.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
         ];
         let rep = apply_index_events(
@@ -642,11 +797,13 @@ mod tests {
                 branch_id: branch,
                 path: "Tile.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
             IndexEvent {
                 branch_id: branch,
                 path: "Screen.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
         ];
         let rep = apply_index_events(
@@ -701,8 +858,9 @@ mod tests {
             branch_id: BranchId([0u8; 16]),
             path: "t.py".into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         }];
-        let rep = apply_index_events(
+                let rep = apply_index_events(
             &q,
             &coord,
             Arc::clone(&kv),
@@ -732,8 +890,9 @@ mod tests {
             branch_id: branch,
             path: "a.py".into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         }];
-        let rep = apply_index_events(
+                let rep = apply_index_events(
             &q,
             &coord,
             kv,
@@ -765,8 +924,9 @@ mod tests {
             branch_id: branch,
             path: "snap.py".into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         }];
-        let rep = apply_index_events(
+                let rep = apply_index_events(
             &q,
             &coord,
             Arc::clone(&kv),
@@ -804,8 +964,9 @@ mod tests {
             branch_id: branch,
             path: "g.py".into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         }];
-        let rep = apply_index_events(
+                let rep = apply_index_events(
             &q,
             &coord,
             Arc::clone(&kv),
@@ -847,6 +1008,7 @@ mod tests {
                 branch_id: branch,
                 path: path.into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             }];
             let s = src.to_string();
             apply_index_events(
@@ -865,11 +1027,18 @@ mod tests {
         let iid_foo = IdentityId(stable_id_bytes("id", path, "foo"));
         apply("def bar():\n    return 1\n");
 
-        let bar = find_symbol_at_in_graph(&coord, "bar");
+        let g = coord.graph().read();
+        let bar = g
+            .primary_revision_for_identity(branch, iid_foo)
+            .expect("bar via preserved identity");
+        assert!(
+            bar.qualified_name.contains("bar"),
+            "expected bar qn, got {}",
+            bar.qualified_name
+        );
         assert_eq!(bar.identity_id, iid_foo);
         assert_eq!(bar.rename_source_id, Some(iid_foo));
         let foo_rev = NodeRevisionId(stable_rev_id_bytes(branch, path, "foo"));
-        let g = coord.graph().read();
         assert!(matches!(
             g.get_revision(foo_rev).map(|r| r.status),
             Some(RevisionStatus::Tombstone)
@@ -879,6 +1048,99 @@ mod tests {
                 .iter()
                 .any(|e| e.ty == EdgeType::RenamedFrom)
         );
+    }
+
+    #[test]
+    fn ingest_append_style_two_versions() {
+        use cis_wal::MutationLog;
+
+        use crate::coordinator::WriteCoordinator;
+        use crate::graph::{Language, NodeIdentity, NodeKind, NodeRevision, SourceSpan};
+        use crate::graph_mutation::GraphMutationSet;
+        use crate::index_model::{content_checksum_32, content_rev_id_bytes, stable_rev_id_bytes};
+
+        let wal: Arc<dyn cis_wal::MutationLogStore> = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(Arc::clone(&wal));
+        let saga = MergeSagaOrchestrator::new(Arc::new(MemoryKv::new()));
+        let _ = coord.reconcile_on_startup(&saga);
+        let branch = BranchId([0u8; 16]);
+        let path = "t.py";
+        let iid = IdentityId(stable_id_bytes("id", path, "f"));
+        let stable = NodeRevisionId(stable_rev_id_bytes(branch, path, "f"));
+        let h1 = content_checksum_32("body1");
+        let h2 = content_checksum_32("body2");
+
+        let mid1 = coord
+            .begin_mutation(&GraphMutationSet::new(vec![stable], h1))
+            .unwrap();
+        coord
+            .commit_graph(mid1, move |g| {
+                g.put_identity(NodeIdentity {
+                    identity_id: iid,
+                    kind: NodeKind::Function,
+                });
+                g.put_revision(NodeRevision {
+                    revision_id: stable,
+                    identity_id: iid,
+                    branch_id: branch,
+                    status: RevisionStatus::Active,
+                    qualified_name: format!("{path}::f"),
+                    file_path: path.into(),
+                    body_hash: h1,
+                    signature_hash: h1,
+                    language: Language::Python,
+                    parent_revision_id: None,
+                    rename_source_id: None,
+                    span: SourceSpan::UNKNOWN,
+                    tombstoned_at_ms: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let new_rid = NodeRevisionId(content_rev_id_bytes(branch, path, "f", h2));
+        let mid2 = coord
+            .begin_mutation(&GraphMutationSet::new(vec![stable, new_rid], h2))
+            .unwrap();
+        coord
+            .commit_graph(mid2, move |g| {
+                let prev = g
+                    .primary_revision_for_identity(branch, iid)
+                    .cloned()
+                    .expect("prev");
+                crate::revision_lineage::retire_revision_to_tombstone(g, prev.revision_id);
+                g.put_revision(NodeRevision {
+                    revision_id: new_rid,
+                    identity_id: iid,
+                    branch_id: branch,
+                    status: RevisionStatus::Active,
+                    qualified_name: format!("{path}::f"),
+                    file_path: path.into(),
+                    body_hash: h2,
+                    signature_hash: h2,
+                    language: Language::Python,
+                    parent_revision_id: Some(prev.revision_id),
+                    rename_source_id: None,
+                    span: SourceSpan::UNKNOWN,
+                    tombstoned_at_ms: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let g = coord.graph().read();
+        assert_eq!(g.revision_ids_for_identity(branch, iid).len(), 2);
+        let steps = crate::revision_lineage::lineage_for_identity(
+            &g,
+            &[branch],
+            iid,
+            None,
+            &crate::revision_lineage::LineageOptions::default(),
+        )
+        .expect("lineage");
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0].status, RevisionStatus::Active));
+        assert!(matches!(steps[1].status, RevisionStatus::Tombstone));
     }
 
     fn find_symbol_at_in_graph(coord: &WriteCoordinator, needle: &str) -> NodeRevision {

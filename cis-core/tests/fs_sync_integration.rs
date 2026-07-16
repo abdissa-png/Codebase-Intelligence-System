@@ -84,6 +84,7 @@ fn debouncer_coalesces_before_reindex() {
             branch_id: branch,
             path: "same.py".into(),
             kind: cis_core::FsChangeKind::Modified,
+            old_path: None,
         });
         thread::sleep(Duration::from_millis(10));
     }
@@ -105,6 +106,7 @@ fn debouncer_records_watcher_metrics() {
             branch_id: branch,
             path: "coalesce.py".into(),
             kind: cis_core::FsChangeKind::Modified,
+            old_path: None,
         });
     }
     let snap = metrics.snapshot(d.pending_count());

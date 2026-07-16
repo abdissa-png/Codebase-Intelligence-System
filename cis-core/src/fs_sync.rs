@@ -316,6 +316,7 @@ pub fn reindex_paths_on_coordinator(
             branch_id: branch,
             path: path.clone(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         })
         .collect();
 
@@ -633,6 +634,7 @@ pub fn run_fs_sync_loop(
                     branch_id: branch,
                     path: rel,
                     kind: FsChangeKind::Modified,
+                    old_path: None,
                 });
             }
         }
@@ -726,18 +728,36 @@ fn run_notify_blocking(
                 return;
             };
             let kind = notify_kind_to_fs_change(event.kind);
-            for p in event.paths {
-                if p.extension().and_then(|x| x.to_str()) != Some("py") {
-                    continue;
-                }
-                let Ok(rel) = p.strip_prefix(&root) else {
-                    continue;
-                };
+            let rels: Vec<String> = event
+                .paths
+                .iter()
+                .filter_map(|p| {
+                    if p.extension().and_then(|x| x.to_str()) != Some("py") {
+                        return None;
+                    }
+                    let Ok(rel) = p.strip_prefix(&root) else {
+                        return None;
+                    };
+                    Some(rel.to_string_lossy().replace('\\', "/"))
+                })
+                .collect();
+            if matches!(kind, FsChangeKind::Renamed | FsChangeKind::Moved) && rels.len() >= 2 {
+                // notify typically lists old path then new path.
                 debouncer.schedule(IndexEvent {
                     branch_id: branch,
-                    path: rel.to_string_lossy().replace('\\', "/"),
+                    path: rels[1].clone(),
                     kind,
+                    old_path: Some(rels[0].clone()),
                 });
+            } else {
+                for rel in rels {
+                    debouncer.schedule(IndexEvent {
+                        branch_id: branch,
+                        path: rel,
+                        kind,
+                        old_path: None,
+                    });
+                }
             }
         },
         Config::default(),
@@ -782,6 +802,7 @@ mod tests {
                 branch_id: branch,
                 path: "a.py".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             });
             thread::sleep(Duration::from_millis(20));
         }
@@ -812,6 +833,7 @@ mod tests {
             branch_id: branch,
             path: "b.py".into(),
             kind: FsChangeKind::Modified,
+            old_path: None,
         });
         let all = d.flush_all();
         assert_eq!(all.len(), 1);

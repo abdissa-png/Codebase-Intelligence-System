@@ -168,6 +168,7 @@ pub fn bootstrap_python_workspace_on_coordinator(
                 branch_id: branch,
                 path: rel.to_string_lossy().replace('\\', "/"),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             })
         })
         .collect();

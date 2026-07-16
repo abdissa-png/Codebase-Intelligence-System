@@ -55,11 +55,13 @@ fn typescript_cross_file_calls() {
                 branch_id: branch,
                 path: "util.ts".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
             IndexEvent {
                 branch_id: branch,
                 path: "main.ts".into(),
                 kind: FsChangeKind::Modified,
+                old_path: None,
             },
         ],
         |rel| fs::read_to_string(root.join(rel)),

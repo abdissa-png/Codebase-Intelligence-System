@@ -249,7 +249,7 @@ fn default_recency_half_life_days() -> u32 {
 }
 
 fn default_rename_min_confidence() -> f64 {
-    0.5
+    0.55
 }
 
 fn default_body_similarity_threshold() -> f64 {
