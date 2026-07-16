@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/abdissa-png/Codebase-Intelligence-System)
+
 # CIS — Codebase Intelligence System
 
 CIS is a Rust daemon that builds a **versioned code graph** over your repository and exposes it to AI agents through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). Agents can navigate symbols, search semantically, apply speculative edits with confirm/revert, and merge branches — with crash-safe persistence and background maintenance.
