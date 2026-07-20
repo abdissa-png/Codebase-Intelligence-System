@@ -76,12 +76,19 @@ impl OptimisticPatcher {
                     return Err(OptimisticPatchError::MergeLocked);
                 }
             }
+            let mut acquired: Vec<&str> = Vec::with_capacity(paths.len());
             for p in &paths {
-                self.leases.acquire(p, session)?;
+                if let Err(e) = self.leases.acquire(p, session) {
+                    for prev in &acquired {
+                        self.leases.release(prev, session);
+                    }
+                    return Err(OptimisticPatchError::Lease(e));
+                }
+                acquired.push(p.as_str());
             }
             if let Some((kv, branch)) = merge_ctx {
                 if merge_lock_holder(kv, branch).is_some() {
-                    for p in &paths {
+                    for p in &acquired {
                         self.leases.release(p, session);
                     }
                     return Err(OptimisticPatchError::MergeLocked);
@@ -319,6 +326,31 @@ mod tests {
                 Some((&kv, branch)),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn partial_acquire_conflict_releases_earlier_leases() {
+        let leases = Arc::new(PathLeaseManager::new());
+        let spec = Arc::new(SpeculativePathTracker::new());
+        let patcher = OptimisticPatcher::new(Arc::clone(&leases), Arc::clone(&spec));
+        // Hold "b.rs" as another session so multi-path acquire fails mid-loop
+        // after "a.rs" is acquired (paths are sorted).
+        leases.acquire("b.rs", SessionId(99)).unwrap();
+        let err = patcher
+            .apply_speculative(
+                SessionId(1),
+                vec!["b.rs".into(), "a.rs".into()],
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, OptimisticPatchError::Lease(_)));
+        assert!(
+            leases.holder("a.rs").is_none(),
+            "a.rs lease must be released after mid-acquire conflict"
+        );
+        assert_eq!(leases.holder("b.rs"), Some(SessionId(99)));
+        assert_eq!(patcher.open_patch_count(), 0);
+        assert!(!spec.intersects(&["a.rs".into(), "b.rs".into()]));
     }
 
     #[test]
