@@ -627,15 +627,21 @@ fn tool_definitions() -> Vec<Value> {
     tools
 }
 
-fn session_id_from_args(args: &Value) -> u64 {
-    args.get("session_id")
-        .and_then(|x| x.as_u64())
-        .unwrap_or_else(|| {
-            std::env::var("CIS_SESSION_ID")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0)
-        })
+/// Resolve MCP session id. Requires `arguments.session_id` or `CIS_SESSION_ID`.
+/// Legacy default `0` only when `CIS_ALLOW_DEFAULT_SESSION=1`.
+fn session_id_from_args(args: &Value) -> Result<u64, &'static str> {
+    if let Some(id) = args.get("session_id").and_then(|x| x.as_u64()) {
+        return Ok(id);
+    }
+    if let Ok(s) = std::env::var("CIS_SESSION_ID") {
+        if let Ok(id) = s.parse::<u64>() {
+            return Ok(id);
+        }
+    }
+    if std::env::var_os("CIS_ALLOW_DEFAULT_SESSION").is_some_and(|v| v == "1") {
+        return Ok(0);
+    }
+    Err("session_id is required (pass arguments.session_id or set CIS_SESSION_ID; CIS_ALLOW_DEFAULT_SESSION=1 for legacy default 0)")
 }
 
 fn parse_hybrid_candidates(args: &Value) -> Vec<HybridSearchCandidate> {
@@ -723,7 +729,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
     let mut is_error = false;
     let content_text: String = match name {
         "find_symbol" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let needle = symbol_from_args(&args);
             let limit = limit_from_args(&args, 20);
             let prefer_file = prefer_file_hub_from_args(&args);
@@ -741,7 +760,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "find_symbol_at" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let needle = args.get("symbol").and_then(|x| x.as_str()).unwrap_or("");
             let limit = args.get("limit").and_then(|x| x.as_u64()).unwrap_or(20) as usize;
             let branch = args
@@ -769,7 +801,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "build_context" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let text = args.get("text").and_then(|x| x.as_str()).unwrap_or("");
             let budget = args
                 .get("budget_tokens")
@@ -785,7 +830,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "build_context_at" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let target = args.get("target").and_then(|x| x.as_str()).unwrap_or("");
             let budget = args
                 .get("budget_tokens")
@@ -816,7 +874,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "get_symbol_body" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let rev_hex = revision_id_from_args(&args);
             let revision_id = if rev_hex.is_empty() {
                 None
@@ -845,7 +916,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "hybrid_search" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let k = args
                 .get("vector_top_k")
                 .and_then(|x| x.as_u64())
@@ -861,7 +945,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "go_to_definition" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let rev = revision_id_from_args(&args);
             let branch = args
                 .get("branch_id")
@@ -877,7 +974,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "find_references" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let rev = revision_id_from_args(&args);
             let branch = args
                 .get("branch_id")
@@ -894,7 +1004,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "get_callers" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let branch = args
                 .get("branch_id")
                 .and_then(|x| x.as_str())
@@ -930,7 +1053,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "get_dependencies" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let rev = revision_id_from_args(&args);
             let branch = args
                 .get("branch_id")
@@ -947,7 +1083,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "file_imports" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let file_path = args
                 .get("file_path")
                 .and_then(|x| x.as_str())
@@ -970,7 +1119,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "expand_context" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let rev = revision_id_from_args(&args);
             let depth = args.get("depth").and_then(|x| x.as_u64()).unwrap_or(2) as u32;
             let branch = args
@@ -988,7 +1150,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "semantic_search" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let q = args.get("query").and_then(|x| x.as_str()).unwrap_or("");
             let branch = args
                 .get("branch_id")
@@ -1005,7 +1180,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "explain_context" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let rev = revision_id_from_args(&args);
             let budget = args
                 .get("budget_tokens")
@@ -1025,7 +1213,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "index_status" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.index_status(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1036,7 +1237,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "embedding_status" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.embedding_status(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1047,7 +1261,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "system_status" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.system_status(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1058,7 +1285,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "why_no_definition" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let rev = revision_id_from_args(&args);
             let branch = args
                 .get("branch_id")
@@ -1074,7 +1314,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "list_branches" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.list_branches(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1085,7 +1338,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "list_merge_metrics" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let limit = args
                 .get("limit")
                 .and_then(|x| x.as_u64())
@@ -1101,7 +1367,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "verify_audit_chain" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.verify_audit_chain(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1112,7 +1391,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "check_graph_consistency" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.check_graph_consistency(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1123,7 +1415,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "write_file" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let path = args.get("path").and_then(|x| x.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|x| x.as_str()).unwrap_or("");
             let reindex = args.get("reindex").and_then(|x| x.as_bool()).unwrap_or(true);
@@ -1137,7 +1442,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "apply_patch" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let path = args.get("path").and_then(|x| x.as_str()).unwrap_or("");
             let new_content = args.get("new_content").and_then(|x| x.as_str()).unwrap_or("");
             let reindex = args.get("reindex").and_then(|x| x.as_bool()).unwrap_or(true);
@@ -1151,7 +1469,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "reindex_paths" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let paths: Vec<&str> = args
                 .get("paths")
                 .and_then(|x| x.as_array())
@@ -1175,7 +1506,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "confirm_patch" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let patch_id = args.get("patch_id").and_then(|x| x.as_u64()).unwrap_or(0);
             match rt.confirm_patch(session_id, patch_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
@@ -1187,7 +1531,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "revert_patch" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let patch_id = args.get("patch_id").and_then(|x| x.as_u64()).unwrap_or(0);
             match rt.revert_patch(session_id, patch_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
@@ -1199,7 +1556,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "sweep_confirm_sidecars" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let _ = session_id;
             let n = rt.sweep_stale_confirm_sidecars();
             match serde_json::to_string(&json!({
@@ -1211,7 +1581,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "purge_branch" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let branch = args
                 .get("branch_id")
                 .and_then(|x| x.as_str())
@@ -1226,7 +1609,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "save_workspace" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.save_workspace(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1237,7 +1633,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "cancel_merge" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let merge_hex = args.get("merge_id").and_then(|x| x.as_str()).unwrap_or("");
             let Some(branch) = args
                 .get("branch_id")
@@ -1257,7 +1666,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "merge_ttl_sweep" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.run_merge_ttl_sweep(session_id) {
                 Ok(n) => serde_json::to_string(&json!({
                     "cleared_merge_locks": n,
@@ -1272,7 +1694,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "merge_branch" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let source = args
                 .get("source_branch_id")
                 .and_then(|x| x.as_str())
@@ -1308,7 +1743,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "ingest_cis_config" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             match rt.ingest_cis_config(session_id) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
@@ -1319,7 +1767,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "create_branch" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let name = args.get("name").and_then(|x| x.as_str()).unwrap_or("");
             let parent = args.get("parent").and_then(|x| x.as_str());
             match rt.create_branch(session_id, name, parent) {
@@ -1332,7 +1793,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
             }
         }
         "switch_branch" => {
-            let session_id = session_id_from_args(&args);
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
             let name = args.get("name").and_then(|x| x.as_str()).unwrap_or("");
             match rt.switch_branch(session_id, name) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
