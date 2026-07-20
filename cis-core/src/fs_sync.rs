@@ -503,7 +503,8 @@ pub fn resolve_fs_watch_backend() -> FsWatchBackend {
     }
 }
 
-fn flush_debounced_reindex(rt: &crate::mcp_runtime::CisMcpRuntime) {
+/// Process debounce-ready FS events: promote CIS writes (token present) or revert external edits.
+pub fn flush_debounced_reindex(rt: &crate::mcp_runtime::CisMcpRuntime) {
     let batch = rt.index_debouncer().drain_ready();
     if batch.is_empty() {
         return;

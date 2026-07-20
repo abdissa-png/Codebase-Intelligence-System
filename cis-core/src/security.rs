@@ -40,6 +40,15 @@ impl AuthProvider {
             .ok_or(AuthError::Unauthorized)
     }
 
+    /// Require a registered session with `admin: true` for privileged tools.
+    pub fn require_admin(&self, id: u64) -> Result<Session, AuthError> {
+        let s = self.require_session(id)?;
+        if !s.admin {
+            return Err(AuthError::Forbidden);
+        }
+        Ok(s)
+    }
+
     pub fn validate_path(&self, session_id: u64, path: &str) -> Result<(), AuthError> {
         let s = self.require_session(session_id)?;
         if path.contains("..") {
@@ -60,10 +69,18 @@ pub enum AuthError {
     Forbidden,
     /// Bad MCP arguments (e.g. invalid **`commit_hash`** / missing snapshot).
     InvalidInput,
+    /// Lease / CAS / merge conflict (HTTP 409 class).
+    Conflict,
+    /// Patch/merge/coordinator state does not allow the operation.
+    State,
+    /// Persistence / WAL failure.
+    Persist,
     /// **FR-4.7** — concurrent query quota exceeded (HTTP 429).
     QuotaExceeded,
     /// **FR-1.10** — disk pressure; refuse new speculative writes.
     DiskPressure,
+    /// Coordinator not ready (e.g. WAL replay failed at startup).
+    NotReady,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

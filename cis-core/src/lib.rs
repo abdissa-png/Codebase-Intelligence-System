@@ -1,6 +1,10 @@
 //! Core engine: graph, `WriteCoordinator`, KV, revision index, reconciliation hooks.
 //!
 //! Spec: `CIS-Architecture-v2.md` (repo root).
+//!
+//! **Follow-up (architecture):** MCP response/tool DTOs currently live in `mcp_runtime`
+//! and are re-exported from this crate. Prefer moving transport-facing types into
+//! `cis-mcp` in a later refactor so `cis-core` stays free of MCP surface area.
 
 mod body_blob;
 mod body_store;
@@ -147,7 +151,7 @@ pub use embedding_worker::{EmbeddingDrainReport, EmbeddingWorker};
 pub use watcher_metrics::{WatcherMetrics, WatcherStatusSnapshot};
 pub use worker_heartbeats::{WorkerHeartbeat, WorkerHeartbeatSummary, WorkerHeartbeats};
 pub use fs_sync::{
-    reindex_paths, reindex_persist_snapshots_enabled, reindex_python_paths,
+    flush_debounced_reindex, reindex_paths, reindex_persist_snapshots_enabled, reindex_python_paths,
     reindex_paths_on_coordinator, reindex_python_paths_on_coordinator,
     reindex_python_paths_with_config,
     resolve_fs_watch_backend,
@@ -172,7 +176,7 @@ pub use fault_injection::{
 };
 pub use graph_delete_queue::{DeleteJob, DeleteReason, GraphDeleteQueue};
 pub use graph_mutation::GraphMutationSet;
-pub use identity_cas::IdentityProvisionalCas;
+pub use identity_cas::{IdentityProvisionalCas, ALLOCATING_TTL_MS};
 pub use language_indexer::{
     default_indexers, indexer_for_path, IndexError, LanguageIndexer, PythonIndexer,
 };
@@ -221,7 +225,7 @@ pub use merge_engine::{
     recover_inflight_merges,
     resume_merge, run_phase_a_classify, ClassifiedMergeIdentity, MergeContext,
     MergeIdentityClass, MergeRecoveryReport, MergeReport, MergeStrategy, MergeWorkflowStatus,
-    PhaseAResult, PhaseBResult, PhaseCResult,
+    PhaseAResult, PhaseBResult, PhaseCResult, ResumePendingResolution,
 };
 pub use merge_gate::MergeRecoveryGate;
 pub use merge_metrics::{

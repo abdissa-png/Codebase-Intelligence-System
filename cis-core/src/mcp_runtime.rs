@@ -645,12 +645,40 @@ fn resolve_repo_path(repo_root: &str, rel: &str) -> Result<std::path::PathBuf, A
         root.join(rel)
     };
     let root_canon = root.canonicalize().map_err(|_| AuthError::Forbidden)?;
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| AuthError::Forbidden)?;
-    }
+
+    // Validate containment before any create_dir_all side effects.
     let abs = if p.exists() {
-        p.canonicalize().map_err(|_| AuthError::Forbidden)?
+        let abs = p.canonicalize().map_err(|_| AuthError::Forbidden)?;
+        if !abs.starts_with(&root_canon) {
+            return Err(AuthError::Forbidden);
+        }
+        abs
     } else {
+        // Walk up to the nearest existing ancestor and ensure it is under repo root
+        // before creating any missing directories.
+        let mut ancestor = p.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| root_canon.clone());
+        while !ancestor.as_os_str().is_empty() && !ancestor.exists() {
+            match ancestor.parent() {
+                Some(parent) => ancestor = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        let ancestor_canon = if ancestor.as_os_str().is_empty() || ancestor == Path::new("") {
+            root_canon.clone()
+        } else if ancestor.exists() {
+            ancestor.canonicalize().map_err(|_| AuthError::Forbidden)?
+        } else {
+            return Err(AuthError::Forbidden);
+        };
+        if !ancestor_canon.starts_with(&root_canon) {
+            return Err(AuthError::Forbidden);
+        }
+        // Safe to create parents now — they are under root_canon.
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|_| AuthError::Forbidden)?;
+            }
+        }
         let parent = p.parent().ok_or(AuthError::Forbidden)?;
         let parent_canon = if parent.as_os_str().is_empty() {
             root_canon.clone()
@@ -661,11 +689,12 @@ fn resolve_repo_path(repo_root: &str, rel: &str) -> Result<std::path::PathBuf, A
             return Err(AuthError::Forbidden);
         }
         let name = p.file_name().ok_or(AuthError::Forbidden)?;
-        parent_canon.join(name)
+        let abs = parent_canon.join(name);
+        if !abs.starts_with(&root_canon) {
+            return Err(AuthError::Forbidden);
+        }
+        abs
     };
-    if !abs.starts_with(&root_canon) {
-        return Err(AuthError::Forbidden);
-    }
     Ok(abs)
 }
 
@@ -679,8 +708,11 @@ fn is_probably_unified_diff(s: &str) -> bool {
 
 fn patch_err(e: OptimisticPatchError) -> AuthError {
     match e {
-        OptimisticPatchError::Lease(LeaseError::Conflict { .. }) => AuthError::Forbidden,
-        OptimisticPatchError::MergeLocked => AuthError::Forbidden,
+        OptimisticPatchError::Lease(LeaseError::Conflict { .. }) => AuthError::Conflict,
+        OptimisticPatchError::MergeLocked => AuthError::Conflict,
+        OptimisticPatchError::UnknownPatch(_) | OptimisticPatchError::SessionMismatch(_) => {
+            AuthError::State
+        }
         _ => AuthError::InvalidInput,
     }
 }
@@ -780,10 +812,19 @@ impl CisMcpRuntime {
                 if wp.exists() {
                     match cis_wal::DurableMutationLog::open(&wp) {
                         Ok(d) => std::sync::Arc::new(d),
-                        Err(_) => std::sync::Arc::new(cis_wal::MutationLog::new()),
+                        Err(e) => {
+                            // Fail closed: do not silently empty WAL history.
+                            panic!(
+                                "cis: corrupt or unreadable WAL at {}: {e} — refusing to start with empty log",
+                                wp.display()
+                            );
+                        }
                     }
                 } else {
-                    std::sync::Arc::new(cis_wal::MutationLog::new())
+                    match cis_wal::DurableMutationLog::open(&wp) {
+                        Ok(d) => std::sync::Arc::new(d),
+                        Err(_) => std::sync::Arc::new(cis_wal::MutationLog::new()),
+                    }
                 }
             }
         };
@@ -1361,6 +1402,9 @@ impl CisMcpRuntime {
                 &gate,
                 Some(&self.reconciliation_tracker),
             );
+            drop(g);
+            // Compensate leftovers only after resume attempts.
+            let _ = saga.compensate_orphans();
             for entry in report.entries {
                 self.append_merge_metrics_record(crate::merge_metrics::MergeMetricsRecord {
                     merge_id_hex: hex16(&entry.merge_id.0),
@@ -1479,7 +1523,8 @@ impl CisMcpRuntime {
         self.patcher.pending_patch_for_path(rel_path, &self.repo_root)
     }
 
-    /// Promote pending speculative patches that touch any of `paths` and clear confirm sidecars.
+    /// Promote pending speculative patches that touch any of `paths` **only when** a confirm
+    /// token is present (FS-originated CIS write). Unconfirmed patches are left speculative.
     pub fn confirm_pending_patches_for_paths(&self, paths: &[&str]) -> usize {
         let mut seen = HashSet::new();
         let mut n = 0usize;
@@ -1488,6 +1533,15 @@ impl CisMcpRuntime {
                 continue;
             };
             if !seen.insert(patch_id) {
+                continue;
+            }
+            let nonce = format!("{}", patch_id);
+            let has_token = self
+                .confirm_backend()
+                .read_token(&nonce)
+                .unwrap_or(None)
+                .is_some();
+            if !has_token {
                 continue;
             }
             if self.confirm_patch_internal(patch_id).is_ok() {
@@ -1638,7 +1692,12 @@ impl CisMcpRuntime {
         let session_id = self.patcher.patch_session(patch_id).ok_or(())?;
         let paths = self.patcher.promote(patch_id, session_id).map_err(|_| ())?;
         let nonce = format!("{}", patch_id);
-        let _ = clear_token_with_retry(self.confirm_backend(), &nonce);
+        if let Err(e) = clear_token_with_retry(self.confirm_backend(), &nonce) {
+            eprintln!(
+                "cis-mcp: clear confirm token after confirm_patch_internal {}: {:?}",
+                patch_id, e
+            );
+        }
         let branch = self.active_branch();
         let _ = self.wal_promote_speculative(patch_id, &paths, branch).map_err(|_| ())?;
         self.pre_write_snapshots.clear_patch(patch_id);
@@ -1694,7 +1753,12 @@ impl CisMcpRuntime {
             .revert(patch_id, session_id)
             .map_err(|_| crate::coordinator::CoordinatorError::Graph("patcher revert"))?;
         let nonce = format!("{}", patch_id);
-        let _ = clear_token_with_retry(self.confirm_backend(), &nonce);
+        if let Err(e) = clear_token_with_retry(self.confirm_backend(), &nonce) {
+            eprintln!(
+                "cis-mcp: clear confirm token after revert patch {}: {:?}",
+                patch_id, e
+            );
+        }
         let branch = self.active_branch();
         self.wal_revert_speculative(patch_id, paths, branch)?;
         self.pre_write_snapshots.clear_patch(patch_id);
@@ -1893,7 +1957,7 @@ impl CisMcpRuntime {
     /// Remove **`ri:{branch}:`** overlay keys and **`deleted:{branch}:`** absence markers
     /// from durable KV (post-merge / branch cleanup).
     pub fn purge_branch(&self, session_id: u64, branch_hex: &str) -> Result<PurgeBranchResponse, AuthError> {
-        self.require_session(session_id)?;
+        self.require_admin(session_id)?;
         let branch = parse_branch_id_hex(branch_hex).ok_or(AuthError::InvalidInput)?;
         let prefix = format!("ri:{}:", hex16(&branch.0));
         let keys: Vec<String> = self
@@ -2116,13 +2180,24 @@ impl CisMcpRuntime {
 
     /// Run merge-lock TTL sweep using **`policy.merge_ttl_hours`** (**§01.6.5**).
     pub fn run_merge_ttl_sweep(&self, session_id: u64) -> Result<usize, AuthError> {
-        self.require_session(session_id)?;
+        self.require_admin(session_id)?;
         let ttl = self.policy.snapshot().merge_ttl_hours;
         Ok(sweep_all_expired_merge_intents(&self.kv, now_ms(), ttl))
     }
 
     pub fn require_session(&self, session_id: u64) -> Result<(), AuthError> {
         self.auth.require_session(session_id).map(|_| ())
+    }
+
+    pub fn require_admin(&self, session_id: u64) -> Result<(), AuthError> {
+        self.auth.require_admin(session_id).map(|_| ())
+    }
+
+    fn require_ready(&self) -> Result<(), AuthError> {
+        if !self.coordinator.is_ready() {
+            return Err(AuthError::NotReady);
+        }
+        Ok(())
     }
 
     fn current_index_status(&self) -> IndexStatusSnapshot {
@@ -2850,60 +2925,108 @@ impl CisMcpRuntime {
 
         let chain = self.query_branch_chain(branch);
         let absence = absence_for_runtime(&self.kv);
-        let mut seen_ids = HashSet::new();
-        for r in g.revisions() {
-            if !revision_on_chain(&chain, r.branch_id) {
-                continue;
+
+        // Prefer ANN-driven candidates when the index is warm; fall back to a capped
+        // identity scan so large graphs do not materialize every revision per query.
+        let query_vec_early = self
+            .embedder
+            .embed_batch(&[query.to_string()])
+            .ok()
+            .and_then(|mut v| v.pop());
+        let ann_hits: Vec<([u8; 32], f64)> = if let Some(ref qv) = query_vec_early {
+            let ann = self.ann_index.lock().unwrap();
+            if ann.is_empty() {
+                Vec::new()
+            } else {
+                ann.search(qv, limit.saturating_mul(10).max(50))
             }
-            if !seen_ids.insert(r.identity_id) {
-                continue;
+        } else {
+            Vec::new()
+        };
+
+        if !ann_hits.is_empty() {
+            let wanted: HashSet<[u8; 32]> = ann_hits.iter().map(|(h, _)| *h).collect();
+            let mut seen_ids = HashSet::new();
+            for r in g.revisions() {
+                if !wanted.contains(&r.body_hash) {
+                    continue;
+                }
+                if !revision_on_chain(&chain, r.branch_id) {
+                    continue;
+                }
+                if !seen_ids.insert(r.identity_id) {
+                    continue;
+                }
+                let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
+                    &g,
+                    &chain,
+                    r.identity_id,
+                    Some(&absence),
+                ) else {
+                    continue;
+                };
+                if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
+                    continue;
+                }
+                match vector.vector_for_body(&r.body_hash) {
+                    Some(entry) if entry.model_id == model_id => embedded_count += 1,
+                    Some(_) | None => stale_count += 1,
+                }
+                rows.push(SemanticRow {
+                    revision_id_hex: hex16(&r.revision_id.0),
+                    qualified_name: r.qualified_name.clone(),
+                    body_hash: r.body_hash,
+                    structural_score: structural_substring_score(&needle, &r.qualified_name),
+                    vector_score: 0.0,
+                });
             }
-            let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
-                &g,
-                &chain,
-                r.identity_id,
-                Some(&absence),
-            ) else {
-                continue;
-            };
-            if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
-                continue;
+        } else {
+            let mut seen_ids = HashSet::new();
+            const MAX_SCAN_ROWS: usize = 4096;
+            for r in g.revisions() {
+                if rows.len() >= MAX_SCAN_ROWS {
+                    break;
+                }
+                if !revision_on_chain(&chain, r.branch_id) {
+                    continue;
+                }
+                if !seen_ids.insert(r.identity_id) {
+                    continue;
+                }
+                let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
+                    &g,
+                    &chain,
+                    r.identity_id,
+                    Some(&absence),
+                ) else {
+                    continue;
+                };
+                if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
+                    continue;
+                }
+                match vector.vector_for_body(&r.body_hash) {
+                    Some(entry) if entry.model_id == model_id => embedded_count += 1,
+                    Some(_) | None => stale_count += 1,
+                }
+                rows.push(SemanticRow {
+                    revision_id_hex: hex16(&r.revision_id.0),
+                    qualified_name: r.qualified_name.clone(),
+                    body_hash: r.body_hash,
+                    structural_score: structural_substring_score(&needle, &r.qualified_name),
+                    vector_score: 0.0,
+                });
             }
-            match vector.vector_for_body(&r.body_hash) {
-                Some(entry) if entry.model_id == model_id => embedded_count += 1,
-                Some(_) | None => stale_count += 1,
-            }
-            rows.push(SemanticRow {
-                revision_id_hex: hex16(&r.revision_id.0),
-                qualified_name: r.qualified_name.clone(),
-                body_hash: r.body_hash,
-                structural_score: structural_substring_score(&needle, &r.qualified_name),
-                vector_score: 0.0,
-            });
         }
         drop(g);
 
         let query_vec = if embedded_count > 0 {
-            self.embedder
-                .embed_batch(&[query.to_string()])
-                .ok()
-                .and_then(|mut v| v.pop())
+            query_vec_early
         } else {
             None
         };
 
-        let ann_scores: std::collections::HashMap<[u8; 32], f64> = if let Some(ref qv) = query_vec {
-            let ann = self.ann_index.lock().unwrap();
-            if ann.is_empty() {
-                std::collections::HashMap::new()
-            } else {
-                ann.search(qv, limit.saturating_mul(10).max(50))
-                    .into_iter()
-                    .collect()
-            }
-        } else {
-            std::collections::HashMap::new()
-        };
+        let ann_scores: std::collections::HashMap<[u8; 32], f64> =
+            ann_hits.into_iter().collect();
 
         let mut hits = Vec::new();
         let mut meta = self.meta_at_commit(
@@ -3008,6 +3131,7 @@ impl CisMcpRuntime {
         reindex: bool,
     ) -> Result<WriteFileResponse, AuthError> {
         self.require_session(session_id)?;
+        self.require_ready()?;
         if self.disk_pressure.disk_pressure() {
             return Err(AuthError::DiskPressure);
         }
@@ -3028,11 +3152,16 @@ impl CisMcpRuntime {
             return Err(AuthError::InvalidInput);
         }
         let bytes = content.as_bytes();
-        std::fs::write(&abs, bytes).map_err(|_| AuthError::InvalidInput)?;
+        // Confirm token first so FS sync never sees "pending patch + no token" as external edit.
         let nonce = format!("{}", patch_id);
-        if let Err(e) = write_token_with_retry(self.confirm_backend(), &nonce, nonce.as_bytes())
-        {
+        if let Err(e) = write_token_with_retry(self.confirm_backend(), &nonce, nonce.as_bytes()) {
             eprintln!("cis-mcp: write_file confirm_token write: {:?}", e);
+            self.rollback_failed_speculative_write(patch_id, session_id, path, &pre_bytes);
+            return Err(AuthError::InvalidInput);
+        }
+        if let Err(e) = std::fs::write(&abs, bytes) {
+            eprintln!("cis-mcp: write_file fs write: {:?}", e);
+            let _ = clear_token_with_retry(self.confirm_backend(), &nonce);
             self.rollback_failed_speculative_write(patch_id, session_id, path, &pre_bytes);
             return Err(AuthError::InvalidInput);
         }
@@ -3064,6 +3193,7 @@ impl CisMcpRuntime {
         reindex: bool,
     ) -> Result<WriteFileResponse, AuthError> {
         self.require_session(session_id)?;
+        self.require_ready()?;
         if self.disk_pressure.disk_pressure() {
             return Err(AuthError::DiskPressure);
         }
@@ -3085,17 +3215,35 @@ impl CisMcpRuntime {
         }
         let original = std::fs::read_to_string(&abs).unwrap_or_default();
         let merged = if is_probably_unified_diff(new_content_or_unified_patch) {
-            let p = diffy::Patch::from_str(new_content_or_unified_patch).map_err(|_| AuthError::InvalidInput)?;
-            diffy::apply(&original, &p).map_err(|_| AuthError::InvalidInput)?
+            let parsed = match diffy::Patch::from_str(new_content_or_unified_patch) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("cis-mcp: apply_patch patch parse: {:?}", e);
+                    self.rollback_failed_speculative_write(patch_id, session_id, path, &pre_bytes);
+                    return Err(AuthError::InvalidInput);
+                }
+            };
+            match diffy::apply(&original, &parsed) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("cis-mcp: apply_patch diff apply: {:?}", e);
+                    self.rollback_failed_speculative_write(patch_id, session_id, path, &pre_bytes);
+                    return Err(AuthError::InvalidInput);
+                }
+            }
         } else {
             new_content_or_unified_patch.to_string()
         };
         let bytes = merged.as_bytes();
-        std::fs::write(&abs, bytes).map_err(|_| AuthError::InvalidInput)?;
         let nonce = format!("{}", patch_id);
-        if let Err(e) = write_token_with_retry(self.confirm_backend(), &nonce, nonce.as_bytes())
-        {
+        if let Err(e) = write_token_with_retry(self.confirm_backend(), &nonce, nonce.as_bytes()) {
             eprintln!("cis-mcp: apply_patch confirm_token write: {:?}", e);
+            self.rollback_failed_speculative_write(patch_id, session_id, path, &pre_bytes);
+            return Err(AuthError::InvalidInput);
+        }
+        if let Err(e) = std::fs::write(&abs, bytes) {
+            eprintln!("cis-mcp: apply_patch fs write: {:?}", e);
+            let _ = clear_token_with_retry(self.confirm_backend(), &nonce);
             self.rollback_failed_speculative_write(patch_id, session_id, path, &pre_bytes);
             return Err(AuthError::InvalidInput);
         }
@@ -3129,13 +3277,21 @@ impl CisMcpRuntime {
         let paths = self
             .patcher
             .promote(patch_id, SessionId(session_id))
-            .map_err(|_| AuthError::InvalidInput)?;
+            .map_err(patch_err)?;
         let nonce = format!("{}", patch_id);
-        let _ = clear_token_with_retry(self.confirm_backend(), &nonce);
+        if let Err(e) = clear_token_with_retry(self.confirm_backend(), &nonce) {
+            eprintln!(
+                "cis-mcp: clear confirm token after confirm_patch {}: {:?}",
+                patch_id, e
+            );
+        }
         let branch = self.active_branch();
         let count = self
             .wal_promote_speculative(patch_id, &paths, branch)
-            .map_err(|_| AuthError::InvalidInput)?;
+            .map_err(|e| {
+                eprintln!("cis-mcp: confirm_patch WAL promote: {:?}", e);
+                AuthError::Persist
+            })?;
         self.pre_write_snapshots.clear_patch(patch_id);
         self.audit.record_sync(session_id, format!("confirm_patch {}", patch_id));
         Ok(ConfirmPatchResponse { patch_id, paths_promoted: paths, revisions_activated: count })
@@ -3150,7 +3306,10 @@ impl CisMcpRuntime {
         self.require_session(session_id)?;
         let paths = self.patcher.peek_patch_paths(patch_id);
         self.finish_revert_patch(patch_id, SessionId(session_id), &paths)
-            .map_err(|_| AuthError::InvalidInput)?;
+            .map_err(|e| {
+                eprintln!("cis-mcp: revert_patch: {:?}", e);
+                AuthError::Persist
+            })?;
         self.audit.record_sync(session_id, format!("revert_patch {}", patch_id));
         Ok(RevertPatchResponse { patch_id, paths_reverted: paths })
     }
