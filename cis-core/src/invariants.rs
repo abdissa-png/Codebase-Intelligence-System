@@ -67,6 +67,8 @@ pub enum MergeViolation {
     },
     MergeLockWithoutSaga { branch: BranchId },
     SagaWithoutMergeLock { merge_id: MergeId, branch: BranchId },
+    /// Merge lock held while the write coordinator is not ready (failed WAL replay).
+    CoordinatorNotReadyWhileMergeLocked { branch: BranchId },
 }
 
 /// Context for running all invariant checks.
@@ -134,14 +136,9 @@ pub fn check_write_path_invariants(
         }
     }
 
-    for (path, session) in active_leases {
-        if !patch_path_set.contains(&path) {
-            violations.push(WritePathViolation::OrphanLease {
-                path,
-                session: session.0,
-            });
-        }
-    }
+    // Note: OrphanLease was previously emitted for the same condition as LeaseWithoutPatch;
+    // keep a single signal to avoid duplicate invariant noise.
+    let _ = active_leases;
 
     violations
 }
@@ -173,7 +170,7 @@ pub fn check_merge_invariants(
 fn check_merge_invariants_inner(
     graph: &SharedInMemoryGraph,
     kv: &MemoryKv,
-    _coordinator: Option<&WriteCoordinator>,
+    coordinator: Option<&WriteCoordinator>,
 ) -> Vec<MergeViolation> {
     let mut violations = Vec::new();
     let g = graph.read();
@@ -189,6 +186,17 @@ fn check_merge_invariants_inner(
         let mut merge_bytes = [0u8; 16];
         merge_bytes.copy_from_slice(&val);
         lock_branch_by_merge.insert(MergeId(merge_bytes), branch);
+    }
+
+    // When a coordinator is supplied, refuse merge locks while WAL replay left it not-ready.
+    if let Some(coord) = coordinator {
+        if !coord.is_ready() && !lock_branch_by_merge.is_empty() {
+            for (_, branch) in &lock_branch_by_merge {
+                violations.push(MergeViolation::CoordinatorNotReadyWhileMergeLocked {
+                    branch: *branch,
+                });
+            }
+        }
     }
 
     for (key, _) in kv.scan_prefix("saga_batch:") {
