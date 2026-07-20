@@ -440,6 +440,10 @@ fn main() {
     let saga = Arc::new(MergeSagaOrchestrator::new(Arc::clone(&kv)));
     let rep = coord.reconcile_on_startup(saga.as_ref());
     eprintln!("cisd: startup recovery {:?}", rep);
+    if rep.wal_replay_failed {
+        eprintln!("cisd: WAL replay failed — refusing to start");
+        std::process::exit(1);
+    }
 
     let handles = CisDaemonHandles::open(&repo, &policy_snap);
     handles.audit.resume_from_kv(&kv);
@@ -457,6 +461,28 @@ fn main() {
         })
         .collect();
     let body_store_startup = BodyStore::new(Arc::clone(&kv));
+    // Resume in-flight merges before compensating orphans / stuck locks.
+    {
+        let merge_control_startup = cis_core::MergeControl::new(Arc::clone(&kv));
+        let gate = cis_core::MergeRecoveryGate::new(Arc::clone(&kv));
+        let mut g = coord.graph().write();
+        let merge_rep = cis_core::recover_inflight_merges(
+            &mut *g,
+            kv.as_ref(),
+            &body_store_startup,
+            saga.as_ref(),
+            &merge_control_startup,
+            coord.vector_chunk_store(),
+            &gate,
+            None,
+        );
+        drop(g);
+        let compensated = saga.compensate_orphans();
+        eprintln!(
+            "cisd: merge recovery resumed={} compensated_by_recover={} orphans_purged={}",
+            merge_rep.resumed, merge_rep.compensated, compensated
+        );
+    }
     let consistency = cis_core::check_consistency(
         coord.graph(),
         &kv,

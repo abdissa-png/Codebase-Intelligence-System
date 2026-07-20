@@ -21,6 +21,8 @@ pub struct RecoveryReport {
     pub sagas_compensated: usize,
     /// In-flight WAL rows finished or marked failed during startup replay.
     pub wal_replayed: usize,
+    /// True when WAL replay returned an error (coordinator stays not-ready).
+    pub wal_replay_failed: bool,
     /// Optional consistency report from the last periodic pass.
     pub consistency: Option<ConsistencyReport>,
 }
@@ -36,10 +38,9 @@ impl ReconciliationEngine {
         Self { wal, saga }
     }
 
-    /// **DERIVED** ordering: (1) compensate orphaned sagas, (2) rebuild `MutationIndex` from full WAL.
-    /// Graph/vector replay hooks attach here in the full merge implementation.
+    /// **DERIVED** ordering: rebuild `MutationIndex` from full WAL.
+    /// Saga compensation is performed after merge resume elsewhere.
     pub fn reconcile_on_startup(&self, mutation_index: &mut MutationIndex) -> RecoveryReport {
-        let compensated = self.saga.compensate_orphans();
         let mut rows = self.wal.iter_all();
         rows.sort_by_key(|r| r.log_id);
         mutation_index.rebuild_from_wal(&rows);
@@ -47,8 +48,9 @@ impl ReconciliationEngine {
         RecoveryReport {
             mutation_index_entries: mutation_index.len(),
             in_flight_wal_records: inflight,
-            sagas_compensated: compensated,
+            sagas_compensated: 0,
             wal_replayed: 0,
+            wal_replay_failed: false,
             consistency: None,
         }
     }
@@ -85,7 +87,7 @@ impl PeriodicReconciler {
         branches: &[cis_wal::BranchId],
         last_consistency: Option<&LastConsistencySnapshot>,
     ) -> RecoveryReport {
-        let mut report = coordinator.reconcile_now(saga);
+        // Resume first, then compensate leftovers so resumable sagas are not purged.
         let merge_rep = {
             let mut g = coordinator.graph().write();
             recover_inflight_merges(
@@ -99,6 +101,9 @@ impl PeriodicReconciler {
                 None,
             )
         };
+        let sagas_compensated = saga.compensate_orphans();
+        let mut report = coordinator.reconcile_now(saga);
+        report.sagas_compensated = sagas_compensated;
         if merge_rep.resumed > 0 || merge_rep.compensated > 0 {
             audit.record_sync(
                 0,
@@ -160,12 +165,14 @@ mod tests {
         let saga = MergeSagaOrchestrator::new(Arc::clone(&kv));
         let mid = MergeId([8u8; 16]);
         saga.persist(mid, SagaPhase::Intent);
-        let engine = ReconciliationEngine::new(Arc::clone(&wal), saga);
+        let engine = ReconciliationEngine::new(Arc::clone(&wal), MergeSagaOrchestrator::new(Arc::clone(&kv)));
         wal.append(mk_row(MutationPhase::Pending)).unwrap();
         let mut idx = MutationIndex::new();
         let rep = engine.reconcile_on_startup(&mut idx);
-        assert_eq!(rep.sagas_compensated, 1);
+        // Saga compensation is deferred until after merge resume.
+        assert_eq!(rep.sagas_compensated, 0);
         assert!(rep.mutation_index_entries >= 1);
         assert_eq!(rep.in_flight_wal_records, 1);
+        assert!(saga.load(mid).is_some());
     }
 }

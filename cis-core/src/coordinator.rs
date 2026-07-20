@@ -64,6 +64,8 @@ pub struct WriteCoordinator {
     ready: AtomicBool,
     /// **Phase 4** — optional fault injection for hardening tests.
     fault_injector: Mutex<Arc<dyn FaultInjector>>,
+    /// Serializes phase check + side effects + `update_phase` for commit_graph/commit_vector.
+    commit_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for WriteCoordinator {
@@ -109,6 +111,7 @@ impl WriteCoordinator {
             post_embed_hook: Mutex::new(None),
             ready: AtomicBool::new(false),
             fault_injector: Mutex::new(Arc::new(NoOpFaultInjector)),
+            commit_lock: Mutex::new(()),
         }
     }
 
@@ -280,22 +283,32 @@ impl WriteCoordinator {
         Ok(replayed)
     }
 
-    /// Single startup pipeline: load snapshots, saga orphan compensation, WAL replay, **`MutationIndex`** rebuild.
+    /// Single startup pipeline: WAL replay + **`MutationIndex`** rebuild.
+    /// Saga orphan compensation is deferred until after merge resume
+    /// ([`crate::merge_engine::recover_inflight_merges`]) so resumable merges are not purged first.
     pub fn reconcile_on_startup(&self, saga: &MergeSagaOrchestrator) -> RecoveryReport {
         let report = self.reconcile_now(saga);
-        self.ready.store(true, Ordering::SeqCst);
+        if report.wal_replay_failed {
+            eprintln!("cis: refusing ready — WAL replay failed");
+            self.ready.store(false, Ordering::SeqCst);
+        } else {
+            self.ready.store(true, Ordering::SeqCst);
+        }
         report
     }
 
-    /// Reusable reconciliation body (**Phase 3.3**): saga compensation, WAL replay, index rebuild.
+    /// Reusable reconciliation body (**Phase 3.3**): WAL replay + index rebuild (no saga purge).
     pub fn reconcile_now(&self, saga: &MergeSagaOrchestrator) -> RecoveryReport {
-        let sagas_compensated = saga.compensate_orphans();
-        let wal_replayed = self
-            .replay_inflight_wal()
-            .unwrap_or_else(|e| {
-                eprintln!("cis: WAL replay error (continuing): {:?}", e);
+        let _ = saga; // reserved for future WAL↔saga cross-checks
+        let mut wal_replay_failed = false;
+        let wal_replayed = match self.replay_inflight_wal() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("cis: WAL replay error: {:?}", e);
+                wal_replay_failed = true;
                 0
-            });
+            }
+        };
         self.sync_rebuild_index_from_wal();
         let mut rows = self.wal.iter_all();
         rows.sort_by_key(|r| r.log_id);
@@ -304,8 +317,9 @@ impl WriteCoordinator {
         RecoveryReport {
             mutation_index_entries,
             in_flight_wal_records,
-            sagas_compensated,
+            sagas_compensated: 0,
             wal_replayed,
+            wal_replay_failed,
             consistency: None,
         }
     }
@@ -392,6 +406,7 @@ impl WriteCoordinator {
         id: LogId,
         apply: impl FnOnce(&mut InMemoryGraph) -> Result<(), &'static str>,
     ) -> Result<(), CoordinatorError> {
+        let _commit = self.commit_lock.lock().unwrap();
         let rec = self.wal.get(id).ok_or(CoordinatorError::UnknownMutation(id))?;
         if rec.phase != MutationPhase::Pending {
             return Err(CoordinatorError::PhaseMismatch {
@@ -417,6 +432,7 @@ impl WriteCoordinator {
     }
 
     pub fn commit_vector(&self, id: LogId) -> Result<(), CoordinatorError> {
+        let _commit = self.commit_lock.lock().unwrap();
         let rec = self.wal.get(id).ok_or(CoordinatorError::UnknownMutation(id))?;
         if rec.phase != MutationPhase::GraphDone {
             return Err(CoordinatorError::PhaseMismatch {

@@ -131,7 +131,21 @@ impl MergeSagaOrchestrator {
         self.kv.delete(&Self::key(merge_id));
     }
 
-    /// **Startup:** drop every saga not in **`Committed`** (inverse batch + lock release is **`MergeControl`** / engine).
+    /// Release any durable `merge_lock:` held by `merge_id` (and its `merge_started` stamp).
+    fn release_locks_for_merge(&self, merge_id: MergeId) {
+        for (branch, holder) in crate::merge_lock::scan_merge_lock_holders(&self.kv) {
+            if holder == merge_id {
+                let _ = crate::merge_lock::release_merge_lock(&self.kv, branch, merge_id);
+            }
+        }
+        // Defensive: clear start stamp even if lock key was already gone.
+        self.kv
+            .delete(&crate::merge_lock::merge_started_key(merge_id));
+    }
+
+    /// Drop every saga not in **`Committed`**, releasing any associated merge locks.
+    /// Prefer calling [`crate::merge_engine::recover_inflight_merges`] first so resumable
+    /// merges are attempted before compensation.
     pub fn compensate_orphans(&self) -> usize {
         let rows = self.kv.scan_prefix("saga_state:");
         let mut n = 0usize;
@@ -140,11 +154,19 @@ impl MergeSagaOrchestrator {
                 continue;
             }
             if let Some(mid) = Self::merge_id_from_saga_key(&k) {
+                self.release_locks_for_merge(mid);
                 self.purge_merge_saga_state(mid);
             } else {
                 self.kv.delete(&k);
             }
             n += 1;
+        }
+        // Also clear merge locks that have no saga at all (stuck after crash).
+        for (branch, merge_id) in crate::merge_lock::scan_merge_lock_holders(&self.kv) {
+            if self.load(merge_id).is_none() {
+                let _ = crate::merge_lock::release_merge_lock(&self.kv, branch, merge_id);
+                n += 1;
+            }
         }
         n
     }
