@@ -1,5 +1,7 @@
 //! Bounded embedding queue with HWM/LWM (**§01.4**).
 
+use std::collections::VecDeque;
+
 use cis_wal::LogId;
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +29,7 @@ pub struct EmbeddingQueue {
     depth: usize,
     pub hwm: usize,
     pub lwm: usize,
-    pending: Vec<EmbedJob>,
+    pending: VecDeque<EmbedJob>,
 }
 
 impl EmbeddingQueue {
@@ -40,17 +42,17 @@ impl EmbeddingQueue {
             depth: 0,
             hwm,
             lwm,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }
     }
 
     pub fn enqueue(&mut self, job: EmbedJob) {
-        self.pending.push(job);
+        self.pending.push_back(job);
         self.depth = self.pending.len();
     }
 
     pub fn drain_one(&mut self) -> Option<EmbedJob> {
-        let j = self.pending.pop();
+        let j = self.pending.pop_front();
         self.depth = self.pending.len();
         j
     }
@@ -67,9 +69,9 @@ impl EmbeddingQueue {
         }
     }
 
-    /// Recovery: enqueue vector retry jobs without duplicating external API.
+    /// Recovery: enqueue vector retry jobs at the front (O(1)).
     pub fn reenqueue_front(&mut self, job: EmbedJob) {
-        self.pending.insert(0, job);
+        self.pending.push_front(job);
         self.depth = self.pending.len();
     }
 }
