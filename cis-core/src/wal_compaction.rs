@@ -46,7 +46,7 @@ impl WalCompactionScheduler {
         if !Self::preconditions_ok(kv, saga, gate) {
             return None;
         }
-        let approx = wal.iter_all().len() as u64 * 256;
+        let approx = wal.record_count() as u64 * 256;
         if approx < self.min_bytes_before_compact.max(wal_max_bytes / 4) {
             return None;
         }

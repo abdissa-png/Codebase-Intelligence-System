@@ -127,6 +127,14 @@ impl MutationLog {
         self.records.read().unwrap().values().cloned().collect()
     }
 
+    pub fn len(&self) -> usize {
+        self.records.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// **FR-1.7:** drop the lowest-`log_id` **compactable** rows while estimated size > `wal_max_bytes`.
     /// **DESIGNED:** `Committed` and `Failed` are both compactable terminals (release WAL retention and FR-1.13(d)
     /// "no PENDING mutation" — neither is in-flight).

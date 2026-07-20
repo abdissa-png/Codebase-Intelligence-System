@@ -1,11 +1,14 @@
 //! JSON snapshot persistence for **`MutationLog`** (**FR-1.7**, **NFR-R2**).
 //!
-//! Writes atomically: `wal.tmp` → `fsync` → `rename` → **`wal.json`**.
-//! **FSYNC policy:** `fsync` the temp file before rename; `sync_all` on directory not portable — document POSIX caveat.
+//! Writes atomically: unique temp → `fsync` → `rename` → **`wal.json`**.
+//! A process-wide flush mutex serializes snapshot+rename so concurrent writers
+//! cannot tear or lose records.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,13 +27,21 @@ struct WalSnapshot {
 pub struct DurableMutationLog {
     path: PathBuf,
     log: MutationLog,
+    /// Serializes snapshot materialization + rename.
+    flush_lock: Mutex<()>,
+    flush_seq: AtomicU64,
 }
 
 impl DurableMutationLog {
     pub fn create_new(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let log = MutationLog::new();
-        let d = Self { path, log };
+        let d = Self {
+            path,
+            log,
+            flush_lock: Mutex::new(()),
+            flush_seq: AtomicU64::new(0),
+        };
         d.flush()?;
         Ok(d)
     }
@@ -47,7 +58,12 @@ impl DurableMutationLog {
         let log = MutationLog::restore(snap.next_allocate_id, snap.records).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
         })?;
-        Ok(Self { path, log })
+        Ok(Self {
+            path,
+            log,
+            flush_lock: Mutex::new(()),
+            flush_seq: AtomicU64::new(0),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -87,14 +103,20 @@ impl DurableMutationLog {
     }
 
     fn flush(&self) -> io::Result<()> {
+        let _guard = self.flush_lock.lock().unwrap();
         let snap = WalSnapshot {
             next_allocate_id: self.log.next_allocate_id(),
-            records: self.log.iter_all()
+            records: self.log.iter_all(),
         };
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let seq = self.flush_seq.fetch_add(1, Ordering::SeqCst);
+        let tmp = self.path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            seq
+        ));
         {
             let mut f = OpenOptions::new()
                 .create(true)
@@ -129,6 +151,10 @@ impl MutationLogStore for DurableMutationLog {
 
     fn iter_all(&self) -> Vec<MutationRecord> {
         self.log.iter_all()
+    }
+
+    fn record_count(&self) -> usize {
+        self.log.len()
     }
 
     fn next_allocate_id(&self) -> LogId {
