@@ -119,6 +119,8 @@ pub struct PhaseCResult {
 pub struct MergeRecoveryReport {
     pub resumed: usize,
     pub compensated: usize,
+    /// In-flight merges left pending user resolution (not cancelled).
+    pub pending_resolution: usize,
     pub entries: Vec<MergeRecoveryEntry>,
 }
 
@@ -140,6 +142,10 @@ pub struct ResumeMergeOutcome {
     pub phase_b: PhaseBResult,
     pub phase_c: PhaseCResult,
 }
+
+/// Sentinel: merge still needs a user strategy; do not cancel on recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumePendingResolution;
 
 pub fn merge_reconciliation_job_id(merge_id: MergeId) -> u64 {
     u64::from_le_bytes(merge_id.0[0..8].try_into().expect("merge id is 16 bytes"))
@@ -254,13 +260,17 @@ pub fn resume_merge(
     merge_id: MergeId,
     saga: &crate::saga::MergeSagaOrchestrator,
     tracker: Option<&BranchReconciliationTracker>,
-) -> Option<ResumeMergeOutcome> {
-    let ctx = MergeContext::load(kv, merge_id)?;
-    let phase = saga.load(merge_id)?;
+) -> Result<Option<ResumeMergeOutcome>, ResumePendingResolution> {
+    let Some(ctx) = MergeContext::load(kv, merge_id) else {
+        return Ok(None);
+    };
+    let Some(phase) = saga.load(merge_id) else {
+        return Ok(None);
+    };
     let resumed_from_phase = saga_phase_label(&phase);
 
     match phase {
-        crate::saga::SagaPhase::Committed => None,
+        crate::saga::SagaPhase::Committed => Ok(None),
 
         crate::saga::SagaPhase::Intent | crate::saga::SagaPhase::Classifying => {
             saga.persist(merge_id, crate::saga::SagaPhase::Classifying);
@@ -275,7 +285,7 @@ pub fn resume_merge(
             );
             if pa.report.status == MergeWorkflowStatus::RequiresResolution && ctx.strategy.is_none()
             {
-                return None;
+                return Err(ResumePendingResolution);
             }
             saga.persist(merge_id, crate::saga::SagaPhase::Promoting);
             let pb = phase_b_promote(kv, graph, ctx.target_branch, &pa.classified, ctx.strategy);
@@ -292,12 +302,12 @@ pub fn resume_merge(
             );
             saga.persist(merge_id, crate::saga::SagaPhase::Committed);
             MergeContext::remove(kv, merge_id);
-            Some(ResumeMergeOutcome {
+            Ok(Some(ResumeMergeOutcome {
                 resumed_from_phase,
                 phase_a: pa,
                 phase_b: pb,
                 phase_c: pc,
-            })
+            }))
         }
 
         crate::saga::SagaPhase::Promoting => {
@@ -325,12 +335,12 @@ pub fn resume_merge(
             );
             saga.persist(merge_id, crate::saga::SagaPhase::Committed);
             MergeContext::remove(kv, merge_id);
-            Some(ResumeMergeOutcome {
+            Ok(Some(ResumeMergeOutcome {
                 resumed_from_phase,
                 phase_a: pa,
                 phase_b: pb,
                 phase_c: pc,
-            })
+            }))
         }
 
         crate::saga::SagaPhase::EdgeBatch { .. } | crate::saga::SagaPhase::PointerSwap => {
@@ -376,12 +386,12 @@ pub fn resume_merge(
                 promoted,
                 ..Default::default()
             };
-            Some(ResumeMergeOutcome {
+            Ok(Some(ResumeMergeOutcome {
                 resumed_from_phase,
                 phase_a: pa,
                 phase_b: pb,
                 phase_c: pc,
-            })
+            }))
         }
     }
 }
@@ -426,19 +436,26 @@ pub fn recover_inflight_merges(
             continue;
         };
         if merge_lock_holder(kv, ctx.target_branch) == Some(merge_id) {
-            if let Some(out) = resume_merge(graph, kv, Some(body_store), merge_id, saga, tracker) {
-                let _ = release_merge_lock(kv, ctx.target_branch, merge_id);
-                report.resumed += 1;
-                report.entries.push(MergeRecoveryEntry {
-                    merge_id,
-                    resumed_from_phase: Some(out.resumed_from_phase),
-                    compensated: false,
-                    edges_regenerated: out.phase_c.edges_regenerated,
-                    dangling_edges_removed: out.phase_c.dangling_edges_removed,
-                    signature_reresolved: out.phase_c.signature_reresolved,
-                    cardinality_violations: out.phase_c.cardinality_violations,
-                });
-                continue;
+            match resume_merge(graph, kv, Some(body_store), merge_id, saga, tracker) {
+                Ok(Some(out)) => {
+                    let _ = release_merge_lock(kv, ctx.target_branch, merge_id);
+                    report.resumed += 1;
+                    report.entries.push(MergeRecoveryEntry {
+                        merge_id,
+                        resumed_from_phase: Some(out.resumed_from_phase),
+                        compensated: false,
+                        edges_regenerated: out.phase_c.edges_regenerated,
+                        dangling_edges_removed: out.phase_c.dangling_edges_removed,
+                        signature_reresolved: out.phase_c.signature_reresolved,
+                        cardinality_violations: out.phase_c.cardinality_violations,
+                    });
+                    continue;
+                }
+                Err(ResumePendingResolution) => {
+                    report.pending_resolution += 1;
+                    continue;
+                }
+                Ok(None) => {}
             }
         }
         gate.begin_rollback(ctx.target_branch);

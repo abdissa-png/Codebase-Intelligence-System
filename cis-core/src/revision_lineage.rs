@@ -119,10 +119,7 @@ pub fn lineage_from_revision(
 
         if opts.follow_renames {
             if let Some(src_iid) = rev.rename_source_id {
-                if let Some(tomb) = g
-                    .primary_revision_for_identity_in_chain(chain, src_iid)
-                    .filter(|r| matches!(r.status, RevisionStatus::Tombstone))
-                {
+                if let Some(tomb) = g.tombstone_revision_for_identity_in_chain(chain, src_iid) {
                     cur_rid = tomb.revision_id;
                     next_link = LineageLink::RenameSource;
                     continue;
@@ -315,6 +312,12 @@ mod tests {
         retire_revision_to_tombstone(&mut g, stable);
         let r = g.get_revision(stable).unwrap();
         assert!(matches!(r.status, RevisionStatus::Tombstone));
-        assert!(g.primary_revision_for_identity(b, iid).is_some());
+        // Row is preserved for lineage/bridging, but never bound as primary.
+        assert!(g.primary_revision_for_identity(b, iid).is_none());
+        assert_eq!(
+            g.tombstone_revision_for_identity(b, iid)
+                .map(|t| t.revision_id),
+            Some(stable)
+        );
     }
 }

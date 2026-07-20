@@ -1,6 +1,7 @@
 //! **Phase 5 / FR-2.5** — confidence-aware graph traversal, ETO resolution, tombstone bridging.
 
 use std::collections::{HashSet, VecDeque};
+use std::rc::Rc;
 
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
@@ -14,6 +15,8 @@ use crate::index_model::stable_rev_id_bytes;
 use crate::ranking_policy::RankingPolicySnapshot;
 
 fn is_context_edge(ty: EdgeType) -> bool {
+    // Context expansion includes Uses (type/name usage). Go-to-definition uses a
+    // stricter priority (Calls → Imports/Extends → Uses) via resolve_definition_target.
     matches!(
         ty,
         EdgeType::Calls | EdgeType::Imports | EdgeType::Uses | EdgeType::Extends
@@ -112,6 +115,10 @@ pub fn resolve_identity_revision<'a>(
 ///
 /// Nearest-first: if any branch in `chain` has `deleted:{branch}:{identity}`, the identity
 /// is treated as absent (does not fall through to an ancestor Active revision).
+///
+/// Live primaries (`Active`/`Speculative`) never include tombstones. Per branch, if only a
+/// tombstone remains: bridge via `RENAMED_FROM` when present, otherwise treat as deleted
+/// (do not inherit a parent Active).
 pub fn resolve_identity_revision_with_absence<'a>(
     g: &'a InMemoryGraph,
     chain: &[BranchId],
@@ -123,29 +130,34 @@ pub fn resolve_identity_revision_with_absence<'a>(
             return None;
         }
     }
-    let primary = g.primary_revision_for_identity_in_chain(chain, identity_id)?;
-    if matches!(
-        primary.status,
-        RevisionStatus::Active | RevisionStatus::Speculative
-    ) {
-        return Some(primary);
-    }
-    if matches!(primary.status, RevisionStatus::Tombstone) {
-        let successor = rename_successor_identity(g, primary.revision_id)?;
-        // Successor may itself be marked deleted on a nearer branch.
-        if let Some(store) = absence {
-            if store.is_deleted_in_chain(chain, successor) {
-                return None;
+    for &branch_id in chain {
+        if let Some(primary) = g.primary_revision_for_identity(branch_id, identity_id) {
+            if matches!(
+                primary.status,
+                RevisionStatus::Active | RevisionStatus::Speculative
+            ) {
+                return Some(primary);
             }
         }
-        return g
-            .primary_revision_for_identity_in_chain(chain, successor)
-            .filter(|r| {
-                matches!(
-                    r.status,
-                    RevisionStatus::Active | RevisionStatus::Speculative
-                )
-            });
+        if let Some(tomb) = g.tombstone_revision_for_identity(branch_id, identity_id) {
+            if let Some(successor) = rename_successor_identity(g, tomb.revision_id) {
+                if let Some(store) = absence {
+                    if store.is_deleted_in_chain(chain, successor) {
+                        return None;
+                    }
+                }
+                return g
+                    .primary_revision_for_identity_in_chain(chain, successor)
+                    .filter(|r| {
+                        matches!(
+                            r.status,
+                            RevisionStatus::Active | RevisionStatus::Speculative
+                        )
+                    });
+            }
+            // Pure deletion tombstone on this branch: stop inheritance.
+            return None;
+        }
     }
     None
 }
@@ -293,8 +305,10 @@ pub fn expand_context_bfs_with_absence(
     let half_life_ms = policy.recency.half_life_days as u64 * 24 * 60 * 60 * 1000;
     let min_path = policy.min_path_confidence;
     let mut seen_rev: HashSet<NodeRevisionId> = HashSet::new();
-    let mut q: VecDeque<(NodeRevisionId, u32, Vec<f64>, SourceType)> = VecDeque::new();
-    q.push_back((start, 0, vec![], SourceType::Ast));
+    // Path confidence stored as Rc<[f64]> so siblings share the parent prefix cheaply
+    // until an edge is accepted (then a new Rc is allocated).
+    let mut q: VecDeque<(NodeRevisionId, u32, Rc<[f64]>, SourceType)> = VecDeque::new();
+    q.push_back((start, 0, Rc::from([]), SourceType::Ast));
     let mut hits = Vec::new();
     let mut pruned = 0usize;
 
@@ -323,10 +337,13 @@ pub fn expand_context_bfs_with_absence(
 
         for e in outbound_context_edges(g, chain, rid) {
             let ec = edge_confidence(e, now_ms, half_life_ms);
-            let mut next_confs = path_edge_confs.clone();
-            next_confs.push(ec);
             let next_min = min_source_on_path(min_src, e);
-            let next_path = path_confidence(&next_confs, next_min);
+            // Build next path only after prune check would need the scores —
+            // allocate once into a buffer, score, then Rc-wrap if accepted.
+            let mut next_buf = Vec::with_capacity(path_edge_confs.len() + 1);
+            next_buf.extend_from_slice(&path_edge_confs);
+            next_buf.push(ec);
+            let next_path = path_confidence(&next_buf, next_min);
             if next_path < min_path {
                 pruned += 1;
                 continue;
@@ -335,7 +352,7 @@ pub fn expand_context_bfs_with_absence(
                 pruned += 1;
                 continue;
             };
-            q.push_back((next_rev.revision_id, d + 1, next_confs, next_min));
+            q.push_back((next_rev.revision_id, d + 1, Rc::from(next_buf), next_min));
         }
     }
 
@@ -356,6 +373,9 @@ pub fn resolve_definition_target<'a>(
 }
 
 /// Like [`resolve_definition_target`] with deletion absence.
+///
+/// Priority: Calls, then Imports/Extends, then Uses (aligned with context edges so
+/// navigation and expansion do not disagree on reachable definition edges).
 pub fn resolve_definition_target_with_absence<'a>(
     g: &'a InMemoryGraph,
     eto: &EdgeTargetOverrideStore,
@@ -372,6 +392,13 @@ pub fn resolve_definition_target_with_absence<'a>(
     }
     for e in outbound_context_edges(g, chain, source_revision) {
         if matches!(e.ty, EdgeType::Imports | EdgeType::Extends) {
+            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) {
+                return Some(trev);
+            }
+        }
+    }
+    for e in outbound_context_edges(g, chain, source_revision) {
+        if e.ty == EdgeType::Uses {
             if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) {
                 return Some(trev);
             }
@@ -496,7 +523,11 @@ mod tests {
             [8u8; 16],
         );
         g.replace_edges_for_revision(tomb, vec![renamed]).unwrap();
-        let tomb_rev = g.primary_revision_for_identity(b, old_i).unwrap();
+        assert!(
+            g.primary_revision_for_identity(b, old_i).is_none(),
+            "tombstones are never bound as primary"
+        );
+        let tomb_rev = g.tombstone_revision_for_identity(b, old_i).unwrap();
         assert!(matches!(tomb_rev.status, RevisionStatus::Tombstone));
         assert_eq!(rename_successor_identity(&g, tomb_rev.revision_id), Some(new_i));
         let chain = [b];

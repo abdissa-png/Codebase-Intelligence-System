@@ -699,7 +699,8 @@ fn saga_resume_from_classifying() {
     ctx.persist(&kv);
 
     // Resume from crash
-    let result = resume_merge(&mut g, &kv, None, merge_id, &saga, None);
+    let result = resume_merge(&mut g, &kv, None, merge_id, &saga, None)
+        .expect("resume should not be pending");
     assert!(result.is_some());
 
     let out = result.unwrap();
@@ -757,7 +758,8 @@ fn saga_resume_from_edge_batch() {
     };
     ctx.persist(&kv);
 
-    let result = resume_merge(&mut g, &kv, None, merge_id, &saga, None);
+    let result = resume_merge(&mut g, &kv, None, merge_id, &saga, None)
+        .expect("resume should not be pending");
     assert!(result.is_some());
 
     let out = result.unwrap();

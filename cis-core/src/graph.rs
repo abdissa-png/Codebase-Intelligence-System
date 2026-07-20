@@ -304,7 +304,7 @@ impl InMemoryGraph {
 
     fn recompute_primary(&mut self, branch_id: BranchId, identity_id: IdentityId) {
         let key = (branch_id, identity_id);
-        let mut fallback: Option<NodeRevisionId> = None;
+        let mut speculative_fallback: Option<NodeRevisionId> = None;
         let candidates = self
             .revisions_by_identity
             .get(&key)
@@ -314,15 +314,21 @@ impl InMemoryGraph {
             let Some(r) = self.revisions.get(&rid) else {
                 continue;
             };
+            // Never bind Tombstoned (or other non-live statuses) as primary —
+            // matches revision-index sync which only binds Active|Speculative.
             if matches!(r.status, RevisionStatus::Active) {
                 self.primary_by_identity.insert(key, r.revision_id);
                 return;
             }
-            if fallback.is_none() || r.revision_id.0 < fallback.unwrap().0 {
-                fallback = Some(r.revision_id);
+            if matches!(r.status, RevisionStatus::Speculative) {
+                if speculative_fallback.is_none()
+                    || r.revision_id.0 < speculative_fallback.unwrap().0
+                {
+                    speculative_fallback = Some(r.revision_id);
+                }
             }
         }
-        if let Some(rid) = fallback {
+        if let Some(rid) = speculative_fallback {
             self.primary_by_identity.insert(key, rid);
         } else {
             self.primary_by_identity.remove(&key);
@@ -362,6 +368,35 @@ impl InMemoryGraph {
     ) -> Option<&NodeRevision> {
         for &branch_id in chain {
             if let Some(rev) = self.primary_revision_for_identity(branch_id, identity_id) {
+                return Some(rev);
+            }
+        }
+        None
+    }
+
+    /// First tombstone revision for `(branch, identity)`, if any.
+    ///
+    /// Tombstones are never bound as primary; this lookup is for rename bridging
+    /// and lineage walks that must still see retired rows.
+    pub fn tombstone_revision_for_identity(
+        &self,
+        branch_id: BranchId,
+        identity_id: IdentityId,
+    ) -> Option<&NodeRevision> {
+        self.revision_ids_for_identity(branch_id, identity_id)
+            .iter()
+            .filter_map(|rid| self.revisions.get(rid))
+            .find(|r| matches!(r.status, RevisionStatus::Tombstone))
+    }
+
+    /// Nearest-first tombstone across a branch ancestry chain.
+    pub fn tombstone_revision_for_identity_in_chain(
+        &self,
+        chain: &[BranchId],
+        identity_id: IdentityId,
+    ) -> Option<&NodeRevision> {
+        for &branch_id in chain {
+            if let Some(rev) = self.tombstone_revision_for_identity(branch_id, identity_id) {
                 return Some(rev);
             }
         }
