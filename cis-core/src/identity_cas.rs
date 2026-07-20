@@ -105,14 +105,18 @@ impl IdentityProvisionalCas {
         ) {
             Ok(()) => {
                 self.apply_identity_cas_fault("ready")?;
-                self.kv
-                    .compare_and_swap(
-                        &k,
-                        Some(&encode(STATE_ALLOCATING, &proposed_identity, created)),
-                        encode(STATE_READY, &proposed_identity, created),
-                    )
-                    .expect("we hold allocating");
-                Ok(Some(proposed_identity))
+                match self.kv.compare_and_swap(
+                    &k,
+                    Some(&encode(STATE_ALLOCATING, &proposed_identity, created)),
+                    encode(STATE_READY, &proposed_identity, created),
+                ) {
+                    Ok(()) => Ok(Some(proposed_identity)),
+                    Err(CasError::Mismatch(_)) => {
+                        // Lost race (e.g. concurrent TTL cleanup deleted ALLOCATING).
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(CasError::Mismatch(_)) => {
                 if allow_ttl_retry && self.clear_expired_allocating(branch_id, semantic_hash) {
@@ -128,7 +132,8 @@ impl IdentityProvisionalCas {
         }
     }
 
-    /// Delete stuck ALLOCATING entries past TTL. Returns true if a key was cleared.
+    /// Delete stuck ALLOCATING entries past TTL via conditional CAS delete.
+    /// Returns true if a key was cleared. Never deletes a READY winner.
     pub fn clear_expired_allocating(
         &self,
         branch_id: BranchId,
@@ -144,8 +149,8 @@ impl IdentityProvisionalCas {
         if !allocating_expired(created, now_ms()) {
             return false;
         }
-        self.kv.delete(&k);
-        true
+        // Only delete if the exact ALLOCATING value is still present.
+        self.kv.compare_and_delete(&k, &v).is_ok()
     }
 
     fn apply_identity_cas_fault(&self, phase: &str) -> Result<(), CasError> {
