@@ -9,6 +9,9 @@ on:
 jobs:
   test-core:
     runs-on: ubuntu-latest
+    env:
+      CIS_REQUIRE_FIXTURES: "1"
+      CIS_ALLOW_DEFAULT_SESSION: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,6 +33,10 @@ jobs:
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test restart_survival
       - name: Write path correctness (Phase 0)
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test write_path_correctness
+      - name: Lease lifecycle / FS sync confirm race
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test lease_lifecycle --test fs_sync_confirm_race --test reindex_no_auto_promote
+      - name: Durability / concurrency remediation
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test durable_merge_lock_recovery --test wal_corrupt_open --test reconcile_resume_order --test wal_flush_concurrency --test coordinator_phase_atomicity --test identity_cas_ttl_race --test merge_resume_pending --test invariants_coverage
       - name: Confirm token integration
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test epic33_confirm_token
       - name: WAL crash recovery

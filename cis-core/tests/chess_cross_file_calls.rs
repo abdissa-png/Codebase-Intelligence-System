@@ -15,7 +15,7 @@ use cis_core::{
 use cis_core::MergeSagaOrchestrator;
 use cis_wal::{BranchId, MutationLog};
 
-use support::chess_fixture_root;
+use support::{chess_fixture_root, ensure_chess_fixture};
 
 /// Process-global `CIS_*` env + shared fixture `.cis/` — serialize MCP bootstrap tests.
 static CHESS_MCP_LOCK: Mutex<()> = Mutex::new(());
@@ -27,8 +27,7 @@ fn chess_root() -> PathBuf {
 #[test]
 fn chess_ingest_has_cross_file_calls() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("skip: no chess repo at {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 
@@ -101,8 +100,7 @@ fn chess_ingest_has_cross_file_calls() {
 #[cfg(feature = "tree-sitter")]
 fn chess_screen_calls_board_initialize() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("skip: no chess repo at {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 
@@ -334,8 +332,7 @@ fn sync_graph(rt: &CisMcpRuntime, coord: &WriteCoordinator) {
 #[cfg(all(feature = "tree-sitter", feature = "body-sqlite"))]
 fn chess_graph_sqlite_restart_query_parity() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("skip: no chess repo at {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 

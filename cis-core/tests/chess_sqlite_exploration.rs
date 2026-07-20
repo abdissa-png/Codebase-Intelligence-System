@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use cis_core::CisMcpRuntime;
 use cis_wal::BranchId;
 
-use support::chess_fixture_root;
+use support::{chess_fixture_root, ensure_chess_fixture};
 
 fn chess_root() -> PathBuf {
     chess_fixture_root()
@@ -43,8 +43,7 @@ fn file_size(path: &std::path::Path) -> u64 {
 #[cfg(all(feature = "tree-sitter", feature = "body-sqlite"))]
 fn chess_sqlite_migration_and_exploration() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("skip: clone chess repo to {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 

@@ -1,7 +1,8 @@
 //! Smoke test: ingest the cloned [Pygame chess](https://github.com/abdissa-png/A-chess-game-using-Pygame) repo
 //! and exercise MCP-equivalent queries on `CisMcpRuntime`.
 //!
-//! Expects the repo at **`cis/fixtures/chess_pygame`**. If missing, tests skip.
+//! Expects the repo at **`cis/fixtures/chess_pygame`**. If missing, tests skip locally;
+//! set **`CIS_REQUIRE_FIXTURES=1`** in CI to fail instead of skip.
 //!
 //! **Ingest:** without **`tree-sitter`**, only module-level `def` / `async def` are indexed from regex. With **`tree-sitter`**,
 //! classes/methods and lightweight call edges are included (**FR-1.1** / §01.7.4).
@@ -19,7 +20,7 @@ use cis_core::{
 };
 use cis_wal::{BranchId, IdentityId, MutationLog, NodeRevisionId};
 
-use support::chess_fixture_root;
+use support::{chess_fixture_root, ensure_chess_fixture};
 
 fn chess_root() -> PathBuf {
     chess_fixture_root()
@@ -95,11 +96,7 @@ fn sync_mcp_graph_from_coordinator(rt: &CisMcpRuntime, coord: &WriteCoordinator)
 #[test]
 fn chess_repo_ingest_creates_top_level_function_nodes() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!(
-            "chess_pygame_repo: skip — clone to {}",
-            root.display()
-        );
+    if !ensure_chess_fixture(&root) {
         return;
     }
 
@@ -178,8 +175,7 @@ fn chess_repo_ingest_creates_top_level_function_nodes() {
 #[test]
 fn chess_repo_mcp_find_symbol_after_graph_sync() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("chess_pygame_repo: skip — clone to {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 
@@ -293,8 +289,7 @@ fn chess_repo_mcp_find_symbol_after_graph_sync() {
 #[test]
 fn chess_full_ingest_has_no_renamed_from_edges() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("chess_pygame_repo: skip — clone to {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 
@@ -321,8 +316,7 @@ fn chess_full_ingest_has_no_renamed_from_edges() {
 #[test]
 fn chess_reingest_unchanged_preserves_identities_and_no_renamed_from() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("chess_pygame_repo: skip — clone to {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 
@@ -371,8 +365,7 @@ fn chess_reingest_unchanged_preserves_identities_and_no_renamed_from() {
 #[test]
 fn chess_boardutils_dissimilar_replace_avoids_false_rename() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("chess_pygame_repo: skip — clone to {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 

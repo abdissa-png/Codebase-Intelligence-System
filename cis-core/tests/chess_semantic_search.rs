@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use cis_core::CisMcpRuntime;
 use cis_wal::BranchId;
 
-use support::chess_fixture_root;
+use support::{chess_fixture_root, ensure_chess_fixture};
 
 fn chess_root() -> PathBuf {
     chess_fixture_root()
@@ -60,8 +60,7 @@ fn top_names(rt: &CisMcpRuntime, query: &str, k: usize) -> Vec<String> {
 #[cfg(feature = "tree-sitter")]
 fn chess_semantic_search_stub_embedder() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("skip: no chess repo at {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 

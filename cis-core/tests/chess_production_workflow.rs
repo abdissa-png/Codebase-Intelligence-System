@@ -16,7 +16,7 @@ use cis_core::{
 use cis_core::cis_dir;
 use cis_wal::{BranchId, IdentityId};
 
-use support::chess_fixture_root;
+use support::{chess_fixture_root, ensure_chess_fixture};
 
 fn chess_root() -> PathBuf {
     chess_fixture_root()
@@ -58,8 +58,7 @@ where
 #[test]
 fn chess_production_instance_query_and_branch_merge() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("skip: no chess repo at {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 

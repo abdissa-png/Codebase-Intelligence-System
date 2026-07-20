@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use cis_core::CisMcpRuntime;
 
-use support::chess_fixture_root;
+use support::{chess_fixture_root, ensure_chess_fixture};
 
 fn chess_root() -> PathBuf {
     chess_fixture_root()
@@ -50,8 +50,7 @@ fn print_meta(tool: &str, meta: &cis_core::QueryMeta) {
 #[test]
 fn chess_query_engine_real_world_eval() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!("skip: clone chess repo to {}", root.display());
+    if !ensure_chess_fixture(&root) {
         return;
     }
 

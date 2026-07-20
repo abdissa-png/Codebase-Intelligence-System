@@ -19,7 +19,7 @@ use cis_core::{
 };
 use cis_wal::{BranchId, IdentityId};
 
-use support::chess_fixture_root;
+use support::{chess_fixture_root, ensure_chess_fixture};
 
 fn chess_root() -> PathBuf {
     chess_fixture_root()
@@ -32,11 +32,7 @@ fn branch_hex(b: BranchId) -> String {
 #[test]
 fn chess_pygame_merge_engine_demo() {
     let root = chess_root();
-    if !root.is_dir() {
-        eprintln!(
-            "chess_pygame_merge: skip — clone Pygame chess repo to {}",
-            root.display()
-        );
+    if !ensure_chess_fixture(&root) {
         return;
     }
 
