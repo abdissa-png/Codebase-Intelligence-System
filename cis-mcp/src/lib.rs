@@ -48,6 +48,7 @@ const MCP_WRITE_TOOLS: &[&str] = &[
     "revert_patch",
     "sweep_confirm_sidecars",
     "purge_branch",
+    "retarget_edge",
     "save_workspace",
     "cancel_merge",
     "merge_ttl_sweep",
@@ -509,6 +510,17 @@ fn write_tool_schema(name: &str) -> Value {
             },
             "required": ["branch_id"]
         }),
+        "retarget_edge" => json!({
+            "type": "object",
+            "properties": {
+                "branch_id": { "type": "string", "description": "32-char hex BranchId" },
+                "source_revision_id": { "type": "string", "description": "32-char hex source NodeRevisionId" },
+                "edge_id": { "type": "string", "description": "32-char hex edge_id" },
+                "new_target_identity_id": { "type": "string", "description": "32-char hex IdentityId to redirect to" },
+                "session_id": { "type": "integer" }
+            },
+            "required": ["branch_id", "source_revision_id", "edge_id", "new_target_identity_id"]
+        }),
         "save_workspace" => json!({
             "type": "object",
             "properties": {
@@ -594,6 +606,7 @@ fn write_tool_description(name: &str) -> String {
         "revert_patch" => "Discard a speculative patch: tombstone revisions, release leases, clear confirm sidecar.".into(),
         "sweep_confirm_sidecars" => "Remove orphan .cis_confirm_* files with no matching pending patch.".into(),
         "purge_branch" => "Delete ri:{branch_id}:* overlay keys from KV (feature-branch cleanup).".into(),
+        "retarget_edge" => "Override an edge's target identity on a branch via ETO without rewriting the shared graph (FR §01.7.1a).".into(),
         "save_workspace" => "Persist graph, vector, and KV snapshots under .cis/; also sweeps stale confirm sidecars.".into(),
         "create_branch" => "Register a new branch and copy parent ri: bindings (Phase 1 fork bootstrap).".into(),
         "switch_branch" => "Set the active branch for subsequent default-branch MCP calls.".into(),
@@ -1600,6 +1613,49 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
             match rt.purge_branch(session_id, branch) {
+                Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
+                Err(e) => {
+                    is_error = true;
+                    serde_json::to_string(&json!({ "error": format!("{e:?}"), "tool": name }))
+                        .unwrap_or_else(|_| "{}".into())
+                }
+            }
+        }
+        "retarget_edge" => {
+            let session_id = match session_id_from_args(&args) {
+                Ok(id) => id,
+                Err(msg) => {
+                    is_error = true;
+                    return json!({
+                        "content": content_block(
+                            &serde_json::to_string(&json!({ "error": msg, "tool": name }))
+                                .unwrap_or_else(|_| "{}".into()),
+                            json_mode
+                        ),
+                        "isError": true
+                    });
+                }
+            };
+            let branch = args
+                .get("branch_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let source_rev = args
+                .get("source_revision_id")
+                .or_else(|| args.get("source_revision_id_hex"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let edge_id = args
+                .get("edge_id")
+                .or_else(|| args.get("edge_id_hex"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let new_target = args
+                .get("new_target_identity_id")
+                .or_else(|| args.get("new_target_identity_id_hex"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            match rt.retarget_edge(session_id, branch, source_rev, edge_id, new_target) {
                 Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()),
                 Err(e) => {
                     is_error = true;

@@ -206,6 +206,15 @@ pub struct PurgeBranchResponse {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct RetargetEdgeResponse {
+    pub branch_id_hex: String,
+    pub source_revision_id_hex: String,
+    pub edge_id_hex: String,
+    pub new_target_identity_id_hex: String,
+    pub meta: QueryMeta,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct CreateBranchResponse {
     pub branch_id_hex: String,
     pub branch_name: String,
@@ -492,6 +501,10 @@ fn now_ms() -> u64 {
 }
 
 fn parse_revision_hex(s: &str) -> Option<NodeRevisionId> {
+    parse_hex16_bytes(s).map(NodeRevisionId)
+}
+
+fn parse_hex16_bytes(s: &str) -> Option<[u8; 16]> {
     let t = s.trim();
     if t.len() != 32 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -500,7 +513,7 @@ fn parse_revision_hex(s: &str) -> Option<NodeRevisionId> {
     for i in 0..16 {
         b[i] = u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()?;
     }
-    Some(NodeRevisionId(b))
+    Some(b)
 }
 
 fn parse_merge_id_hex(s: &str) -> Option<MergeId> {
@@ -1978,6 +1991,47 @@ impl CisMcpRuntime {
         Ok(PurgeBranchResponse {
             branch_id_hex: hex16(&branch.0),
             keys_deleted: n,
+            meta,
+        })
+    }
+
+    /// Set a per-branch edge target override (**§01.7.1a** / MCP `retarget_edge`).
+    ///
+    /// Redirects `(branch, source_revision, edge_id)` to `new_target` without rewriting
+    /// the shared graph edge list.
+    pub fn retarget_edge(
+        &self,
+        session_id: u64,
+        branch_hex: &str,
+        source_revision_hex: &str,
+        edge_id_hex: &str,
+        new_target_identity_hex: &str,
+    ) -> Result<RetargetEdgeResponse, AuthError> {
+        self.require_session(session_id)?;
+        let branch = parse_branch_id_hex(branch_hex).ok_or(AuthError::InvalidInput)?;
+        let source_rev = parse_revision_hex(source_revision_hex).ok_or(AuthError::InvalidInput)?;
+        let edge_id = parse_hex16_bytes(edge_id_hex).ok_or(AuthError::InvalidInput)?;
+        let new_target =
+            parse_identity_hex_local(new_target_identity_hex).ok_or(AuthError::InvalidInput)?;
+
+        {
+            let g = self.coordinator.graph().read();
+            let edges = g.outbound_edges(source_rev);
+            if !edges.iter().any(|e| e.edge_id == edge_id) {
+                return Err(AuthError::InvalidInput);
+            }
+        }
+
+        eto_for_runtime(&self.kv).set_override(branch, source_rev, edge_id, new_target);
+        let mut meta = QueryMeta::default();
+        meta.policy_version = self.policy.current_version_label();
+        meta.node_count = 1;
+        self.audit.record_sync(session_id, "retarget_edge");
+        Ok(RetargetEdgeResponse {
+            branch_id_hex: hex16(&branch.0),
+            source_revision_id_hex: hex16(&source_rev.0),
+            edge_id_hex: hex16(&edge_id),
+            new_target_identity_id_hex: hex16(&new_target.0),
             meta,
         })
     }
