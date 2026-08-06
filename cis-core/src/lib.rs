@@ -136,7 +136,10 @@ pub use coordinator::{CoordinatorError, CoordinatorPersistence, WriteCoordinator
 pub use daemon_handles::CisDaemonHandles;
 pub use degraded::{disk_free_percent, DiskPressureFlag, VectorDegradedController};
 pub use deletion_absence::{deleted_key, DeletionAbsenceStore};
-pub use edge_target_override::{delete_eto_for_source_revision, eto_key, EdgeTargetOverrideStore};
+pub use edge_target_override::{
+    delete_eto_for_source_revision, eto_key, retarget_inbound_edges_for_rename,
+    tombstone_needed_for_inbound_bridge, EdgeTargetOverrideStore,
+};
 pub use embedder::{
     api_embedder_configured, cosine_similarity, embedder_from_env, embeddings_endpoint_url,
     l2_normalize, EmbedError, Embedder, StubEmbedder, STUB_EMBED_DIM,
@@ -210,8 +213,8 @@ pub use mcp_runtime::{
     IngestCisConfigResponse, ListBranchesResponse,
     ListMergeMetricsResponse,
     MergeBranchResponse, MergeProgressEvent, MergeProgressSink, RevertPatchResponse,
-    SemanticSearchHit, SemanticSearchResponse, SwitchBranchResponse, SymbolHit, SymbolHitsResponse,
-    VerifyAuditChainResponse, GraphConsistencyResponse,
+    RetargetEdgeResponse, SemanticSearchHit, SemanticSearchResponse, SwitchBranchResponse,
+    SymbolHit, SymbolHitsResponse, VerifyAuditChainResponse, GraphConsistencyResponse,
     WhyNoDefinitionResponse, WriteFileResponse, MERGE_PROGRESS_TOTAL,
 };
 pub use merge_control::{
@@ -219,13 +222,13 @@ pub use merge_control::{
 };
 pub use merge_engine::{
     append_merge_cancelled_after_control, append_merge_cancelled_marker,
-    append_merge_committed, classify_identity_stub, merge_phase_a_report, phase_a_classify,
-    phase_a_classify_with_base, phase_a_for_merge, phase_b_promote, phase_c_reconcile_edges,
-    phase_c_reconcile_edges_full, premerge_bindings_for_branch, merge_reconciliation_job_id,
-    recover_inflight_merges,
-    resume_merge, run_phase_a_classify, ClassifiedMergeIdentity, MergeContext,
-    MergeIdentityClass, MergeRecoveryReport, MergeReport, MergeStrategy, MergeWorkflowStatus,
-    PhaseAResult, PhaseBResult, PhaseCResult, ResumePendingResolution,
+    append_merge_committed, classify_identity_stub, collect_rename_pairs, merge_phase_a_report,
+    phase_a_classify, phase_a_classify_with_base, phase_a_for_merge, phase_b_promote,
+    phase_c_reconcile_edges, phase_c_reconcile_edges_full, premerge_bindings_for_branch,
+    merge_reconciliation_job_id, recover_inflight_merges, resume_merge, run_phase_a_classify,
+    ClassifiedMergeIdentity, MergeContext, MergeIdentityClass, MergeRecoveryReport, MergeReport,
+    MergeStrategy, MergeWorkflowStatus, PhaseAResult, PhaseBResult, PhaseCResult,
+    ResumePendingResolution,
 };
 pub use merge_gate::MergeRecoveryGate;
 pub use merge_metrics::{

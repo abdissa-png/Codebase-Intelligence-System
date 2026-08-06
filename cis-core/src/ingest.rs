@@ -327,6 +327,7 @@ pub fn apply_index_events_with_config(
         let batch_indexes_c = batch_indexes.clone();
         let lang_c = lang;
         let absence_c = absence.clone();
+        let kv_c = Arc::clone(&kv);
         let bindings_out: Arc<Mutex<Vec<(IdentityId, NodeRevisionId)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let bindings_c = Arc::clone(&bindings_out);
@@ -351,6 +352,7 @@ pub fn apply_index_events_with_config(
             );
 
             let mut rename_edges: Vec<GraphEdge> = Vec::new();
+            let mut rename_retargets: Vec<(IdentityId, IdentityId)> = Vec::new();
             let mut claimed_tomb_ids: std::collections::HashSet<cis_wal::NodeRevisionId> =
                 std::collections::HashSet::new();
             let mut local_bindings: Vec<(IdentityId, NodeRevisionId)> = Vec::new();
@@ -401,9 +403,19 @@ pub fn apply_index_events_with_config(
                             ev,
                             stable_id_bytes("rn", &path_c, &id_key),
                         ));
-                        g.get_revision(tomb_rev)
+                        let tomb_iid = g
+                            .get_revision(tomb_rev)
                             .map(|r| r.identity_id)
-                            .unwrap_or(outcome.identity_id)
+                            .unwrap_or(outcome.identity_id);
+                        if tomb_iid != outcome.identity_id {
+                            rename_retargets.push((tomb_iid, outcome.identity_id));
+                        }
+                        // New stable-key identity was not used — redirect any edges that
+                        // still target the unused proposed id to the preserved identity.
+                        if proposed_iid != outcome.identity_id {
+                            rename_retargets.push((proposed_iid, outcome.identity_id));
+                        }
+                        tomb_iid
                     });
                     (outcome.identity_id, rename_source_id)
                 };
@@ -520,6 +532,12 @@ pub fn apply_index_events_with_config(
                 list.push(e);
                 g.replace_edges_for_revision(rid, list)
                     .map_err(|_| "edge_replace")?;
+            }
+            {
+                let eto = crate::edge_target_override::EdgeTargetOverrideStore::new(kv_c);
+                for (old_iid, new_iid) in rename_retargets {
+                    eto.retarget_inbound_edges_for_rename(g, branch, old_iid, new_iid);
+                }
             }
             *bindings_c.lock().unwrap() = local_bindings;
             Ok(())
@@ -1312,6 +1330,95 @@ mod tests {
                 Some(NodeKind::Class),
                 "bare slot must remain the class"
             );
+        }
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn ingest_class_first_then_two_overloads_keeps_three_identities() {
+        use cis_wal::MutationLog;
+
+        use crate::coordinator::WriteCoordinator;
+        use crate::index_model::symbol_identity_key;
+        use crate::saga::MergeSagaOrchestrator;
+        use crate::MemoryKv;
+
+        let wal: Arc<dyn cis_wal::MutationLogStore> = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(Arc::clone(&wal));
+        let kv = Arc::new(MemoryKv::new());
+        let saga = MergeSagaOrchestrator::new(Arc::new(MemoryKv::new()));
+        let _ = coord.reconcile_on_startup(&saga);
+        let branch = BranchId([0u8; 16]);
+        let path = "class_then_overloads.py";
+        let q = IndexEventQueue::new();
+
+        let apply = |src: &str| {
+            let events = vec![IndexEvent {
+                branch_id: branch,
+                path: path.into(),
+                kind: FsChangeKind::Modified,
+                old_path: None,
+            }];
+            let s = src.to_string();
+            apply_index_events(
+                &q,
+                &coord,
+                Arc::clone(&kv),
+                events,
+                move |_p| Ok(s.clone()),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        apply("class foo:\n    pass\n");
+        let iid_class_bare =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "")));
+        {
+            let g = coord.graph().read();
+            assert_eq!(g.identity_kind(iid_class_bare), Some(NodeKind::Class));
+        }
+
+        // Class + two overloads: without re-numbering, stabilize would stamp both fns as fn:0.
+        apply(
+            "class foo:\n    pass\n\ndef foo(x: int):\n    ...\n\ndef foo(x):\n    return x\n",
+        );
+        let iid_fn0 =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "fn:0")));
+        let iid_fn1 =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "fn:1")));
+        {
+            let g = coord.graph().read();
+            let class_rev = g
+                .primary_revision_for_identity(branch, iid_class_bare)
+                .expect("class still on bare slot");
+            assert_eq!(g.identity_kind(iid_class_bare), Some(NodeKind::Class));
+            assert!(matches!(class_rev.status, RevisionStatus::Active));
+
+            let f0 = g
+                .primary_revision_for_identity(branch, iid_fn0)
+                .expect("fn:0 present");
+            let f1 = g
+                .primary_revision_for_identity(branch, iid_fn1)
+                .expect("fn:1 present — must not collide with fn:0");
+            assert_eq!(g.identity_kind(iid_fn0), Some(NodeKind::Function));
+            assert_eq!(g.identity_kind(iid_fn1), Some(NodeKind::Function));
+            assert!(matches!(f0.status, RevisionStatus::Active));
+            assert!(matches!(f1.status, RevisionStatus::Active));
+            assert_ne!(iid_fn0, iid_fn1);
+            assert_ne!(iid_fn0, iid_class_bare);
+            assert_ne!(iid_fn1, iid_class_bare);
+
+            let active_foo: Vec<_> = g
+                .revisions()
+                .filter(|r| {
+                    matches!(r.status, RevisionStatus::Active)
+                        && r.file_path == path
+                        && r.qualified_name == format!("{path}::foo")
+                })
+                .collect();
+            assert_eq!(active_foo.len(), 3);
         }
     }
 

@@ -113,6 +113,8 @@ pub struct PhaseCResult {
     pub needs_edge_regen: Vec<NodeRevisionId>,
     /// Edge batches applied during Phase C (for saga compensate on cancel).
     pub saga_batches: Vec<SagaEdgeBatch>,
+    /// Inbound edges retargeted via ETO for rename pairs.
+    pub eto_retargets: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -896,6 +898,33 @@ pub fn phase_a_for_merge(
     }
 }
 
+/// Collect `(old_identity, new_identity)` rename pairs from classified merge rows.
+///
+/// Prefer calling after [`detect_renames`] so `RenamedCandidate` rows are present.
+pub fn collect_rename_pairs(
+    graph: &InMemoryGraph,
+    classified: &[ClassifiedMergeIdentity],
+) -> Vec<(IdentityId, IdentityId)> {
+    let mut rename_pairs: Vec<(IdentityId, IdentityId)> = Vec::new();
+    for ci in classified.iter() {
+        if !matches!(ci.class, MergeIdentityClass::RenamedCandidate) {
+            continue;
+        }
+        let rename_src = [ci.ours_revision, ci.theirs_revision]
+            .into_iter()
+            .flatten()
+            .find_map(|r| graph.get_revision(r).and_then(|rev| rev.rename_source_id));
+        if let Some(src) = rename_src {
+            if src != ci.identity_id {
+                rename_pairs.push((src, ci.identity_id));
+            }
+        }
+    }
+    rename_pairs.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then(a.1 .0.cmp(&b.1 .0)));
+    rename_pairs.dedup();
+    rename_pairs
+}
+
 /// Post-classification rename detection pass.
 ///
 /// Scans for identity pairs where one was deleted and another was created
@@ -1181,6 +1210,16 @@ pub fn phase_c_reconcile_edges_full(
         }
     }
 
+    // Write ETO redirects for rename pairs before dangling cleanup so edges whose
+    // raw target is the old identity survive via effective-target checks.
+    let eto = crate::edge_target_override::EdgeTargetOverrideStore::from_kv(kv);
+    if let Some(classified) = classified {
+        for (old_id, new_id) in collect_rename_pairs(graph, classified) {
+            result.eto_retargets +=
+                eto.retarget_inbound_edges_for_rename(graph, target_branch, old_id, new_id);
+        }
+    }
+
     let target_bindings = scan_branch_bindings(kv, target_branch);
     let active_identities: HashSet<IdentityId> = target_bindings.keys().copied().collect();
 
@@ -1192,13 +1231,14 @@ pub fn phase_c_reconcile_edges_full(
         for edge in &edges {
             result.edges_checked += 1;
 
-            if !active_identities.contains(&edge.target_identity_id) {
+            let effective_target = eto.effective_target_identity(target_branch, edge);
+            if !active_identities.contains(&effective_target) {
                 result.dangling_edges_removed += 1;
                 changed = true;
                 continue;
             }
 
-            if let Some(&target_rev_id) = target_bindings.get(&edge.target_identity_id) {
+            if let Some(&target_rev_id) = target_bindings.get(&effective_target) {
                 if let Some(target_rev) = graph.get_revision(target_rev_id) {
                     if edge.resolution.target_signature_hash != [0u8; 32]
                         && edge.resolution.target_signature_hash != target_rev.signature_hash

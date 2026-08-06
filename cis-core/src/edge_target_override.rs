@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
+use crate::graph::InMemoryGraph;
 use crate::kv::MemoryKv;
 
 fn hex16(b: &[u8; 16]) -> String {
@@ -45,6 +46,13 @@ pub struct EdgeTargetOverrideStore {
 impl EdgeTargetOverrideStore {
     pub fn new(kv: Arc<MemoryKv>) -> Self {
         Self { kv }
+    }
+
+    /// Share an existing [`MemoryKv`] handle (clone shares the interior map).
+    pub fn from_kv(kv: &MemoryKv) -> Self {
+        Self {
+            kv: Arc::new(kv.clone()),
+        }
     }
 
     pub fn set_override(
@@ -147,6 +155,85 @@ impl EdgeTargetOverrideStore {
         }
         out
     }
+
+    /// Redirect every live outbound edge on `branch` whose raw target is `old_target`
+    /// to `new_target` via ETO. No-op when identities are equal.
+    ///
+    /// Used after rename detection (ingest / merge) so callers keep resolving correctly
+    /// even after the old identity's tombstone is GC'd.
+    pub fn retarget_inbound_edges_for_rename(
+        &self,
+        graph: &InMemoryGraph,
+        branch: BranchId,
+        old_target: IdentityId,
+        new_target: IdentityId,
+    ) -> usize {
+        retarget_inbound_edges_for_rename(graph, self, branch, old_target, new_target)
+    }
+}
+
+/// Redirect live inbound edges from `old_target` → `new_target` on `branch`.
+///
+/// Returns the number of ETO rows written. Skips when `old_target == new_target`.
+///
+/// Source revisions are resolved preferentially via the target-branch primary, then
+/// any live Active/Speculative revision of the source identity (merge graphs often
+/// keep edges on base-branch revision rows that are merely rebound on the target).
+pub fn retarget_inbound_edges_for_rename(
+    graph: &InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
+    branch: BranchId,
+    old_target: IdentityId,
+    new_target: IdentityId,
+) -> usize {
+    if old_target == new_target {
+        return 0;
+    }
+    let mut n = 0usize;
+    for src_iid in graph.source_identities_targeting(old_target) {
+        let mut source_revs: Vec<NodeRevisionId> = Vec::new();
+        if let Some(src) = graph.primary_revision_for_identity(branch, src_iid) {
+            source_revs.push(src.revision_id);
+        } else {
+            for rev in graph.revisions() {
+                if rev.identity_id == src_iid
+                    && matches!(
+                        rev.status,
+                        crate::graph::RevisionStatus::Active
+                            | crate::graph::RevisionStatus::Speculative
+                    )
+                {
+                    source_revs.push(rev.revision_id);
+                }
+            }
+        }
+        for rid in source_revs {
+            for e in graph.outbound_edges(rid) {
+                if e.target_identity_id == old_target {
+                    eto.set_override(branch, rid, e.edge_id, new_target);
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// True when a tombstone must be kept because its identity has no live primary and
+/// live edges still target it (query resolution still needs tombstone bridging /
+/// pending ETO coverage).
+pub fn tombstone_needed_for_inbound_bridge(
+    graph: &InMemoryGraph,
+    branch_id: BranchId,
+    identity_id: IdentityId,
+) -> bool {
+    if graph
+        .primary_revision_for_identity(branch_id, identity_id)
+        .is_some()
+    {
+        return false;
+    }
+    !graph.source_identities_targeting(identity_id).is_empty()
 }
 
 fn parse_hex16_id(s: &str) -> Option<[u8; 16]> {
@@ -295,5 +382,144 @@ mod tests {
         let hits = s.overrides_targeting(t);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0], (b, r, e));
+    }
+
+    #[test]
+    fn retarget_inbound_edges_writes_eto_for_live_callers() {
+        use crate::graph::{
+            EdgeResolution, EdgeType, GraphEdge, Language, NodeIdentity, NodeKind, NodeRevision,
+            RevisionStatus, SourceSpan, SourceType,
+        };
+        let kv = Arc::new(MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let branch = BranchId([1u8; 16]);
+        let old_t = IdentityId([10u8; 16]);
+        let new_t = IdentityId([11u8; 16]);
+        let caller_i = IdentityId([20u8; 16]);
+        let caller_r = NodeRevisionId([20u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: caller_i,
+            kind: NodeKind::Function,
+        });
+        g.put_identity(NodeIdentity {
+            identity_id: old_t,
+            kind: NodeKind::Function,
+        });
+        g.put_identity(NodeIdentity {
+            identity_id: new_t,
+            kind: NodeKind::Function,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: caller_r,
+            identity_id: caller_i,
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: "caller".into(),
+            file_path: "a.py".into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let edge_id = [7u8; 16];
+        g.replace_edges_for_revision(
+            caller_r,
+            vec![GraphEdge {
+                edge_id,
+                ty: EdgeType::Calls,
+                source_revision_id: caller_r,
+                target_identity_id: old_t,
+                resolution: EdgeResolution {
+                    target_signature_hash: [0u8; 32],
+                    resolver: SourceType::Ast,
+                    last_validation_ms: 0,
+                },
+                anchor: SourceSpan::UNKNOWN,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            retarget_inbound_edges_for_rename(&g, &eto, branch, old_t, new_t),
+            1
+        );
+        assert_eq!(eto.get_override(branch, caller_r, edge_id), Some(new_t));
+        assert_eq!(
+            retarget_inbound_edges_for_rename(&g, &eto, branch, old_t, old_t),
+            0,
+            "same-identity rename must be a no-op"
+        );
+    }
+
+    #[test]
+    fn tombstone_needed_when_no_live_primary_and_inbound_edges() {
+        use crate::graph::{
+            EdgeResolution, EdgeType, GraphEdge, Language, NodeIdentity, NodeKind, NodeRevision,
+            RevisionStatus, SourceSpan, SourceType,
+        };
+        let mut g = InMemoryGraph::default();
+        let branch = BranchId([1u8; 16]);
+        let target_i = IdentityId([10u8; 16]);
+        let caller_i = IdentityId([20u8; 16]);
+        let caller_r = NodeRevisionId([20u8; 16]);
+        let tomb_r = NodeRevisionId([10u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: caller_i,
+            kind: NodeKind::Function,
+        });
+        g.put_identity(NodeIdentity {
+            identity_id: target_i,
+            kind: NodeKind::Function,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: caller_r,
+            identity_id: caller_i,
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: "caller".into(),
+            file_path: "a.py".into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: tomb_r,
+            identity_id: target_i,
+            branch_id: branch,
+            status: RevisionStatus::Tombstone,
+            qualified_name: "old".into(),
+            file_path: "a.py".into(),
+            body_hash: [1u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: Some(1),
+        });
+        g.replace_edges_for_revision(
+            caller_r,
+            vec![GraphEdge {
+                edge_id: [7u8; 16],
+                ty: EdgeType::Calls,
+                source_revision_id: caller_r,
+                target_identity_id: target_i,
+                resolution: EdgeResolution {
+                    target_signature_hash: [0u8; 32],
+                    resolver: SourceType::Ast,
+                    last_validation_ms: 0,
+                },
+                anchor: SourceSpan::UNKNOWN,
+            }],
+        )
+        .unwrap();
+        assert!(tombstone_needed_for_inbound_bridge(&g, branch, target_i));
     }
 }

@@ -58,6 +58,13 @@ impl TombstoneGcWorker {
             .filter(|r| !bound.contains(&r.revision_id))
             .filter(|r| !protected_snapshots.contains(&r.revision_id))
             .filter(|r| !protected_wal.contains(&r.revision_id))
+            .filter(|r| {
+                !crate::edge_target_override::tombstone_needed_for_inbound_bridge(
+                    &g,
+                    r.branch_id,
+                    r.identity_id,
+                )
+            })
             .map(|r| r.revision_id)
             .collect()
     }
@@ -159,6 +166,13 @@ fn delete_revision(
         if !matches!(rev.status, RevisionStatus::Tombstone) {
             return Err("not tombstone");
         }
+        if crate::edge_target_override::tombstone_needed_for_inbound_bridge(
+            &g,
+            rev.branch_id,
+            rev.identity_id,
+        ) {
+            return Err("inbound references");
+        }
         (rev.identity_id, rev.body_hash)
     };
     {
@@ -244,5 +258,79 @@ mod tests {
         delete_revision(&graph, &kv, &vq, rid).unwrap();
         assert!(kv.get(&key).is_none());
         assert!(graph.read().get_revision(rid).is_none());
+    }
+
+    #[test]
+    fn scan_skips_tombstone_with_live_inbound_edges() {
+        use crate::graph::{
+            EdgeResolution, EdgeType, GraphEdge, NodeIdentity, RevisionStatus, SourceSpan,
+            SourceType,
+        };
+        use cis_wal::IdentityId;
+
+        let mut g = InMemoryGraph::default();
+        let branch = BranchId([0u8; 16]);
+        let target_i = IdentityId([10u8; 16]);
+        let caller_i = IdentityId([20u8; 16]);
+        let caller_r = NodeRevisionId([20u8; 16]);
+        let tomb_r = NodeRevisionId([10u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: caller_i,
+            kind: NodeKind::Function,
+        });
+        g.put_identity(NodeIdentity {
+            identity_id: target_i,
+            kind: NodeKind::Function,
+        });
+        let mut tomb = tombstone_rev(10, 0);
+        tomb.revision_id = tomb_r;
+        tomb.identity_id = target_i;
+        tomb.branch_id = branch;
+        g.put_revision(tomb);
+        g.put_revision(NodeRevision {
+            revision_id: caller_r,
+            identity_id: caller_i,
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: "caller".into(),
+            file_path: "a.py".into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: Default::default(),
+            tombstoned_at_ms: None,
+        });
+        g.replace_edges_for_revision(
+            caller_r,
+            vec![GraphEdge {
+                edge_id: [7u8; 16],
+                ty: EdgeType::Calls,
+                source_revision_id: caller_r,
+                target_identity_id: target_i,
+                resolution: EdgeResolution {
+                    target_signature_hash: [0u8; 32],
+                    resolver: SourceType::Ast,
+                    last_validation_ms: 0,
+                },
+                anchor: SourceSpan::UNKNOWN,
+            }],
+        )
+        .unwrap();
+
+        let graph = SharedInMemoryGraph::new(g);
+        let kv = MemoryKv::new();
+        let wal = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(wal);
+        let worker = TombstoneGcWorker {
+            retention: Duration::from_secs(0),
+        };
+        let policy = RankingPolicy::default();
+        let ids = worker.scan_eligible(&graph, &kv, &coord, &policy, 10_000);
+        assert!(
+            !ids.contains(&tomb_r),
+            "tombstone with inbound edges must not be GC-eligible"
+        );
     }
 }

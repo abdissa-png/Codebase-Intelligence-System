@@ -572,6 +572,96 @@ fn rename_detected_and_unified() {
     assert!(kv.get(&key_old).is_none());
 }
 
+#[test]
+fn phase_c_writes_eto_for_rename_and_keeps_inbound_edges() {
+    use cis_core::{collect_rename_pairs, EdgeTargetOverrideStore};
+
+    let kv = Arc::new(MemoryKv::new());
+    let mut g = InMemoryGraph::default();
+    let base = BranchId([1u8; 16]);
+    let ours = BranchId([2u8; 16]);
+    let theirs = BranchId([3u8; 16]);
+
+    let old_id = iid(1);
+    let new_id = iid(2);
+    let caller_id = iid(3);
+    let r_old = rid(1);
+    let r_caller = rid(3);
+    g.put_identity(NodeIdentity {
+        identity_id: old_id,
+        kind: NodeKind::Function,
+    });
+    g.put_identity(NodeIdentity {
+        identity_id: new_id,
+        kind: NodeKind::Function,
+    });
+    g.put_identity(NodeIdentity {
+        identity_id: caller_id,
+        kind: NodeKind::Function,
+    });
+    g.put_revision(make_rev(
+        r_old,
+        old_id,
+        base,
+        "old_fn",
+        [10u8; 32],
+        [0u8; 32],
+    ));
+    g.put_revision(make_rev(
+        r_caller,
+        caller_id,
+        base,
+        "caller",
+        [30u8; 32],
+        [0u8; 32],
+    ));
+    let edge_id = [9u8; 16];
+    g.replace_edges_for_revision(r_caller, vec![make_edge(edge_id, r_caller, old_id, [0u8; 32])])
+        .unwrap();
+    bind(&kv, base, old_id, r_old);
+    bind(&kv, base, caller_id, r_caller);
+    bind(&kv, ours, old_id, r_old);
+    bind(&kv, ours, caller_id, r_caller);
+
+    let r_new = rid(2);
+    let mut new_rev = make_rev(r_new, new_id, theirs, "new_fn", [20u8; 32], [0u8; 32]);
+    new_rev.rename_source_id = Some(old_id);
+    g.put_revision(new_rev);
+    bind(&kv, theirs, new_id, r_new);
+    bind(&kv, theirs, caller_id, r_caller);
+
+    let pa = phase_a_classify(&g, &kv, ours, theirs, base);
+    let pairs = collect_rename_pairs(&g, &pa.classified);
+    assert_eq!(pairs, vec![(old_id, new_id)]);
+
+    let pb = phase_b_promote(&kv, &mut g, ours, &pa.classified, None);
+    let pc = phase_c_reconcile_edges_full(
+        &mut g,
+        &kv,
+        None,
+        ours,
+        &pb.promoted,
+        Some(&pa.classified),
+    );
+    assert!(
+        pc.eto_retargets >= 1,
+        "expected ETO retarget for caller→old_id, got {}",
+        pc.eto_retargets
+    );
+    assert_eq!(
+        pc.dangling_edges_removed, 0,
+        "ETO-covered edge must not be dropped as dangling"
+    );
+    assert_eq!(g.outbound_edges(r_caller).len(), 1);
+
+    let eto = EdgeTargetOverrideStore::from_kv(&kv);
+    assert_eq!(
+        eto.get_override(ours, r_caller, edge_id),
+        Some(new_id),
+        "caller edge should be overridden to new identity"
+    );
+}
+
 /// Theirs renamed; ours independently created the same new identity without rename_source_id.
 /// Must still detect rename via theirs revision (not `ours.or(theirs)` alone).
 #[test]
