@@ -4099,6 +4099,21 @@ mod tests {
     use crate::merge_lock::acquire_merge_lock;
     use cis_wal::MergeId;
 
+    /// Isolated repo root so tests never share `/tmp/.cis/wal.json` (or a corrupt leftover).
+    fn isolated_dev_runtime(label: &str) -> (std::path::PathBuf, CisMcpRuntime) {
+        let dir = std::env::temp_dir().join(format!(
+            "cis_mcp_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = CisMcpRuntime::new_dev(&dir.to_string_lossy());
+        (dir, rt)
+    }
+
     #[test]
     fn structural_substring_score_is_case_insensitive() {
         let score = structural_substring_score("authenticate", "auth.Authenticate");
@@ -4107,14 +4122,15 @@ mod tests {
 
     #[test]
     fn find_symbol_at_requires_snapshot() {
-        let rt = CisMcpRuntime::new_dev("/tmp");
+        let (dir, rt) = isolated_dev_runtime("find_at_req");
         let r = rt.find_symbol_at(0, "x", 1, None, 10);
         assert!(matches!(r, Err(AuthError::InvalidInput)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn find_symbol_at_hits_after_checkpoint() {
-        let rt = CisMcpRuntime::new_dev("/tmp");
+        let (dir, rt) = isolated_dev_runtime("find_at_hit");
         let branch = BranchId([0u8; 16]);
         assert_eq!(rt.revision_index().branch_id(), branch);
         {
@@ -4152,6 +4168,7 @@ mod tests {
         assert_eq!(resp.meta.query_at_commit, Some("1".into()));
         assert_eq!(resp.matches[0].start_line, 1);
         assert_eq!(resp.matches[0].start_col, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4275,7 +4292,7 @@ mod tests {
 
     #[test]
     fn semantic_search_degraded_without_embeddings() {
-        let rt = CisMcpRuntime::new_dev("/tmp");
+        let (dir, rt) = isolated_dev_runtime("sem_deg");
         let branch = rt.revision_index().branch_id();
         let i = IdentityId([51u8; 16]);
         let r = NodeRevisionId([61u8; 16]);
@@ -4309,11 +4326,12 @@ mod tests {
             .degraded_modes
             .contains(&"semantic_degraded".to_string()));
         assert!(resp.meta.degraded_modes.contains(&"embeddings_pending".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn merge_ttl_sweep_clears_stale_lock() {
-        let rt = CisMcpRuntime::new_dev("/tmp");
+        let (dir, rt) = isolated_dev_runtime("merge_ttl");
         let b = rt.revision_index().branch_id();
         let m = MergeId([8u8; 16]);
         acquire_merge_lock(rt.kv.as_ref(), b, m).unwrap();
@@ -4321,6 +4339,7 @@ mod tests {
         let n = rt.run_merge_ttl_sweep(0).unwrap();
         assert_eq!(n, 1);
         assert!(crate::merge_lock::merge_lock_holder(rt.kv.as_ref(), b).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn branch_hex(b: BranchId) -> String {
@@ -4339,7 +4358,7 @@ mod tests {
         let r_base = NodeRevisionId([21u8; 16]);
         let r_theirs = NodeRevisionId([23u8; 16]);
 
-        let rt = CisMcpRuntime::new_dev("/tmp");
+        let (dir, rt) = isolated_dev_runtime("merge_e2e");
         {
             let mut g = rt.graph_mutex().write();
             g.put_identity(NodeIdentity {
@@ -4403,6 +4422,7 @@ mod tests {
         assert!(rt.wal().iter_all().iter().any(|r| {
             matches!(r.kind, MutationKind::Merge { .. })
         }));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     struct CountingSink(std::sync::Arc<std::sync::atomic::AtomicU32>);
@@ -4419,7 +4439,7 @@ mod tests {
 
         let target = BranchId([0u8; 16]);
         let source = BranchId([2u8; 16]);
-        let rt = CisMcpRuntime::new_dev("/tmp");
+        let (dir, rt) = isolated_dev_runtime("merge_sink");
         let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let mut sink = CountingSink(std::sync::Arc::clone(&count));
 
@@ -4438,5 +4458,6 @@ mod tests {
             count.load(std::sync::atomic::Ordering::SeqCst),
             MERGE_PROGRESS_TOTAL
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
