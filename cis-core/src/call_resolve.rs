@@ -9,8 +9,8 @@ use crate::graph::{
 };
 
 use crate::index_model::{
-    edge_id_bytes, stable_id_bytes, stable_rev_id_bytes, CallReceiver, FileIndex, ImportBinding,
-    ImportStyle, ParsedCall, ParsedImport,
+    edge_id_bytes, scope_relative_edge_pos, stable_id_bytes, stable_rev_id_bytes, CallReceiver,
+    FileIndex, ImportBinding, ImportStyle, ParsedCall, ParsedImport,
 };
 
 fn path_matches_stripped_module(path: &str, stripped: &str) -> bool {
@@ -476,20 +476,76 @@ pub(crate) fn ast_edge_resolution() -> EdgeResolution {
     }
 }
 
+/// Look up the innermost owning scope's 1-based start line for `stable_key`.
+/// File hubs / missing symbols default to line `1` (module top).
+fn scope_start_line_for_key(index: &FileIndex, stable_key: &str) -> u32 {
+    let start = index
+        .symbols
+        .iter()
+        .find(|s| {
+            s.kind == NodeKind::Function
+                && s.stable_key == stable_key
+                && s.disambiguator.is_empty()
+        })
+        .or_else(|| {
+            index
+                .symbols
+                .iter()
+                .find(|s| s.kind == NodeKind::Function && s.stable_key == stable_key)
+        })
+        .or_else(|| {
+            index
+                .symbols
+                .iter()
+                .find(|s| s.kind == NodeKind::Class && s.stable_key == stable_key)
+        })
+        .or_else(|| {
+            index
+                .symbols
+                .iter()
+                .find(|s| s.stable_key == stable_key && s.disambiguator.is_empty())
+        })
+        .or_else(|| index.symbols.iter().find(|s| s.stable_key == stable_key))
+        .map(|s| s.span.start_line)
+        .unwrap_or(1);
+    if start == 0 {
+        1
+    } else {
+        start
+    }
+}
+
+fn file_hub_scope_start(index: &FileIndex) -> u32 {
+    index
+        .symbols
+        .iter()
+        .find(|s| s.stable_key == "$file" || s.kind == NodeKind::File)
+        .map(|s| {
+            if s.span.start_line == 0 {
+                1
+            } else {
+                s.span.start_line
+            }
+        })
+        .unwrap_or(1)
+}
+
 pub(crate) fn import_edge(
     src_rid: NodeRevisionId,
     tgt: IdentityId,
     path: &str,
     label: &str,
-    anchor: SourceSpan,
+    absolute_anchor: SourceSpan,
+    scope_start_line: u32,
 ) -> GraphEdge {
+    let (rel_line, rel_col) = scope_relative_edge_pos(absolute_anchor, scope_start_line);
     GraphEdge {
-        edge_id: edge_id_bytes("imp", path, src_rid, label, anchor),
+        edge_id: edge_id_bytes("imp", path, src_rid, label, rel_line, rel_col),
         ty: EdgeType::Imports,
         source_revision_id: src_rid,
         target_identity_id: tgt,
         resolution: ast_edge_resolution(),
-        anchor,
+        anchor: absolute_anchor,
     }
 }
 
@@ -498,15 +554,17 @@ pub(crate) fn call_edge(
     tgt: IdentityId,
     path: &str,
     label: &str,
-    anchor: SourceSpan,
+    absolute_anchor: SourceSpan,
+    scope_start_line: u32,
 ) -> GraphEdge {
+    let (rel_line, rel_col) = scope_relative_edge_pos(absolute_anchor, scope_start_line);
     GraphEdge {
-        edge_id: edge_id_bytes("cal", path, src_rid, label, anchor),
+        edge_id: edge_id_bytes("cal", path, src_rid, label, rel_line, rel_col),
         ty: EdgeType::Calls,
         source_revision_id: src_rid,
         target_identity_id: tgt,
         resolution: ast_edge_resolution(),
-        anchor,
+        anchor: absolute_anchor,
     }
 }
 
@@ -516,16 +574,18 @@ pub(crate) fn extends_edge(
     path: &str,
     class_key: &str,
     base_name: &str,
-    anchor: SourceSpan,
+    absolute_anchor: SourceSpan,
+    scope_start_line: u32,
 ) -> GraphEdge {
     let label = format!("{class_key}:extends:{base_name}");
+    let (rel_line, rel_col) = scope_relative_edge_pos(absolute_anchor, scope_start_line);
     GraphEdge {
-        edge_id: edge_id_bytes("ext", path, src_rid, &label, anchor),
+        edge_id: edge_id_bytes("ext", path, src_rid, &label, rel_line, rel_col),
         ty: EdgeType::Extends,
         source_revision_id: src_rid,
         target_identity_id: tgt,
         resolution: ast_edge_resolution(),
-        anchor,
+        anchor: absolute_anchor,
     }
 }
 
@@ -535,16 +595,18 @@ pub(crate) fn use_edge(
     path: &str,
     owner_key: &str,
     type_name: &str,
-    anchor: SourceSpan,
+    absolute_anchor: SourceSpan,
+    scope_start_line: u32,
 ) -> GraphEdge {
     let label = format!("{owner_key}:uses:{type_name}");
+    let (rel_line, rel_col) = scope_relative_edge_pos(absolute_anchor, scope_start_line);
     GraphEdge {
-        edge_id: edge_id_bytes("use", path, src_rid, &label, anchor),
+        edge_id: edge_id_bytes("use", path, src_rid, &label, rel_line, rel_col),
         ty: EdgeType::Uses,
         source_revision_id: src_rid,
         target_identity_id: tgt,
         resolution: ast_edge_resolution(),
-        anchor,
+        anchor: absolute_anchor,
     }
 }
 
@@ -572,6 +634,7 @@ pub(crate) fn attach_import_and_call_edges(
 ) -> HashMap<NodeRevisionId, Vec<GraphEdge>> {
     let mut edge_map: HashMap<NodeRevisionId, Vec<GraphEdge>> = HashMap::new();
     let file_hub_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "$file"));
+    let file_scope = file_hub_scope_start(index);
     for imp in &index.imports {
         let Some(tp) = resolve_module_path(&imp.module, mod_map) else {
             continue;
@@ -588,6 +651,7 @@ pub(crate) fn attach_import_and_call_edges(
                     path,
                     &imp.module,
                     imp.span,
+                    file_scope,
                 ));
             }
             ImportStyle::Names => {
@@ -601,6 +665,7 @@ pub(crate) fn attach_import_and_call_edges(
                         path,
                         &label,
                         imp.span,
+                        file_scope,
                     ));
                 }
             }
@@ -609,6 +674,7 @@ pub(crate) fn attach_import_and_call_edges(
     for ext in &index.extends {
         let class_ikey = identity_key_for_class(index, &ext.class_stable_key);
         let class_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &class_ikey));
+        let class_scope = scope_start_line_for_key(index, &ext.class_stable_key);
         if let Some(tiid) = resolve_type_name_to_identity(
             path,
             branch,
@@ -625,12 +691,14 @@ pub(crate) fn attach_import_and_call_edges(
                 &ext.class_stable_key,
                 &ext.base_name,
                 ext.span,
+                class_scope,
             ));
         }
     }
     for u in &index.uses {
         let owner_ikey = identity_key_for_owner(index, &u.owner_stable_key);
         let owner_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &owner_ikey));
+        let owner_scope = scope_start_line_for_key(index, &u.owner_stable_key);
         if let Some(tiid) = resolve_type_name_to_identity(
             path,
             branch,
@@ -647,12 +715,14 @@ pub(crate) fn attach_import_and_call_edges(
                 &u.owner_stable_key,
                 &u.type_name,
                 u.span,
+                owner_scope,
             ));
         }
     }
     for call in &index.calls {
         let caller_ikey = identity_key_for_owner(index, &call.caller_stable_key);
         let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &caller_ikey));
+        let caller_scope = scope_start_line_for_key(index, &call.caller_stable_key);
         if let Some(tiid) = resolve_call_target(
             path,
             branch,
@@ -669,6 +739,7 @@ pub(crate) fn attach_import_and_call_edges(
                 path,
                 &label,
                 call.span,
+                caller_scope,
             ));
         }
     }
@@ -904,6 +975,7 @@ mod tests {
         let branch = BranchId([0u8; 16]);
         let path = "main.py";
         let caller_sk = "foo";
+        let scope_start = 5;
         let span_a = SourceSpan {
             start_line: 10,
             start_col: 4,
@@ -918,9 +990,180 @@ mod tests {
         };
         let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, caller_sk));
         let target = IdentityId(stable_id_bytes("id", path, "bar"));
-        let e1 = call_edge(caller_rid, target, path, "foo->bar", span_a);
-        let e2 = call_edge(caller_rid, target, path, "foo->bar", span_b);
+        let e1 = call_edge(caller_rid, target, path, "foo->bar", span_a, scope_start);
+        let e2 = call_edge(caller_rid, target, path, "foo->bar", span_b, scope_start);
         assert_ne!(e1.edge_id, e2.edge_id);
+        // Display anchors remain file-absolute.
+        assert_eq!(e1.anchor.start_line, 10);
+        assert_eq!(e2.anchor.start_line, 20);
+    }
+
+    #[test]
+    fn edge_id_stable_when_absolute_lines_shift_but_relative_pos_unchanged() {
+        let branch = BranchId([0u8; 16]);
+        let path = "main.py";
+        let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "run"));
+        let target = IdentityId(stable_id_bytes("id", path, "helper"));
+        // Inserting 3 lines above the function shifts absolute lines, not relative.
+        let before = call_edge(
+            caller_rid,
+            target,
+            path,
+            "run->helper",
+            SourceSpan {
+                start_line: 12,
+                start_col: 4,
+                end_line: 12,
+                end_col: 10,
+            },
+            10, // function starts at line 10 → relative line 2
+        );
+        let after = call_edge(
+            caller_rid,
+            target,
+            path,
+            "run->helper",
+            SourceSpan {
+                start_line: 15,
+                start_col: 4,
+                end_line: 15,
+                end_col: 10,
+            },
+            13, // function now starts at line 13 → relative line still 2
+        );
+        assert_eq!(before.edge_id, after.edge_id);
+        assert_eq!(before.anchor.start_line, 12);
+        assert_eq!(after.anchor.start_line, 15);
+    }
+
+    #[test]
+    fn edge_id_changes_when_relative_position_inside_scope_changes() {
+        let branch = BranchId([0u8; 16]);
+        let path = "main.py";
+        let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "run"));
+        let target = IdentityId(stable_id_bytes("id", path, "helper"));
+        let scope = 10;
+        let early = call_edge(
+            caller_rid,
+            target,
+            path,
+            "run->helper",
+            SourceSpan {
+                start_line: 12,
+                start_col: 4,
+                end_line: 12,
+                end_col: 10,
+            },
+            scope,
+        );
+        let later = call_edge(
+            caller_rid,
+            target,
+            path,
+            "run->helper",
+            SourceSpan {
+                start_line: 14,
+                start_col: 4,
+                end_line: 14,
+                end_col: 10,
+            },
+            scope,
+        );
+        assert_ne!(early.edge_id, later.edge_id);
+    }
+
+    #[test]
+    fn attach_edges_uses_caller_scope_relative_edge_ids() {
+        let branch = BranchId([0u8; 16]);
+        let path = "main.py";
+        let mut mod_map = HashMap::new();
+        mod_map.insert("helpers".to_string(), "helpers.py".to_string());
+
+        let mut helpers = FileIndex::default();
+        helpers.symbols.push(ParsedSymbol {
+            stable_key: "helper".to_string(),
+            disambiguator: String::new(),
+            qualified_name: "helpers.py::helper".into(),
+            kind: NodeKind::Function,
+            span: SourceSpan {
+                start_line: 1,
+                start_col: 1,
+                end_line: 2,
+                end_col: 1,
+            },
+        });
+
+        // Scenario A: helper call at absolute line 12, function starts at 10.
+        let mut index_a = FileIndex::default();
+        index_a.symbols.push(ParsedSymbol {
+            stable_key: "$file".into(),
+            disambiguator: String::new(),
+            qualified_name: path.into(),
+            kind: NodeKind::File,
+            span: SourceSpan {
+                start_line: 1,
+                start_col: 1,
+                end_line: 20,
+                end_col: 1,
+            },
+        });
+        index_a.symbols.push(ParsedSymbol {
+            stable_key: "run".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{path}::run"),
+            kind: NodeKind::Function,
+            span: SourceSpan {
+                start_line: 10,
+                start_col: 1,
+                end_line: 15,
+                end_col: 1,
+            },
+        });
+        index_a.imports.push(ParsedImport {
+            module: "helpers".into(),
+            style: ImportStyle::Names,
+            names: vec!["helper".into()],
+            span: SourceSpan {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 20,
+            },
+        });
+        index_a.calls.push(ParsedCall {
+            caller_stable_key: "run".into(),
+            callee: CallReceiver::bare("helper"),
+            span: SourceSpan {
+                start_line: 12,
+                start_col: 4,
+                end_line: 12,
+                end_col: 12,
+            },
+        });
+
+        // Scenario B: three blank lines inserted above `run` — absolute shift, same relative.
+        let mut index_b = index_a.clone();
+        index_b.symbols[1].span.start_line = 13;
+        index_b.symbols[1].span.end_line = 18;
+        index_b.calls[0].span.start_line = 15;
+        index_b.calls[0].span.end_line = 15;
+
+        let mut batch = HashMap::new();
+        batch.insert("helpers.py".to_string(), helpers);
+
+        let edges_a =
+            attach_import_and_call_edges(path, branch, &index_a, &mod_map, None, &batch);
+        let edges_b =
+            attach_import_and_call_edges(path, branch, &index_b, &mod_map, None, &batch);
+
+        let run_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "run"));
+        let a = edges_a.get(&run_rid).expect("call edges for run in A");
+        let b = edges_b.get(&run_rid).expect("call edges for run in B");
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a[0].edge_id, b[0].edge_id, "relative edge id must survive insert above fn");
+        assert_eq!(a[0].anchor.start_line, 12);
+        assert_eq!(b[0].anchor.start_line, 15);
     }
 
     #[test]

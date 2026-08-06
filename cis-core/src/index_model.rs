@@ -64,16 +64,37 @@ pub fn content_rev_id_bytes(
     stable_id_bytes("revgen", &tag, &format!("{path}\x1f{stable_key}\x1f{hex}"))
 }
 
-/// Stable edge id including source revision + anchor (Option B — restart-safe SQLite rows).
+/// Convert a file-absolute edge anchor into coordinates relative to the innermost owning
+/// scope (function / class / file hub).
+///
+/// `scope_start_line` is the 1-based start line of that scope. Relative line `0` is the
+/// first line of the scope. Column stays file-absolute (stable when lines are inserted
+/// *above* the scope). Unknown/`0` scope falls back to line `1` (module top).
+///
+/// Absolute display spans on [`crate::graph::GraphEdge::anchor`] are unchanged — only
+/// the hash input for [`edge_id_bytes`] uses these relative coordinates so edits in
+/// other functions do not reshuffle edge ids.
+pub(crate) fn scope_relative_edge_pos(anchor: SourceSpan, scope_start_line: u32) -> (u32, u32) {
+    let scope = if scope_start_line == 0 { 1 } else { scope_start_line };
+    let rel_line = anchor.start_line.saturating_sub(scope);
+    (rel_line, anchor.start_col)
+}
+
+/// Stable edge id including source revision + **scope-relative** anchor
+/// (Option B — restart-safe SQLite rows).
+///
+/// `relative_line` / `relative_col` come from [`scope_relative_edge_pos`], not from the
+/// file-absolute [`SourceSpan`] stored on the edge for display.
 pub(crate) fn edge_id_bytes(
     tag: &str,
     path: &str,
     src: NodeRevisionId,
     label: &str,
-    anchor: SourceSpan,
+    relative_line: u32,
+    relative_col: u32,
 ) -> [u8; 16] {
     let src_hex: String = src.0.iter().map(|b| format!("{:02x}", b)).collect();
-    let key = format!("{src_hex}:{label}:{}:{}", anchor.start_line, anchor.start_col);
+    let key = format!("{src_hex}:{label}:{relative_line}:{relative_col}");
     stable_id_bytes(tag, path, &key)
 }
 
@@ -84,8 +105,11 @@ pub fn identity_cas_semantic_hash(path: &str, stable_key: &str) -> [u8; 32] {
 }
 
 /// Structural BodyStore slot for a symbol (distinct from [`NodeRevision::body_hash`] content checksum).
-pub fn body_store_slot_key(path: &str, stable_key: &str) -> [u8; 32] {
-    hash32_key("bh", path, stable_key)
+///
+/// Callers must pass [`symbol_identity_key`] (or [`ParsedSymbol::identity_key`]), not bare
+/// `stable_key`, so colliding same-name symbols do not share a slot.
+pub fn body_store_slot_key(path: &str, identity_key: &str) -> [u8; 32] {
+    hash32_key("bh", path, identity_key)
 }
 
 /// ASCII Record Separator — never appears in Python/TS identifiers.
@@ -185,12 +209,61 @@ pub(crate) fn assign_collision_disambiguators(idx: &mut FileIndex) {
     }
 }
 
+/// After choosing which symbol keeps the empty disambiguator, tag every other symbol in
+/// the collision group uniquely (functions `fn:N`, classes `class`/`class:N`, …).
+fn reassign_group_around_bare(idx: &mut FileIndex, indices: &[usize], keep: usize) {
+    let mut classes = Vec::new();
+    let mut functions = Vec::new();
+    let mut others = Vec::new();
+    for &i in indices {
+        match idx.symbols[i].kind {
+            NodeKind::Class => classes.push(i),
+            NodeKind::Function => functions.push(i),
+            _ => others.push(i),
+        }
+    }
+    for &i in indices {
+        idx.symbols[i].disambiguator = String::new();
+    }
+    idx.symbols[keep].disambiguator = String::new();
+
+    let mut fn_i = 0usize;
+    for &i in &functions {
+        if i == keep {
+            continue;
+        }
+        idx.symbols[i].disambiguator = format!("fn:{fn_i}");
+        fn_i += 1;
+    }
+    let mut class_i = 0usize;
+    for &i in &classes {
+        if i == keep {
+            continue;
+        }
+        idx.symbols[i].disambiguator = if class_i == 0 {
+            "class".into()
+        } else {
+            format!("class:{class_i}")
+        };
+        class_i += 1;
+    }
+    let mut other_i = 0usize;
+    for &i in &others {
+        if i == keep {
+            continue;
+        }
+        idx.symbols[i].disambiguator = format!("other:{other_i}");
+        other_i += 1;
+    }
+}
+
 /// Reassign collision disambiguators so an existing bare identity slot keeps its kind.
 ///
 /// Default [`assign_collision_disambiguators`] always gives the last function the empty
 /// disambiguator. On re-ingest that remaps a pre-existing class at `id(path, "foo")` onto
 /// a new key. This pass checks the live graph: if the bare slot is already occupied by a
-/// different kind, that occupant keeps `""` and the displaced symbol gets a kind tag.
+/// different kind, that occupant keeps `""` and remaining symbols are re-tagged uniquely
+/// (so a three-way class+two-fn collision never produces two `fn:0` keys).
 pub(crate) fn stabilize_disambiguators(
     idx: &mut FileIndex,
     path: &str,
@@ -239,13 +312,7 @@ pub(crate) fn stabilize_disambiguators(
         else {
             continue;
         };
-        // Occupant of the bare slot keeps ""; displaced symbol gets a kind tag.
-        idx.symbols[keep].disambiguator = String::new();
-        idx.symbols[canon].disambiguator = match idx.symbols[canon].kind {
-            NodeKind::Function => "fn:0".into(),
-            NodeKind::Class => "class".into(),
-            _ => "other:0".into(),
-        };
+        reassign_group_around_bare(idx, &indices, keep);
     }
 }
 
@@ -415,6 +482,39 @@ mod tests {
             end_line: 1,
             end_col: 1,
         }
+    }
+
+    #[test]
+    fn scope_relative_edge_pos_is_zero_on_scope_start_line() {
+        let anchor = SourceSpan {
+            start_line: 10,
+            start_col: 4,
+            end_line: 10,
+            end_col: 8,
+        };
+        assert_eq!(scope_relative_edge_pos(anchor, 10), (0, 4));
+        assert_eq!(scope_relative_edge_pos(anchor, 8), (2, 4));
+    }
+
+    #[test]
+    fn scope_relative_edge_pos_unknown_scope_defaults_to_line_one() {
+        let anchor = SourceSpan {
+            start_line: 5,
+            start_col: 1,
+            end_line: 5,
+            end_col: 2,
+        };
+        assert_eq!(scope_relative_edge_pos(anchor, 0), (4, 1));
+    }
+
+    #[test]
+    fn edge_id_bytes_uses_relative_coordinates() {
+        let src = NodeRevisionId([1u8; 16]);
+        let a = edge_id_bytes("cal", "a.py", src, "f->g", 2, 4);
+        let b = edge_id_bytes("cal", "a.py", src, "f->g", 2, 4);
+        let c = edge_id_bytes("cal", "a.py", src, "f->g", 3, 4);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
@@ -624,5 +724,95 @@ mod tests {
         // Function already owns bare slot — leave default assignment alone.
         assert_eq!(func.disambiguator, "");
         assert_eq!(class.disambiguator, "class");
+    }
+
+    #[test]
+    fn stabilize_three_way_class_plus_two_fns_unique_keys() {
+        use cis_wal::{BranchId, IdentityId, NodeRevisionId};
+
+        use crate::graph::{
+            InMemoryGraph, Language, NodeIdentity, NodeRevision, RevisionStatus,
+        };
+
+        let path = "m.py";
+        let branch = BranchId([0u8; 16]);
+        let bare_iid = IdentityId(stable_id_bytes("id", path, "foo"));
+        let mut g = InMemoryGraph::default();
+        g.put_identity(NodeIdentity {
+            identity_id: bare_iid,
+            kind: NodeKind::Class,
+        });
+        let rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "foo"));
+        g.put_revision(NodeRevision {
+            revision_id: rid,
+            identity_id: bare_iid,
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: format!("{path}::foo"),
+            file_path: path.into(),
+            body_hash: [1u8; 32],
+            signature_hash: [1u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: span(),
+            tombstoned_at_ms: None,
+        });
+
+        let mut idx = FileIndex::default();
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{path}::foo"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        for _ in 0..2 {
+            idx.symbols.push(ParsedSymbol {
+                stable_key: "foo".into(),
+                disambiguator: String::new(),
+                qualified_name: format!("{path}::foo"),
+                kind: NodeKind::Function,
+                span: span(),
+            });
+        }
+        assign_collision_disambiguators(&mut idx);
+        // Default: last fn "", earlier fn "fn:0", class "class".
+        assert_eq!(
+            idx.symbols
+                .iter()
+                .find(|s| s.kind == NodeKind::Class)
+                .unwrap()
+                .disambiguator,
+            "class"
+        );
+        stabilize_disambiguators(&mut idx, path, branch, &g);
+
+        let class = idx.symbols.iter().find(|s| s.kind == NodeKind::Class).unwrap();
+        assert_eq!(class.disambiguator, "");
+        assert_eq!(class.identity_key(), "foo");
+
+        let fn_tags: Vec<_> = idx
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::Function)
+            .map(|s| s.disambiguator.as_str())
+            .collect();
+        assert_eq!(fn_tags.len(), 2);
+        assert!(fn_tags.iter().all(|t| t.starts_with("fn:")));
+        assert_ne!(fn_tags[0], fn_tags[1], "functions must not share a tag");
+
+        let ids: HashSet<_> = idx.symbols.iter().map(|s| s.identity_key()).collect();
+        assert_eq!(ids.len(), 3, "three-way collision must yield three identity keys");
+    }
+
+    #[test]
+    fn body_store_slot_key_distinct_for_disambiguated_symbols() {
+        let a = body_store_slot_key("m.py", &symbol_identity_key("foo", ""));
+        let b = body_store_slot_key("m.py", &symbol_identity_key("foo", "fn:0"));
+        let c = body_store_slot_key("m.py", &symbol_identity_key("foo", "class"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
     }
 }
