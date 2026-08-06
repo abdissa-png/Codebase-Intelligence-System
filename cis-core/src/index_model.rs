@@ -185,6 +185,70 @@ pub(crate) fn assign_collision_disambiguators(idx: &mut FileIndex) {
     }
 }
 
+/// Reassign collision disambiguators so an existing bare identity slot keeps its kind.
+///
+/// Default [`assign_collision_disambiguators`] always gives the last function the empty
+/// disambiguator. On re-ingest that remaps a pre-existing class at `id(path, "foo")` onto
+/// a new key. This pass checks the live graph: if the bare slot is already occupied by a
+/// different kind, that occupant keeps `""` and the displaced symbol gets a kind tag.
+pub(crate) fn stabilize_disambiguators(
+    idx: &mut FileIndex,
+    path: &str,
+    branch: BranchId,
+    graph: &crate::graph::InMemoryGraph,
+) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, s) in idx.symbols.iter().enumerate() {
+        if s.stable_key == "$file" {
+            continue;
+        }
+        groups.entry(s.stable_key.clone()).or_default().push(i);
+    }
+    for indices in groups.into_values() {
+        if indices.len() <= 1 {
+            continue;
+        }
+        let Some(canon) = indices
+            .iter()
+            .copied()
+            .find(|&i| idx.symbols[i].disambiguator.is_empty())
+        else {
+            continue;
+        };
+        let bare_key = idx.symbols[canon].stable_key.clone();
+        let bare_iid = cis_wal::IdentityId(stable_id_bytes("id", path, &bare_key));
+        let Some(prev) = graph.primary_revision_for_identity(branch, bare_iid) else {
+            continue;
+        };
+        if !matches!(
+            prev.status,
+            crate::graph::RevisionStatus::Active | crate::graph::RevisionStatus::Speculative
+        ) {
+            continue;
+        }
+        let Some(old_kind) = graph.identity_kind(bare_iid) else {
+            continue;
+        };
+        if old_kind == idx.symbols[canon].kind {
+            continue;
+        }
+        let Some(keep) = indices
+            .iter()
+            .copied()
+            .find(|&i| i != canon && idx.symbols[i].kind == old_kind)
+        else {
+            continue;
+        };
+        // Occupant of the bare slot keeps ""; displaced symbol gets a kind tag.
+        idx.symbols[keep].disambiguator = String::new();
+        idx.symbols[canon].disambiguator = match idx.symbols[canon].kind {
+            NodeKind::Function => "fn:0".into(),
+            NodeKind::Class => "class".into(),
+            _ => "other:0".into(),
+        };
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImportStyle {
     /// `import module` — no bare-name re-exports into scope.
@@ -437,5 +501,128 @@ mod tests {
         let ids: HashSet<_> = idx.symbols.iter().map(|s| s.identity_key()).collect();
         assert_eq!(ids.len(), 3);
         assert!(idx.symbols.iter().all(|s| s.qualified_name == "m.py::foo"));
+    }
+
+    #[test]
+    fn stabilize_keeps_existing_class_on_bare_slot() {
+        use cis_wal::{BranchId, IdentityId, NodeRevisionId};
+
+        use crate::graph::{
+            InMemoryGraph, Language, NodeIdentity, NodeRevision, RevisionStatus,
+        };
+
+        let path = "m.py";
+        let branch = BranchId([0u8; 16]);
+        let bare_iid = IdentityId(stable_id_bytes("id", path, "foo"));
+        let mut g = InMemoryGraph::default();
+        g.put_identity(NodeIdentity {
+            identity_id: bare_iid,
+            kind: NodeKind::Class,
+        });
+        let rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "foo"));
+        g.put_revision(NodeRevision {
+            revision_id: rid,
+            identity_id: bare_iid,
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: format!("{path}::foo"),
+            file_path: path.into(),
+            body_hash: [1u8; 32],
+            signature_hash: [1u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: span(),
+            tombstoned_at_ms: None,
+        });
+
+        let mut idx = FileIndex::default();
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{path}::foo"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{path}::foo"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        assign_collision_disambiguators(&mut idx);
+        assert_eq!(
+            idx.symbols
+                .iter()
+                .find(|s| s.kind == NodeKind::Function)
+                .unwrap()
+                .disambiguator,
+            ""
+        );
+        stabilize_disambiguators(&mut idx, path, branch, &g);
+        let class = idx.symbols.iter().find(|s| s.kind == NodeKind::Class).unwrap();
+        let func = idx.symbols.iter().find(|s| s.kind == NodeKind::Function).unwrap();
+        assert_eq!(class.disambiguator, "");
+        assert_eq!(func.disambiguator, "fn:0");
+        assert_eq!(class.identity_key(), "foo");
+        assert_eq!(func.identity_key(), symbol_identity_key("foo", "fn:0"));
+    }
+
+    #[test]
+    fn stabilize_noop_when_bare_slot_already_matches_function() {
+        use cis_wal::{BranchId, IdentityId, NodeRevisionId};
+
+        use crate::graph::{
+            InMemoryGraph, Language, NodeIdentity, NodeRevision, RevisionStatus,
+        };
+
+        let path = "m.py";
+        let branch = BranchId([0u8; 16]);
+        let bare_iid = IdentityId(stable_id_bytes("id", path, "foo"));
+        let mut g = InMemoryGraph::default();
+        g.put_identity(NodeIdentity {
+            identity_id: bare_iid,
+            kind: NodeKind::Function,
+        });
+        let rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "foo"));
+        g.put_revision(NodeRevision {
+            revision_id: rid,
+            identity_id: bare_iid,
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: format!("{path}::foo"),
+            file_path: path.into(),
+            body_hash: [1u8; 32],
+            signature_hash: [1u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: span(),
+            tombstoned_at_ms: None,
+        });
+
+        let mut idx = FileIndex::default();
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{path}::foo"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{path}::foo"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        assign_collision_disambiguators(&mut idx);
+        stabilize_disambiguators(&mut idx, path, branch, &g);
+        let class = idx.symbols.iter().find(|s| s.kind == NodeKind::Class).unwrap();
+        let func = idx.symbols.iter().find(|s| s.kind == NodeKind::Function).unwrap();
+        // Function already owns bare slot — leave default assignment alone.
+        assert_eq!(func.disambiguator, "");
+        assert_eq!(class.disambiguator, "class");
     }
 }

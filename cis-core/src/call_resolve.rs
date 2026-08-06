@@ -212,47 +212,56 @@ pub(crate) fn resolve_member_in_module(
 
 pub(crate) fn resolve_symbol_in_file_index(path: &str, simple_name: &str, index: &FileIndex) -> Option<IdentityId> {
     let exact = format!("{path}::{simple_name}");
-    // Prefer canonical (empty disambiguator) when multiple symbols share a name.
-    let mut fallback: Option<IdentityId> = None;
+    // Prefer Function (call/runtime target), then canonical empty disambiguator, then any.
+    let mut best_fn_empty: Option<IdentityId> = None;
+    let mut best_fn: Option<IdentityId> = None;
+    let mut best_empty: Option<IdentityId> = None;
+    let mut best_any: Option<IdentityId> = None;
     for sym in &index.symbols {
-        if sym.qualified_name != exact {
+        let name_match = sym.qualified_name == exact
+            || ((sym.kind == NodeKind::Function || sym.kind == NodeKind::Class)
+                && (sym.stable_key == simple_name
+                    || sym.stable_key.ends_with(&format!(".{simple_name}"))));
+        if !name_match {
             continue;
         }
         let id = IdentityId(stable_id_bytes("id", path, &sym.identity_key()));
-        if sym.disambiguator.is_empty() {
-            return Some(id);
-        }
-        if fallback.is_none() {
-            fallback = Some(id);
-        }
-    }
-    if let Some(id) = fallback {
-        return Some(id);
-    }
-    for sym in &index.symbols {
-        if sym.kind != NodeKind::Function && sym.kind != NodeKind::Class {
-            continue;
-        }
-        if sym.stable_key == simple_name || sym.stable_key.ends_with(&format!(".{simple_name}")) {
-            let id = IdentityId(stable_id_bytes("id", path, &sym.identity_key()));
-            if sym.disambiguator.is_empty() {
-                return Some(id);
-            }
-            if fallback.is_none() {
-                fallback = Some(id);
-            }
+        if sym.kind == NodeKind::Function && sym.disambiguator.is_empty() {
+            best_fn_empty.get_or_insert(id);
+        } else if sym.kind == NodeKind::Function {
+            best_fn.get_or_insert(id);
+        } else if sym.disambiguator.is_empty() {
+            best_empty.get_or_insert(id);
+        } else {
+            best_any.get_or_insert(id);
         }
     }
-    fallback
+    best_fn_empty.or(best_fn).or(best_empty).or(best_any)
 }
 
-/// Revision / identity hash key for a symbol looked up by display `stable_key`.
-/// Prefers the canonical (empty disambiguator) entry.
+/// Revision / identity hash key for a function (calls / uses owners).
+/// Prefers Function symbols so class+function collisions attach edges to the def.
 fn identity_key_for_owner(index: &FileIndex, stable_key: &str) -> String {
     index
         .symbols
         .iter()
-        .find(|s| s.stable_key == stable_key && s.disambiguator.is_empty())
+        .find(|s| {
+            s.kind == NodeKind::Function
+                && s.stable_key == stable_key
+                && s.disambiguator.is_empty()
+        })
+        .or_else(|| {
+            index
+                .symbols
+                .iter()
+                .find(|s| s.kind == NodeKind::Function && s.stable_key == stable_key)
+        })
+        .or_else(|| {
+            index
+                .symbols
+                .iter()
+                .find(|s| s.stable_key == stable_key && s.disambiguator.is_empty())
+        })
         .or_else(|| index.symbols.iter().find(|s| s.stable_key == stable_key))
         .map(|s| s.identity_key())
         .unwrap_or_else(|| stable_key.to_string())
@@ -283,7 +292,10 @@ pub(crate) fn resolve_symbol_in_graph(
 ) -> Option<IdentityId> {
     let exact = format!("{file_path}::{simple_name}");
     let canonical = IdentityId(stable_id_bytes("id", file_path, simple_name));
-    let mut fallback: Option<IdentityId> = None;
+    let mut best_fn_canon: Option<IdentityId> = None;
+    let mut best_fn: Option<IdentityId> = None;
+    let mut best_canon: Option<IdentityId> = None;
+    let mut best_any: Option<IdentityId> = None;
     for r in graph.revisions() {
         if r.branch_id != branch || r.file_path != file_path {
             continue;
@@ -291,35 +303,23 @@ pub(crate) fn resolve_symbol_in_graph(
         if !matches!(r.status, RevisionStatus::Active) {
             continue;
         }
-        if r.qualified_name == exact {
-            if r.identity_id == canonical {
-                return Some(r.identity_id);
-            }
-            if fallback.is_none() {
-                fallback = Some(r.identity_id);
-            }
-        }
-    }
-    if let Some(id) = fallback {
-        return Some(id);
-    }
-    for r in graph.revisions() {
-        if r.branch_id != branch || r.file_path != file_path {
+        let name_match = r.qualified_name == exact
+            || r.qualified_name.ends_with(&format!(".{simple_name}"));
+        if !name_match {
             continue;
         }
-        if !matches!(r.status, RevisionStatus::Active) {
-            continue;
-        }
-        if r.qualified_name.ends_with(&format!(".{simple_name}")) {
-            if r.identity_id == canonical {
-                return Some(r.identity_id);
-            }
-            if fallback.is_none() {
-                fallback = Some(r.identity_id);
-            }
+        let is_fn = graph.identity_kind(r.identity_id) == Some(NodeKind::Function);
+        if is_fn && r.identity_id == canonical {
+            best_fn_canon.get_or_insert(r.identity_id);
+        } else if is_fn {
+            best_fn.get_or_insert(r.identity_id);
+        } else if r.identity_id == canonical {
+            best_canon.get_or_insert(r.identity_id);
+        } else {
+            best_any.get_or_insert(r.identity_id);
         }
     }
-    fallback
+    best_fn_canon.or(best_fn).or(best_canon).or(best_any)
 }
 
 pub(crate) fn resolve_symbol_in_module(
@@ -750,9 +750,12 @@ pub fn regen_edges_for_file_with_graph(
 ) -> Result<HashMap<NodeRevisionId, Vec<GraphEdge>>, &'static str> {
     let indexer = crate::language_indexer::indexer_for_path(path, indexers)
         .ok_or("unsupported language")?;
-    let index = indexer
+    let mut index = indexer
         .index_file(path, content)
         .map_err(|_| "parse failed")?;
+    if let Some(g) = graph {
+        crate::index_model::stabilize_disambiguators(&mut index, path, branch, g);
+    }
     let mut batch_indexes = HashMap::new();
     batch_indexes.insert(path.to_string(), index.clone());
     Ok(attach_import_and_call_edges(

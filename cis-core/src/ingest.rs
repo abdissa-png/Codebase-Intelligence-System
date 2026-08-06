@@ -21,6 +21,7 @@ use crate::identity_resolution::{
 };
 use crate::identity_resolver::IdentityResolver;
 use crate::index_model::hash32_key;
+use crate::index_model::stabilize_disambiguators;
 use crate::language_indexer::{default_indexers, indexer_for_path};
 use crate::merge_lock::merge_lock_holder;
 use crate::python_indexer::index_python_file;
@@ -208,6 +209,11 @@ pub fn apply_index_events_with_config(
         }
         if let Ok(content) = read_file(&ev.path) {
             if let Ok(idx) = indexer.index_file(&ev.path, &content) {
+                let mut idx = idx;
+                {
+                    let g = coord.graph().read();
+                    stabilize_disambiguators(&mut idx, &ev.path, ev.branch_id, &g);
+                }
                 batch_indexes.insert(ev.path.clone(), idx);
             }
         }
@@ -294,8 +300,14 @@ pub fn apply_index_events_with_config(
             rep.skipped_empty_py += 1;
             continue;
         }
+        let mut index = index;
         let lang = indexer.language();
         let branch = ev.branch_id;
+        {
+            let g = coord.graph().read();
+            stabilize_disambiguators(&mut index, &ev.path, branch, &g);
+        }
+        batch_indexes.insert(ev.path.clone(), index.clone());
         let revs: Vec<NodeRevisionId> = index
             .symbols
             .iter()
@@ -304,7 +316,7 @@ pub fn apply_index_events_with_config(
         let set = GraphMutationSet::new(revs.clone(), content_checksum_32(&content));
         let id = coord.begin_mutation(&set)?;
         let path = ev.path.clone();
-        let index_c = index.clone();
+        let index_c = index;
         let mod_map = module_to_path.clone();
         let path_c = path.clone();
         let file_content = content.clone();
@@ -1223,6 +1235,84 @@ mod tests {
             })
             .collect();
         assert_eq!(hits.len(), 2);
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn ingest_class_first_then_function_keeps_class_identity() {
+        use cis_wal::MutationLog;
+
+        use crate::coordinator::WriteCoordinator;
+        use crate::index_model::symbol_identity_key;
+        use crate::saga::MergeSagaOrchestrator;
+        use crate::MemoryKv;
+
+        let wal: Arc<dyn cis_wal::MutationLogStore> = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(Arc::clone(&wal));
+        let kv = Arc::new(MemoryKv::new());
+        let saga = MergeSagaOrchestrator::new(Arc::new(MemoryKv::new()));
+        let _ = coord.reconcile_on_startup(&saga);
+        let branch = BranchId([0u8; 16]);
+        let path = "class_first.py";
+        let q = IndexEventQueue::new();
+
+        let apply = |src: &str| {
+            let events = vec![IndexEvent {
+                branch_id: branch,
+                path: path.into(),
+                kind: FsChangeKind::Modified,
+                old_path: None,
+            }];
+            let s = src.to_string();
+            apply_index_events(
+                &q,
+                &coord,
+                Arc::clone(&kv),
+                events,
+                move |_p| Ok(s.clone()),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        apply("class foo:\n    pass\n");
+        let iid_class_bare =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "")));
+        {
+            let g = coord.graph().read();
+            let rev = g
+                .primary_revision_for_identity(branch, iid_class_bare)
+                .expect("class on bare slot");
+            assert_eq!(g.identity_kind(iid_class_bare), Some(NodeKind::Class));
+            assert!(matches!(rev.status, RevisionStatus::Active));
+        }
+
+        apply("class foo:\n    pass\n\ndef foo():\n    return 1\n");
+        let iid_fn =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "fn:0")));
+        {
+            let g = coord.graph().read();
+            // Class keeps the original bare identity — not remapped/tombstoned.
+            let class_rev = g
+                .primary_revision_for_identity(branch, iid_class_bare)
+                .expect("class still on bare slot");
+            assert_eq!(g.identity_kind(iid_class_bare), Some(NodeKind::Class));
+            assert!(matches!(class_rev.status, RevisionStatus::Active));
+            let fn_rev = g
+                .primary_revision_for_identity(branch, iid_fn)
+                .expect("function on fn:0 slot");
+            assert_eq!(g.identity_kind(iid_fn), Some(NodeKind::Function));
+            assert!(matches!(fn_rev.status, RevisionStatus::Active));
+            // Default assignment would have given function the bare slot — must not.
+            let wrong_fn_bare =
+                IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "")));
+            assert_eq!(
+                g.identity_kind(wrong_fn_bare),
+                Some(NodeKind::Class),
+                "bare slot must remain the class"
+            );
+        }
     }
 
     #[test]
