@@ -1,6 +1,6 @@
 //! Language-neutral index types, span helpers, and stable id material for ingest.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cis_wal::{BranchId, NodeRevisionId};
 
@@ -88,12 +88,101 @@ pub fn body_store_slot_key(path: &str, stable_key: &str) -> [u8; 32] {
     hash32_key("bh", path, stable_key)
 }
 
+/// ASCII Record Separator — never appears in Python/TS identifiers.
+const IDENTITY_KEY_SEP: char = '\u{001e}';
+
+/// Identity / revision hash material for a symbol.
+///
+/// When `disambiguator` is empty (the common case), this equals `stable_key` so existing
+/// graphs keep stable ids. Colliding same-name symbols (overloads, class+function) get a
+/// non-empty disambiguator so each receives a distinct identity while `qualified_name`
+/// stays human-readable for MCP search.
+pub fn symbol_identity_key(stable_key: &str, disambiguator: &str) -> String {
+    if disambiguator.is_empty() {
+        stable_key.to_string()
+    } else {
+        format!("{stable_key}{IDENTITY_KEY_SEP}{disambiguator}")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedSymbol {
+    /// Intra-file display / search name (e.g. `"Board.get_position"`, `"$file"`).
     pub(crate) stable_key: String,
+    /// Empty unless [`assign_collision_disambiguators`] found a same-`stable_key` collision.
+    pub(crate) disambiguator: String,
     pub(crate) qualified_name: String,
     pub(crate) kind: NodeKind,
     pub(crate) span: SourceSpan,
+}
+
+impl ParsedSymbol {
+    pub(crate) fn identity_key(&self) -> String {
+        symbol_identity_key(&self.stable_key, &self.disambiguator)
+    }
+}
+
+/// Assign disambiguators only when multiple symbols share a `stable_key` in one file.
+///
+/// - Last function keeps an empty disambiguator (Python last-definition / overload impl).
+/// - Earlier colliding functions get `fn:0`, `fn:1`, …
+/// - Colliding classes get `class` / `class:N`.
+/// - Non-colliding symbols are left untouched (backward-compatible identity keys).
+pub(crate) fn assign_collision_disambiguators(idx: &mut FileIndex) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, s) in idx.symbols.iter().enumerate() {
+        if s.stable_key == "$file" {
+            continue;
+        }
+        groups.entry(s.stable_key.clone()).or_default().push(i);
+    }
+    for indices in groups.into_values() {
+        if indices.len() <= 1 {
+            continue;
+        }
+        let mut classes = Vec::new();
+        let mut functions = Vec::new();
+        let mut others = Vec::new();
+        for &i in &indices {
+            match idx.symbols[i].kind {
+                NodeKind::Class => classes.push(i),
+                NodeKind::Function => functions.push(i),
+                _ => others.push(i),
+            }
+        }
+
+        if !functions.is_empty() {
+            for (ci, &i) in classes.iter().enumerate() {
+                idx.symbols[i].disambiguator = if ci == 0 {
+                    "class".into()
+                } else {
+                    format!("class:{ci}")
+                };
+            }
+            let last_fn = *functions.last().unwrap();
+            for (fi, &i) in functions.iter().enumerate() {
+                idx.symbols[i].disambiguator = if i == last_fn {
+                    String::new()
+                } else {
+                    format!("fn:{fi}")
+                };
+            }
+        } else if classes.len() > 1 {
+            for (ci, &i) in classes.iter().enumerate() {
+                idx.symbols[i].disambiguator = if ci == 0 {
+                    String::new()
+                } else {
+                    format!("class:{ci}")
+                };
+            }
+        } else if classes.len() == 1 {
+            idx.symbols[classes[0]].disambiguator = "class".into();
+        }
+
+        for (oi, &i) in others.iter().enumerate() {
+            idx.symbols[i].disambiguator = format!("other:{oi}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,5 +335,107 @@ pub(crate) fn span_from_tree_sitter_node(node: tree_sitter::Node) -> SourceSpan 
         start_col: start.column as u32 + 1,
         end_line: end.row as u32 + 1,
         end_col: end.column as u32 + 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::NodeKind;
+    use crate::graph::SourceSpan;
+
+    fn span() -> SourceSpan {
+        SourceSpan {
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 1,
+        }
+    }
+
+    #[test]
+    fn symbol_identity_key_empty_disambiguator_is_stable_key() {
+        assert_eq!(symbol_identity_key("foo", ""), "foo");
+        assert_eq!(symbol_identity_key("Board.get", ""), "Board.get");
+    }
+
+    #[test]
+    fn symbol_identity_key_joins_with_record_separator() {
+        let k = symbol_identity_key("foo", "class");
+        assert!(k.starts_with("foo"));
+        assert!(k.contains('\u{001e}'));
+        assert!(k.ends_with("class"));
+        assert_ne!(k, "foo");
+    }
+
+    #[test]
+    fn assign_disambiguators_leaves_unique_names_alone() {
+        let mut idx = FileIndex::default();
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: "m.py::foo".into(),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "bar".into(),
+            disambiguator: String::new(),
+            qualified_name: "m.py::bar".into(),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        assign_collision_disambiguators(&mut idx);
+        assert!(idx.symbols.iter().all(|s| s.disambiguator.is_empty()));
+    }
+
+    #[test]
+    fn assign_disambiguators_class_and_function_same_name() {
+        let mut idx = FileIndex::default();
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: "m.py::foo".into(),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        idx.symbols.push(ParsedSymbol {
+            stable_key: "foo".into(),
+            disambiguator: String::new(),
+            qualified_name: "m.py::foo".into(),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        assign_collision_disambiguators(&mut idx);
+        let class = idx.symbols.iter().find(|s| s.kind == NodeKind::Class).unwrap();
+        let func = idx.symbols.iter().find(|s| s.kind == NodeKind::Function).unwrap();
+        assert_eq!(class.disambiguator, "class");
+        assert_eq!(func.disambiguator, "");
+        assert_ne!(class.identity_key(), func.identity_key());
+        assert_eq!(class.qualified_name, func.qualified_name);
+    }
+
+    #[test]
+    fn assign_disambiguators_overload_style_last_fn_canonical() {
+        let mut idx = FileIndex::default();
+        for _ in 0..3 {
+            idx.symbols.push(ParsedSymbol {
+                stable_key: "foo".into(),
+                disambiguator: String::new(),
+                qualified_name: "m.py::foo".into(),
+                kind: NodeKind::Function,
+                span: span(),
+            });
+        }
+        assign_collision_disambiguators(&mut idx);
+        let keys: Vec<_> = idx
+            .symbols
+            .iter()
+            .map(|s| s.disambiguator.as_str())
+            .collect();
+        assert_eq!(keys, vec!["fn:0", "fn:1", ""]);
+        let ids: HashSet<_> = idx.symbols.iter().map(|s| s.identity_key()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(idx.symbols.iter().all(|s| s.qualified_name == "m.py::foo"));
     }
 }

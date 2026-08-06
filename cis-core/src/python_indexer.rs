@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use crate::graph::NodeKind;
 
 use crate::index_model::{
-    CallReceiver, FileIndex, ImportStyle, ParsedCall, ParsedExtends, ParsedImport, ParsedSymbol,
-    ParsedUse, span_from_byte_range, whole_file_span,
+    assign_collision_disambiguators, CallReceiver, FileIndex, ImportStyle, ParsedCall,
+    ParsedExtends, ParsedImport, ParsedSymbol, ParsedUse, span_from_byte_range, whole_file_span,
 };
 
 /// Map `dir/Mod.py` → `dir.Mod` for **`from X import …`** resolution.
@@ -72,6 +72,7 @@ fn extract_python_file_index_regex(path: &str, content: &str) -> Result<FileInde
     let mut idx = FileIndex::default();
     idx.symbols.push(ParsedSymbol {
         stable_key: "$file".into(),
+        disambiguator: String::new(),
         qualified_name: path.to_string(),
         kind: NodeKind::File,
         span: whole_file_span(content),
@@ -83,6 +84,7 @@ fn extract_python_file_index_regex(path: &str, content: &str) -> Result<FileInde
             let n = m.as_str().to_string();
             idx.symbols.push(ParsedSymbol {
                 stable_key: n.clone(),
+                disambiguator: String::new(),
                 qualified_name: format!("{path}::{n}"),
                 kind: NodeKind::Function,
                 span: span_from_byte_range(content, full.start(), full.end()),
@@ -92,6 +94,7 @@ fn extract_python_file_index_regex(path: &str, content: &str) -> Result<FileInde
     idx.imports = extract_imports_regex(content);
     idx.calls = extract_calls_regex_top_level(path, content, &idx.symbols);
     idx.calls.extend(extract_calls_regex_module_level(content));
+    assign_collision_disambiguators(&mut idx);
     Ok(idx)
 }
 
@@ -244,6 +247,7 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
     let mut idx = FileIndex::default();
     idx.symbols.push(ParsedSymbol {
         stable_key: "$file".into(),
+        disambiguator: String::new(),
         qualified_name: path.to_string(),
         kind: NodeKind::File,
         span: whole_file_span(content),
@@ -605,6 +609,7 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
                 let stable = cls.join(".");
                 idx.symbols.push(ParsedSymbol {
                     stable_key: stable.clone(),
+                    disambiguator: String::new(),
                     qualified_name: format!("{path}::{stable}"),
                     kind: NodeKind::Class,
                     span: span_from_tree_sitter_node(node),
@@ -646,6 +651,7 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
                 let qn = format!("{path}::{stable}");
                 idx.symbols.push(ParsedSymbol {
                     stable_key: stable.clone(),
+                    disambiguator: String::new(),
                     qualified_name: qn,
                     kind: NodeKind::Function,
                     span: span_from_tree_sitter_node(node),
@@ -677,6 +683,7 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
     visit(root, content, path, &mut Vec::new(), &mut idx);
     visit_module_level_calls(root, content, &mut idx.calls, &mut idx.uses);
     idx.imports = extract_imports_regex(content);
+    assign_collision_disambiguators(&mut idx);
     Ok(idx)
 }
 
@@ -703,4 +710,55 @@ pub fn extract_python_top_level_defs(src: &str) -> Result<Vec<String>, &'static 
         .filter(|s| s.kind == NodeKind::Function && !s.stable_key.contains('.'))
         .map(|s| s.stable_key.clone())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index_model::symbol_identity_key;
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn indexer_disambiguates_class_and_function_same_name() {
+        let src = "class foo:\n    pass\n\ndef foo():\n    return 1\n";
+        let idx = index_python_file("m.py", src).unwrap();
+        let classes: Vec<_> = idx
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::Class && s.stable_key == "foo")
+            .collect();
+        let funcs: Vec<_> = idx
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::Function && s.stable_key == "foo")
+            .collect();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(classes[0].disambiguator, "class");
+        assert_eq!(funcs[0].disambiguator, "");
+        assert_eq!(classes[0].qualified_name, "m.py::foo");
+        assert_eq!(funcs[0].qualified_name, "m.py::foo");
+        assert_ne!(classes[0].identity_key(), funcs[0].identity_key());
+        assert_eq!(funcs[0].identity_key(), symbol_identity_key("foo", ""));
+        assert_eq!(classes[0].identity_key(), symbol_identity_key("foo", "class"));
+    }
+
+    #[test]
+    fn indexer_disambiguates_duplicate_function_defs() {
+        let src = "def foo(x: int):\n    ...\n\ndef foo(x: str):\n    ...\n\ndef foo(x):\n    return x\n";
+        let idx = index_python_file("m.py", src).unwrap();
+        let foos: Vec<_> = idx
+            .symbols
+            .iter()
+            .filter(|s| s.kind == NodeKind::Function && s.stable_key == "foo")
+            .collect();
+        assert_eq!(foos.len(), 3);
+        assert_eq!(foos[0].disambiguator, "fn:0");
+        assert_eq!(foos[1].disambiguator, "fn:1");
+        assert_eq!(foos[2].disambiguator, "");
+        let keys: std::collections::HashSet<_> =
+            foos.iter().map(|s| s.identity_key()).collect();
+        assert_eq!(keys.len(), 3);
+        assert!(foos.iter().all(|s| s.qualified_name == "m.py::foo"));
+    }
 }

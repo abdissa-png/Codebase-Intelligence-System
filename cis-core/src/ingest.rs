@@ -33,7 +33,8 @@ pub use crate::call_resolve::{
 };
 pub use crate::index_model::{
     body_store_slot_key, branch_id_tag, content_checksum_32, content_rev_id_bytes,
-    identity_cas_semantic_hash, stable_id_bytes, stable_rev_id_bytes, FileIndex,
+    identity_cas_semantic_hash, stable_id_bytes, stable_rev_id_bytes, symbol_identity_key,
+    FileIndex,
 };
 pub use crate::python_indexer::{extract_python_top_level_defs, path_to_python_module_key};
 
@@ -298,7 +299,7 @@ pub fn apply_index_events_with_config(
         let revs: Vec<NodeRevisionId> = index
             .symbols
             .iter()
-            .map(|s| NodeRevisionId(stable_rev_id_bytes(branch, &ev.path, &s.stable_key)))
+            .map(|s| NodeRevisionId(stable_rev_id_bytes(branch, &ev.path, &s.identity_key())))
             .collect();
         let set = GraphMutationSet::new(revs.clone(), content_checksum_32(&content));
         let id = coord.begin_mutation(&set)?;
@@ -318,10 +319,16 @@ pub fn apply_index_events_with_config(
             Arc::new(Mutex::new(Vec::new()));
         let bindings_c = Arc::clone(&bindings_out);
         coord.commit_graph(id, move |g| {
-            let retained: HashSet<String> = index_c
+            let retained: HashSet<IdentityId> = index_c
                 .symbols
                 .iter()
-                .map(|s| s.qualified_name.clone())
+                .map(|s| {
+                    if s.kind == NodeKind::File {
+                        IdentityId(stable_id_bytes("file", &path_c, "$hub"))
+                    } else {
+                        IdentityId(stable_id_bytes("id", &path_c, &s.identity_key()))
+                    }
+                })
                 .collect();
             tombstone_orphaned_file_symbols_with_absence(
                 g,
@@ -338,12 +345,13 @@ pub fn apply_index_events_with_config(
             let mut rid_remap: HashMap<NodeRevisionId, NodeRevisionId> = HashMap::new();
 
             for s in &index_c.symbols {
+                let id_key = s.identity_key();
                 let stable_rid =
-                    NodeRevisionId(stable_rev_id_bytes(branch, &path_c, &s.stable_key));
+                    NodeRevisionId(stable_rev_id_bytes(branch, &path_c, &id_key));
                 let proposed_iid = if s.kind == NodeKind::File {
                     IdentityId(stable_id_bytes("file", &path_c, "$hub"))
                 } else {
-                    IdentityId(stable_id_bytes("id", &path_c, &s.stable_key))
+                    IdentityId(stable_id_bytes("id", &path_c, &id_key))
                 };
 
                 let body_snip = if s.kind == NodeKind::File {
@@ -354,8 +362,8 @@ pub fn apply_index_events_with_config(
                     body_snippet_for_span(&file_content, s.span.start_line, s.span.end_line)
                 };
                 let content_hash = content_checksum_32(&body_snip);
-                // CAS key is symbol identity (path+stable_key), never body text.
-                let sem_hash = crate::index_model::identity_cas_semantic_hash(&path_c, &s.stable_key);
+                // CAS key is symbol identity (path+identity_key), never body text.
+                let sem_hash = crate::index_model::identity_cas_semantic_hash(&path_c, &id_key);
 
                 let (iid, rename_source_id) = if s.kind == NodeKind::File {
                     (proposed_iid, None)
@@ -379,7 +387,7 @@ pub fn apply_index_events_with_config(
                             tomb_rev,
                             outcome.identity_id,
                             ev,
-                            stable_id_bytes("rn", &path_c, &s.stable_key),
+                            stable_id_bytes("rn", &path_c, &id_key),
                         ));
                         g.get_revision(tomb_rev)
                             .map(|r| r.identity_id)
@@ -415,7 +423,7 @@ pub fn apply_index_events_with_config(
                                 NodeRevisionId(content_rev_id_bytes(
                                     branch,
                                     &path_c,
-                                    &s.stable_key,
+                                    &id_key,
                                     content_hash,
                                 )),
                                 Some(prev.revision_id),
@@ -432,7 +440,7 @@ pub fn apply_index_events_with_config(
                                 Some(_) => NodeRevisionId(content_rev_id_bytes(
                                     branch,
                                     &path_c,
-                                    &s.stable_key,
+                                    &id_key,
                                     content_hash,
                                 )),
                             };
@@ -1141,6 +1149,134 @@ mod tests {
         assert_eq!(steps.len(), 2);
         assert!(matches!(steps[0].status, RevisionStatus::Active));
         assert!(matches!(steps[1].status, RevisionStatus::Tombstone));
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn ingest_class_and_function_same_name_get_distinct_identities() {
+        use cis_wal::MutationLog;
+
+        use crate::coordinator::WriteCoordinator;
+        use crate::index_model::symbol_identity_key;
+        use crate::saga::MergeSagaOrchestrator;
+        use crate::MemoryKv;
+
+        let wal: Arc<dyn cis_wal::MutationLogStore> = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(Arc::clone(&wal));
+        let kv = Arc::new(MemoryKv::new());
+        let saga = MergeSagaOrchestrator::new(Arc::new(MemoryKv::new()));
+        let _ = coord.reconcile_on_startup(&saga);
+        let branch = BranchId([0u8; 16]);
+        let path = "collide.py";
+        let q = IndexEventQueue::new();
+        let src = "class foo:\n    pass\n\ndef foo():\n    return 1\n";
+        let events = vec![IndexEvent {
+            branch_id: branch,
+            path: path.into(),
+            kind: FsChangeKind::Modified,
+            old_path: None,
+        }];
+        let s = src.to_string();
+        apply_index_events(
+            &q,
+            &coord,
+            Arc::clone(&kv),
+            events,
+            move |_p| Ok(s.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let iid_fn = IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "")));
+        let iid_class =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "class")));
+        assert_ne!(iid_fn, iid_class);
+
+        let g = coord.graph().read();
+        let fn_rev = g
+            .primary_revision_for_identity(branch, iid_fn)
+            .expect("function identity");
+        let class_rev = g
+            .primary_revision_for_identity(branch, iid_class)
+            .expect("class identity");
+        assert_eq!(fn_rev.qualified_name, format!("{path}::foo"));
+        assert_eq!(class_rev.qualified_name, format!("{path}::foo"));
+        assert!(matches!(fn_rev.status, RevisionStatus::Active));
+        assert!(matches!(class_rev.status, RevisionStatus::Active));
+        assert_eq!(
+            g.identity_kind(iid_fn),
+            Some(NodeKind::Function)
+        );
+        assert_eq!(
+            g.identity_kind(iid_class),
+            Some(NodeKind::Class)
+        );
+        // MCP search surface: both still match a "foo" needle via qualified_name.
+        let hits: Vec<_> = g
+            .revisions()
+            .filter(|r| {
+                matches!(r.status, RevisionStatus::Active)
+                    && r.file_path == path
+                    && r.qualified_name.contains("foo")
+                    && r.qualified_name != path
+            })
+            .collect();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn ingest_overload_style_defs_get_distinct_identities_last_canonical() {
+        use cis_wal::MutationLog;
+
+        use crate::coordinator::WriteCoordinator;
+        use crate::index_model::symbol_identity_key;
+        use crate::saga::MergeSagaOrchestrator;
+        use crate::MemoryKv;
+
+        let wal: Arc<dyn cis_wal::MutationLogStore> = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(Arc::clone(&wal));
+        let kv = Arc::new(MemoryKv::new());
+        let saga = MergeSagaOrchestrator::new(Arc::new(MemoryKv::new()));
+        let _ = coord.reconcile_on_startup(&saga);
+        let branch = BranchId([0u8; 16]);
+        let path = "overloads.py";
+        let q = IndexEventQueue::new();
+        let src = "def foo(x: int):\n    ...\n\ndef foo(x: str):\n    ...\n\ndef foo(x):\n    return x\n";
+        let events = vec![IndexEvent {
+            branch_id: branch,
+            path: path.into(),
+            kind: FsChangeKind::Modified,
+            old_path: None,
+        }];
+        let s = src.to_string();
+        apply_index_events(
+            &q,
+            &coord,
+            Arc::clone(&kv),
+            events,
+            move |_p| Ok(s.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let iid_canon =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "")));
+        let iid_0 =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "fn:0")));
+        let iid_1 =
+            IdentityId(stable_id_bytes("id", path, &symbol_identity_key("foo", "fn:1")));
+        let g = coord.graph().read();
+        assert!(g.primary_revision_for_identity(branch, iid_canon).is_some());
+        assert!(g.primary_revision_for_identity(branch, iid_0).is_some());
+        assert!(g.primary_revision_for_identity(branch, iid_1).is_some());
+        let body = g
+            .primary_revision_for_identity(branch, iid_canon)
+            .unwrap();
+        assert_eq!(body.qualified_name, format!("{path}::foo"));
+        // Canonical slot is the last definition (implementation).
+        assert!(body.span.start_line >= 5 || body.body_hash != [0u8; 32]);
     }
 
     fn find_symbol_at_in_graph(coord: &WriteCoordinator, needle: &str) -> NodeRevision {

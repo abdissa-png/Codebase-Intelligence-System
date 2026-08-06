@@ -194,7 +194,7 @@ pub use ingest::{
     body_store_slot_key, branch_id_tag, content_checksum_32, file_body_hash_key,
     identity_cas_semantic_hash, regen_edges_for_file_with_graph,
     regen_edges_for_python_file, regen_edges_for_python_file_with_graph, stable_id_bytes,
-    stable_rev_id_bytes, content_rev_id_bytes, FsChangeKind,
+    stable_rev_id_bytes, content_rev_id_bytes, symbol_identity_key, FsChangeKind,
     IdentityResolverShell,
     IngestApplyReport, IndexEvent, IndexEventQueue,
 };

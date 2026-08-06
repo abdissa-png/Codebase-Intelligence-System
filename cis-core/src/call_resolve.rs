@@ -212,20 +212,67 @@ pub(crate) fn resolve_member_in_module(
 
 pub(crate) fn resolve_symbol_in_file_index(path: &str, simple_name: &str, index: &FileIndex) -> Option<IdentityId> {
     let exact = format!("{path}::{simple_name}");
+    // Prefer canonical (empty disambiguator) when multiple symbols share a name.
+    let mut fallback: Option<IdentityId> = None;
     for sym in &index.symbols {
-        if sym.qualified_name == exact {
-            return Some(IdentityId(stable_id_bytes("id", path, &sym.stable_key)));
+        if sym.qualified_name != exact {
+            continue;
         }
+        let id = IdentityId(stable_id_bytes("id", path, &sym.identity_key()));
+        if sym.disambiguator.is_empty() {
+            return Some(id);
+        }
+        if fallback.is_none() {
+            fallback = Some(id);
+        }
+    }
+    if let Some(id) = fallback {
+        return Some(id);
     }
     for sym in &index.symbols {
         if sym.kind != NodeKind::Function && sym.kind != NodeKind::Class {
             continue;
         }
         if sym.stable_key == simple_name || sym.stable_key.ends_with(&format!(".{simple_name}")) {
-            return Some(IdentityId(stable_id_bytes("id", path, &sym.stable_key)));
+            let id = IdentityId(stable_id_bytes("id", path, &sym.identity_key()));
+            if sym.disambiguator.is_empty() {
+                return Some(id);
+            }
+            if fallback.is_none() {
+                fallback = Some(id);
+            }
         }
     }
-    None
+    fallback
+}
+
+/// Revision / identity hash key for a symbol looked up by display `stable_key`.
+/// Prefers the canonical (empty disambiguator) entry.
+fn identity_key_for_owner(index: &FileIndex, stable_key: &str) -> String {
+    index
+        .symbols
+        .iter()
+        .find(|s| s.stable_key == stable_key && s.disambiguator.is_empty())
+        .or_else(|| index.symbols.iter().find(|s| s.stable_key == stable_key))
+        .map(|s| s.identity_key())
+        .unwrap_or_else(|| stable_key.to_string())
+}
+
+/// Prefer a Class symbol when resolving extends / class owners.
+fn identity_key_for_class(index: &FileIndex, class_key: &str) -> String {
+    index
+        .symbols
+        .iter()
+        .find(|s| s.kind == NodeKind::Class && s.stable_key == class_key)
+        .or_else(|| {
+            index
+                .symbols
+                .iter()
+                .find(|s| s.stable_key == class_key && s.disambiguator.is_empty())
+        })
+        .or_else(|| index.symbols.iter().find(|s| s.stable_key == class_key))
+        .map(|s| s.identity_key())
+        .unwrap_or_else(|| class_key.to_string())
 }
 
 pub(crate) fn resolve_symbol_in_graph(
@@ -235,6 +282,8 @@ pub(crate) fn resolve_symbol_in_graph(
     simple_name: &str,
 ) -> Option<IdentityId> {
     let exact = format!("{file_path}::{simple_name}");
+    let canonical = IdentityId(stable_id_bytes("id", file_path, simple_name));
+    let mut fallback: Option<IdentityId> = None;
     for r in graph.revisions() {
         if r.branch_id != branch || r.file_path != file_path {
             continue;
@@ -243,8 +292,16 @@ pub(crate) fn resolve_symbol_in_graph(
             continue;
         }
         if r.qualified_name == exact {
-            return Some(r.identity_id);
+            if r.identity_id == canonical {
+                return Some(r.identity_id);
+            }
+            if fallback.is_none() {
+                fallback = Some(r.identity_id);
+            }
         }
+    }
+    if let Some(id) = fallback {
+        return Some(id);
     }
     for r in graph.revisions() {
         if r.branch_id != branch || r.file_path != file_path {
@@ -254,10 +311,15 @@ pub(crate) fn resolve_symbol_in_graph(
             continue;
         }
         if r.qualified_name.ends_with(&format!(".{simple_name}")) {
-            return Some(r.identity_id);
+            if r.identity_id == canonical {
+                return Some(r.identity_id);
+            }
+            if fallback.is_none() {
+                fallback = Some(r.identity_id);
+            }
         }
     }
-    None
+    fallback
 }
 
 pub(crate) fn resolve_symbol_in_module(
@@ -545,7 +607,8 @@ pub(crate) fn attach_import_and_call_edges(
         }
     }
     for ext in &index.extends {
-        let class_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &ext.class_stable_key));
+        let class_ikey = identity_key_for_class(index, &ext.class_stable_key);
+        let class_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &class_ikey));
         if let Some(tiid) = resolve_type_name_to_identity(
             path,
             branch,
@@ -566,7 +629,8 @@ pub(crate) fn attach_import_and_call_edges(
         }
     }
     for u in &index.uses {
-        let owner_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &u.owner_stable_key));
+        let owner_ikey = identity_key_for_owner(index, &u.owner_stable_key);
+        let owner_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &owner_ikey));
         if let Some(tiid) = resolve_type_name_to_identity(
             path,
             branch,
@@ -587,7 +651,8 @@ pub(crate) fn attach_import_and_call_edges(
         }
     }
     for call in &index.calls {
-        let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &call.caller_stable_key));
+        let caller_ikey = identity_key_for_owner(index, &call.caller_stable_key);
+        let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &caller_ikey));
         if let Some(tiid) = resolve_call_target(
             path,
             branch,
@@ -777,6 +842,7 @@ mod tests {
         let mut callee_idx = FileIndex::default();
         callee_idx.symbols.push(ParsedSymbol {
             stable_key: "run".to_string(),
+            disambiguator: String::new(),
             qualified_name: format!("{callee_path}::run"),
             kind: NodeKind::Function,
             span: span(),
@@ -817,6 +883,7 @@ mod tests {
         let mut index = FileIndex::default();
         index.symbols.push(ParsedSymbol {
             stable_key: "foo".to_string(),
+            disambiguator: String::new(),
             qualified_name: format!("{path}::foo"),
             kind: NodeKind::Function,
             span: span(),
@@ -862,6 +929,7 @@ mod tests {
         let mut index = FileIndex::default();
         index.symbols.push(ParsedSymbol {
             stable_key: "run".to_string(),
+            disambiguator: String::new(),
             qualified_name: format!("{path}::run"),
             kind: NodeKind::Function,
             span: span(),

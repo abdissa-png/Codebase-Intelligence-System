@@ -2,7 +2,8 @@
 
 use crate::graph::{NodeKind, SourceSpan};
 use crate::index_model::{
-    whole_file_span, FileIndex, ImportStyle, ParsedCall, ParsedImport, ParsedSymbol,
+    assign_collision_disambiguators, whole_file_span, FileIndex, ImportStyle, ParsedCall,
+    ParsedImport, ParsedSymbol,
 };
 use crate::language_indexer::{IndexError, LanguageIndexer};
 use crate::graph::Language;
@@ -18,6 +19,7 @@ pub fn index_typescript_file(path: &str, content: &str) -> Result<FileIndex, Ind
     let mut idx = FileIndex::default();
     idx.symbols.push(ParsedSymbol {
         stable_key: "$file".into(),
+        disambiguator: String::new(),
         qualified_name: path.to_string(),
         kind: NodeKind::File,
         span: whole_file_span(content),
@@ -33,6 +35,7 @@ pub fn index_typescript_file(path: &str, content: &str) -> Result<FileIndex, Ind
         let n = name.as_str().to_string();
         idx.symbols.push(ParsedSymbol {
             stable_key: n.clone(),
+            disambiguator: String::new(),
             qualified_name: format!("{path}::{n}"),
             kind: NodeKind::Function,
             span: span_range(content, full.start(), full.end()),
@@ -41,6 +44,7 @@ pub fn index_typescript_file(path: &str, content: &str) -> Result<FileIndex, Ind
 
     idx.imports = extract_imports_ts(content);
     idx.calls = extract_calls_ts(content, &idx.symbols);
+    assign_collision_disambiguators(&mut idx);
     Ok(idx)
 }
 

@@ -602,14 +602,14 @@ fn do_tombstone(
 }
 
 /// Plant branch-local tombstones that hide inherited (other-branch) live symbols on `file_path`
-/// whose qualified names are not in `retained`. Parent revisions keep their own `branch_id`.
+/// whose identities are not in `retained`. Parent revisions keep their own `branch_id`.
 ///
 /// Also writes durable [`crate::deletion_absence`] markers so hiding survives tombstone GC.
 fn plant_inherited_file_tombstones(
     graph: &mut InMemoryGraph,
     branch: BranchId,
     file_path: &str,
-    retained_qualified_names: &HashSet<String>,
+    retained_identity_ids: &HashSet<IdentityId>,
     absence: Option<&crate::deletion_absence::DeletionAbsenceStore>,
 ) {
     let inherited: Vec<NodeRevision> = graph
@@ -621,7 +621,7 @@ fn plant_inherited_file_tombstones(
                     r.status,
                     RevisionStatus::Active | RevisionStatus::Speculative
                 )
-                && !retained_qualified_names.contains(&r.qualified_name)
+                && !retained_identity_ids.contains(&r.identity_id)
         })
         .cloned()
         .collect();
@@ -675,8 +675,8 @@ fn plant_inherited_file_tombstones(
     }
 }
 
-/// Tombstone active/speculative revisions for `file_path` whose qualified name is not in
-/// `retained_names`, and plant branch-local tombstones that hide **inherited** symbols
+/// Tombstone active/speculative revisions for `file_path` whose identity is not in
+/// `retained_identity_ids`, and plant branch-local tombstones that hide **inherited** symbols
 /// removed from this file (parent revisions keep their own `branch_id`).
 ///
 /// When `absence` is provided, durable `deleted:` KV markers are written so deletions
@@ -685,13 +685,13 @@ pub fn tombstone_orphaned_file_symbols(
     graph: &mut InMemoryGraph,
     branch: BranchId,
     file_path: &str,
-    retained_qualified_names: &HashSet<String>,
+    retained_identity_ids: &HashSet<IdentityId>,
 ) {
     tombstone_orphaned_file_symbols_with_absence(
         graph,
         branch,
         file_path,
-        retained_qualified_names,
+        retained_identity_ids,
         None,
     );
 }
@@ -701,7 +701,7 @@ pub fn tombstone_orphaned_file_symbols_with_absence(
     graph: &mut InMemoryGraph,
     branch: BranchId,
     file_path: &str,
-    retained_qualified_names: &HashSet<String>,
+    retained_identity_ids: &HashSet<IdentityId>,
     absence: Option<&crate::deletion_absence::DeletionAbsenceStore>,
 ) {
     let to_tombstone: Vec<NodeRevisionId> = graph
@@ -713,7 +713,7 @@ pub fn tombstone_orphaned_file_symbols_with_absence(
                     r.status,
                     RevisionStatus::Active | RevisionStatus::Speculative
                 )
-                && !retained_qualified_names.contains(&r.qualified_name)
+                && !retained_identity_ids.contains(&r.identity_id)
         })
         .map(|r| r.revision_id)
         .collect();
@@ -722,7 +722,7 @@ pub fn tombstone_orphaned_file_symbols_with_absence(
         graph,
         branch,
         file_path,
-        retained_qualified_names,
+        retained_identity_ids,
         absence,
     );
 }
