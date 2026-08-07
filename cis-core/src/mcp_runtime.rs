@@ -894,9 +894,9 @@ impl CisMcpRuntime {
             None,
         ));
         let weak = std::sync::Arc::downgrade(&rt);
-        rt.coordinator.set_post_embed_hook(Some(std::sync::Arc::new(move || {
+        rt.coordinator.set_post_embed_hook(Some(std::sync::Arc::new(move |entries| {
             if let Some(rt) = weak.upgrade() {
-                rt.rebuild_ann_index();
+                rt.upsert_ann_entries(entries);
             }
         })));
         if !std::env::var_os("CIS_SKIP_WORKSPACE_LOAD").is_some_and(|v| v == "1") {
@@ -1037,7 +1037,40 @@ impl CisMcpRuntime {
         self.rebuild_ann_index();
     }
 
+    /// Incrementally upsert newly embedded vectors into the flat ANN index.
+    ///
+    /// Used by the post-embed hook hot path. Skips `export_snapshot` and the
+    /// full clear+rebuild. If every entry in the batch is rejected (typically a
+    /// model/dimension switch), falls back to [`Self::rebuild_ann_index`].
+    pub fn upsert_ann_entries(&self, entries: Vec<([u8; 32], Vec<f32>)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let batch_len = entries.len();
+        let (ann_len, dropped) = {
+            let mut ann = self.ann_index.lock().unwrap();
+            let mut dropped = 0usize;
+            for (body_hash, embedding) in entries {
+                if !ann.try_upsert(body_hash, embedding) {
+                    dropped += 1;
+                }
+            }
+            (ann.len(), dropped)
+        };
+        // All rejected → likely dimension switch; reconcile via full rebuild.
+        if dropped == batch_len {
+            self.rebuild_ann_index();
+            return;
+        }
+        let mut st = self.index_status.lock().unwrap();
+        st.ann_dim_mismatch_drops = st.ann_dim_mismatch_drops.saturating_add(dropped);
+        st.ann_index_size = ann_len;
+    }
+
     /// Rebuild flat ANN index from vector store embeddings.
+    ///
+    /// Reserved for cold paths where the keep-set may have changed (workspace
+    /// load, post-GC body sync) or when incremental upsert cannot proceed.
     pub fn rebuild_ann_index(&self) {
         let vector = self.coordinator.vector();
         let snap = vector.export_snapshot();
@@ -4266,6 +4299,42 @@ mod tests {
     fn structural_substring_score_is_case_insensitive() {
         let score = structural_substring_score("authenticate", "auth.Authenticate");
         assert!(score > 0.0, "needle is lowercased; qn must be too");
+    }
+
+    #[test]
+    fn upsert_ann_entries_appends_without_clearing() {
+        let (dir, rt) = isolated_dev_runtime("ann_upsert");
+        rt.upsert_ann_entries(vec![
+            ([1u8; 32], vec![1.0, 0.0]),
+            ([2u8; 32], vec![0.0, 1.0]),
+        ]);
+        assert_eq!(rt.ann_index.lock().unwrap().len(), 2);
+        rt.upsert_ann_entries(vec![([3u8; 32], vec![0.5, 0.5])]);
+        assert_eq!(rt.ann_index.lock().unwrap().len(), 3);
+        assert_eq!(rt.index_status.lock().unwrap().ann_index_size, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_ann_entries_falls_back_when_all_dim_mismatched() {
+        let (dir, rt) = isolated_dev_runtime("ann_fallback");
+        rt.coordinator
+            .vector()
+            .set_embedding([1u8; 32], vec![1.0, 0.0], "stub");
+        rt.rebuild_ann_index();
+        assert_eq!(rt.ann_index.lock().unwrap().len(), 1);
+
+        // Entire batch rejected by live dim → full rebuild from vector store.
+        rt.upsert_ann_entries(vec![([2u8; 32], vec![1.0, 0.0, 0.0])]);
+        assert_eq!(rt.ann_index.lock().unwrap().len(), 1);
+        assert!(rt
+            .ann_index
+            .lock()
+            .unwrap()
+            .search(&[1.0, 0.0], 1)
+            .iter()
+            .any(|(h, _)| *h == [1u8; 32]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -12,7 +12,8 @@ pub trait AnnIndex: Send {
     fn len(&self) -> usize;
 }
 
-/// In-process flat index: body_hash → normalized vector. Rebuilt on ingest commit.
+    /// In-process flat index: body_hash → normalized vector.
+    /// Hot path: incremental upsert via post-embed hook; full rebuild on load/GC.
 #[derive(Debug, Default)]
 pub struct FlatAnnIndex {
     dim: usize,

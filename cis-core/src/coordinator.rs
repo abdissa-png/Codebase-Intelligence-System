@@ -58,8 +58,9 @@ pub struct WriteCoordinator {
     persistence: Option<CoordinatorPersistence>,
     /// When true, auto graph/vector flushes during commit are skipped (batch ingest).
     defer_snapshot_flush: AtomicBool,
-    /// Optional hook after embedding worker writes vectors (e.g. rebuild ANN index).
-    post_embed_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Optional hook after embedding worker writes vectors (e.g. incremental ANN upsert).
+    /// Receives newly embedded `(body_hash, vector)` pairs from the batch.
+    post_embed_hook: Mutex<Option<Arc<dyn Fn(Vec<([u8; 32], Vec<f32>)>) + Send + Sync>>>,
     /// **NFR-R2:** false until **`reconcile_on_startup`** completes successfully.
     ready: AtomicBool,
     /// **Phase 4** — optional fault injection for hardening tests.
@@ -134,13 +135,21 @@ impl WriteCoordinator {
     }
 
     /// Register a callback invoked after the embedding worker stores new vectors.
-    pub fn set_post_embed_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    /// The hook receives the batch of `(body_hash, embedding)` pairs just written.
+    pub fn set_post_embed_hook(
+        &self,
+        hook: Option<Arc<dyn Fn(Vec<([u8; 32], Vec<f32>)>) + Send + Sync>>,
+    ) {
         *self.post_embed_hook.lock().unwrap() = hook;
     }
 
-    pub fn run_post_embed_hook(&self) {
-        if let Some(h) = self.post_embed_hook.lock().unwrap().as_ref() {
-            h();
+    pub fn run_post_embed_hook(&self, entries: Vec<([u8; 32], Vec<f32>)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let hook = self.post_embed_hook.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h(entries);
         }
     }
 

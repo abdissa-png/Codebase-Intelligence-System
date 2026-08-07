@@ -90,12 +90,16 @@ impl EmbeddingWorker {
 
         match embedder.embed_batch(&texts) {
             Ok(vectors) => {
+                let mut ann_batch: Vec<([u8; 32], Vec<f32>)> =
+                    Vec::with_capacity(body_hashes.len());
                 for (bh, vec) in body_hashes.into_iter().zip(vectors) {
-                    vector.set_embedding(bh, vec, model_id);
+                    // Clone for the vector store; move the original into the ANN batch.
+                    vector.set_embedding(bh, vec.clone(), model_id);
+                    ann_batch.push((bh, vec));
                     report.embedded_ok += 1;
                 }
-                if report.embedded_ok > 0 {
-                    coord.run_post_embed_hook();
+                if !ann_batch.is_empty() {
+                    coord.run_post_embed_hook(ann_batch);
                 }
             }
             Err(_) => {
@@ -269,5 +273,31 @@ mod tests {
         let rep = EmbeddingWorker::drain_batch(&coord, &flaky, &bs, coord.vector(), 8);
         assert!(rep.requeued >= 1);
         assert!(coord.embedding_queue_depth() >= depth_before);
+    }
+
+    #[test]
+    fn worker_invokes_post_embed_hook_with_batch() {
+        let wal: Arc<dyn MutationLogStore> = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(Arc::clone(&wal));
+        let kv = Arc::new(MemoryKv::new());
+        let bs = BodyStore::new(Arc::clone(&kv));
+        let body_hash = [77u8; 32];
+        bs.put(body_hash, b"def hook_probe(): pass".to_vec());
+        let _ = seed_revision(&coord, b"def hook_probe(): pass", body_hash);
+
+        let seen: Arc<std::sync::Mutex<Vec<([u8; 32], Vec<f32>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_hook = Arc::clone(&seen);
+        coord.set_post_embed_hook(Some(Arc::new(move |entries| {
+            *seen_hook.lock().unwrap() = entries;
+        })));
+
+        let embedder = StubEmbedder::new();
+        let rep = EmbeddingWorker::drain_batch(&coord, &embedder, &bs, coord.vector(), 8);
+        assert!(rep.embedded_ok >= 1);
+        let batch = seen.lock().unwrap();
+        assert_eq!(batch.len(), rep.embedded_ok);
+        assert_eq!(batch[0].0, body_hash);
+        assert!(!batch[0].1.is_empty());
     }
 }
