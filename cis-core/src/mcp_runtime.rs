@@ -1867,10 +1867,18 @@ impl CisMcpRuntime {
         if name.trim().is_empty() {
             return Err(AuthError::InvalidInput);
         }
+        if let Some(p) = parent {
+            if p.trim().is_empty() {
+                return Err(AuthError::InvalidInput);
+            }
+        }
         let parent_name = parent
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.active_branch_name.read().unwrap().clone());
-        let parent_id = self.branch_registry.get_or_create_id(&parent_name);
+        let parent_id = self
+            .branch_registry
+            .get_id(&parent_name)
+            .ok_or(AuthError::InvalidInput)?;
         let child_id = self.branch_registry.get_or_create_id(name);
         if child_id == parent_id {
             return Err(AuthError::InvalidInput);
@@ -1892,6 +1900,9 @@ impl CisMcpRuntime {
     }
 
     /// Set the active branch for subsequent default-branch MCP calls (**Phase 1.5 / 2.3**).
+    ///
+    /// The branch must already be registered (`create_branch` or prior registration); unknown
+    /// names return [`AuthError::InvalidInput`] and do not mint a new branch id.
     pub fn switch_branch(
         &self,
         session_id: u64,
@@ -1901,7 +1912,10 @@ impl CisMcpRuntime {
         if name.trim().is_empty() {
             return Err(AuthError::InvalidInput);
         }
-        let id = self.branch_registry.get_or_create_id(name);
+        let id = self
+            .branch_registry
+            .get_id(name)
+            .ok_or(AuthError::InvalidInput)?;
         *self.active_branch_name.write().unwrap() = name.to_string();
         *self.active_branch_id.write().unwrap() = id;
         *self.revision_index.write().unwrap() =
@@ -4276,6 +4290,62 @@ mod tests {
 
         let listed = rt.list_branches(0).unwrap();
         assert!(listed.branches.iter().any(|b| b.name == "feature"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn switch_branch_rejects_unregistered_name() {
+        let (dir, rt) = isolated_dev_runtime("switch_typo");
+        let before = rt.list_branches(0).unwrap().branches.len();
+        let err = rt.switch_branch(0, "does_not_exist").unwrap_err();
+        assert!(matches!(err, AuthError::InvalidInput));
+        let listed = rt.list_branches(0).unwrap();
+        assert_eq!(listed.branches.len(), before);
+        assert!(!listed.branches.iter().any(|b| b.name == "does_not_exist"));
+        assert_eq!(listed.active_branch_name, "main");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_branch_rejects_unregistered_parent() {
+        let (dir, rt) = isolated_dev_runtime("create_typo_parent");
+        let err = rt
+            .create_branch(0, "feature", Some("typo_parent"))
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidInput));
+        let listed = rt.list_branches(0).unwrap();
+        assert!(!listed.branches.iter().any(|b| b.name == "typo_parent"));
+        assert!(!listed.branches.iter().any(|b| b.name == "feature"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_branch_rejects_empty_explicit_parent() {
+        let (dir, rt) = isolated_dev_runtime("create_empty_parent");
+        let err = rt.create_branch(0, "feature", Some("   ")).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidInput));
+        assert!(!rt
+            .list_branches(0)
+            .unwrap()
+            .branches
+            .iter()
+            .any(|b| b.name == "feature"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_branch_defaults_to_active_main() {
+        use crate::revision_index::revision_binding_kv_key;
+
+        let (dir, rt) = isolated_dev_runtime("create_default_parent");
+        let main = rt.active_branch();
+        let i = IdentityId([77u8; 16]);
+        let rev = NodeRevisionId([88u8; 16]);
+        rt.kv()
+            .set(&revision_binding_kv_key(main, i), rev.0.to_vec());
+        let created = rt.create_branch(0, "from_active", None).unwrap();
+        assert_eq!(created.parent_branch_name, "main");
+        assert!(created.bindings_copied >= 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

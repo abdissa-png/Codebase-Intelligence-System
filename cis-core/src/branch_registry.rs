@@ -16,19 +16,32 @@ impl BranchRegistry {
         Self { kv }
     }
 
+    /// Lookup-only: returns the registered id if `branch_reg:{name}` exists with a valid 16-byte value.
+    pub fn get_id(&self, branch_name: &str) -> Option<BranchId> {
+        let key = format!("branch_reg:{}", branch_name);
+        let v = self.kv.get(&key)?;
+        if v.len() != 16 {
+            return None;
+        }
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&v);
+        Some(BranchId(b))
+    }
+
+    /// Whether `branch_name` is already registered in this KV.
+    pub fn is_registered(&self, branch_name: &str) -> bool {
+        self.get_id(branch_name).is_some()
+    }
+
     /// New UUID per **first** registration of `name` in this KV; subsequent calls return the same id
     /// until the `branch_reg:` key is deleted (simulates branch delete in tests).
     ///
     /// **`main`** is seeded to `BranchId([0u8; 16])` on first registration for legacy test/fixture compat.
     pub fn get_or_create_id(&self, branch_name: &str) -> BranchId {
-        let key = format!("branch_reg:{}", branch_name);
-        if let Some(v) = self.kv.get(&key) {
-            if v.len() == 16 {
-                let mut b = [0u8; 16];
-                b.copy_from_slice(&v);
-                return BranchId(b);
-            }
+        if let Some(id) = self.get_id(branch_name) {
+            return id;
         }
+        let key = format!("branch_reg:{}", branch_name);
         if branch_name == "main" {
             let id = BranchId([0u8; 16]);
             self.kv.set(&key, id.0.to_vec());
@@ -112,5 +125,16 @@ mod tests {
         let kv = Arc::new(MemoryKv::new());
         let reg = BranchRegistry::new(kv);
         assert_eq!(reg.get_or_create_id("main").0, [0u8; 16]);
+    }
+
+    #[test]
+    fn get_id_none_until_registered() {
+        let kv = Arc::new(MemoryKv::new());
+        let reg = BranchRegistry::new(kv);
+        assert!(reg.get_id("feature").is_none());
+        assert!(!reg.is_registered("feature"));
+        let id = reg.get_or_create_id("feature");
+        assert_eq!(reg.get_id("feature"), Some(id));
+        assert!(reg.is_registered("feature"));
     }
 }

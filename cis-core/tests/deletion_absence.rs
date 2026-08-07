@@ -287,6 +287,18 @@ fn durable_prefix_includes_deleted() {
             .any(|p| *p == "branch_parent:"),
         "branch_parent: must be durable across restart"
     );
+    assert!(
+        cis_core::DURABLE_KV_PREFIXES
+            .iter()
+            .any(|p| *p == "branch_reg:"),
+        "branch_reg: must be durable so switch_branch survives restart"
+    );
+    assert!(
+        cis_core::DURABLE_KV_PREFIXES
+            .iter()
+            .any(|p| *p == "meta:branch_seq"),
+        "meta:branch_seq must be durable with branch_reg:"
+    );
 }
 
 #[test]

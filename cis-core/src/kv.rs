@@ -158,6 +158,8 @@ pub const DURABLE_KV_PREFIXES: &[&str] = &[
     "deleted:",
     "fork_ts:",
     "branch_parent:",
+    "branch_reg:",
+    "meta:branch_seq",
     "merge_ctx:",
     "saga_state:",
     "saga_batch:",
@@ -264,6 +266,19 @@ mod tests {
         assert!(subset
             .entries
             .contains_key("audit:epoch:00000000000000000001"));
+        assert!(!subset.entries.contains_key("ephemeral:tmp"));
+    }
+
+    #[test]
+    fn durable_subset_includes_branch_registry() {
+        let mut snap = KvSnapshot::default();
+        snap.entries.insert("branch_reg:feature".into(), vec![0; 16]);
+        snap.entries
+            .insert("meta:branch_seq".into(), 1u64.to_le_bytes().to_vec());
+        snap.entries.insert("ephemeral:tmp".into(), vec![9]);
+        let subset = durable_kv_subset(&snap);
+        assert!(subset.entries.contains_key("branch_reg:feature"));
+        assert!(subset.entries.contains_key("meta:branch_seq"));
         assert!(!subset.entries.contains_key("ephemeral:tmp"));
     }
 }

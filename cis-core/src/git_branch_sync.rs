@@ -61,10 +61,6 @@ pub fn git_abbrev_ref(repo_root: &Path) -> Option<String> {
     Some(name)
 }
 
-fn branch_name_registered(kv: &MemoryKv, name: &str) -> bool {
-    kv.get(&format!("branch_reg:{name}")).is_some()
-}
-
 /// Apply git branch name to CIS runtime state (registry + optional fork + active branch).
 pub fn apply_git_branch_name(
     repo_root: &Path,
@@ -85,7 +81,7 @@ pub fn apply_git_branch_name(
 
     let prev_name = active_branch_name.read().unwrap().clone();
     let prev_id = *active_branch_id.read().unwrap();
-    let is_new = !branch_name_registered(kv.as_ref(), &git_name);
+    let is_new = !registry.is_registered(&git_name);
     let child_id = registry.get_or_create_id(&git_name);
 
     if cfg.auto_fork && is_new && prev_name != git_name {

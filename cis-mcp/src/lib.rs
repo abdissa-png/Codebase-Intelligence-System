@@ -608,8 +608,8 @@ fn write_tool_description(name: &str) -> String {
         "purge_branch" => "Delete ri:{branch_id}:* overlay keys from KV (feature-branch cleanup).".into(),
         "retarget_edge" => "Override an edge's target identity on a branch via ETO without rewriting the shared graph (FR §01.7.1a).".into(),
         "save_workspace" => "Persist graph, vector, and KV snapshots under .cis/; also sweeps stale confirm sidecars.".into(),
-        "create_branch" => "Register a new branch and copy parent ri: bindings (Phase 1 fork bootstrap).".into(),
-        "switch_branch" => "Set the active branch for subsequent default-branch MCP calls.".into(),
+        "create_branch" => "Register a new branch and copy parent ri: bindings (Phase 1 fork bootstrap). Parent (or active default) must already be registered; unknown parent names error.".into(),
+        "switch_branch" => "Set the active branch for subsequent default-branch MCP calls. Branch must already exist (create_branch first); unknown names error.".into(),
         _ => format!("Write tool {name}."),
     }
 }
