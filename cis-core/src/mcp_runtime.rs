@@ -723,10 +723,10 @@ fn patch_err(e: OptimisticPatchError) -> AuthError {
     match e {
         OptimisticPatchError::Lease(LeaseError::Conflict { .. }) => AuthError::Conflict,
         OptimisticPatchError::MergeLocked => AuthError::Conflict,
+        OptimisticPatchError::Superseded { .. } => AuthError::Conflict,
         OptimisticPatchError::UnknownPatch(_) | OptimisticPatchError::SessionMismatch(_) => {
             AuthError::State
         }
-        _ => AuthError::InvalidInput,
     }
 }
 
@@ -1531,9 +1531,46 @@ impl CisMcpRuntime {
         self.confirm_backend.as_ref().as_ref()
     }
 
-    /// Return the patch_id of any pending speculative patch whose paths include `rel_path`.
+    /// Return the newest pending speculative patch whose paths include `rel_path`.
     pub fn pending_patch_for_path(&self, rel_path: &str) -> Option<u64> {
         self.patcher.pending_patch_for_path(rel_path, &self.repo_root)
+    }
+
+    /// Auto-confirm same-session open patches on this path before a new write.
+    ///
+    /// A second write to the same path implicitly accepts prior speculative content, so we
+    /// promote older patches (Speculative → Active) and clear their leases/tokens/snapshots.
+    /// Agents keep writing at full speed without waiting for an explicit confirm.
+    fn auto_confirm_older_patches_on_path(
+        &self,
+        session_id: u64,
+        rel_path: &str,
+        abs_path: &str,
+    ) {
+        let mut ids = self.patcher.same_session_open_patches_for_path(
+            SessionId(session_id),
+            rel_path,
+            &self.repo_root,
+        );
+        // PatchRecords store resolve_repo_path abs strings; also match that form directly.
+        for id in self.patcher.same_session_open_patches_for_path(
+            SessionId(session_id),
+            abs_path,
+            &self.repo_root,
+        ) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        for patch_id in ids {
+            if let Err(()) = self.confirm_patch_internal(patch_id) {
+                eprintln!(
+                    "cis-mcp: auto-confirm older patch {} on {} failed",
+                    patch_id, rel_path
+                );
+            }
+        }
     }
 
     /// Promote pending speculative patches that touch any of `paths` **only when** a confirm
@@ -1719,6 +1756,13 @@ impl CisMcpRuntime {
 
     /// Internal: revert a patch without session check (used by FS sync on external-edit detection).
     pub fn revert_patch_internal(&self, patch_id: u64) {
+        if let Some(newer) = self.patcher.newer_open_patch_on_paths(patch_id) {
+            eprintln!(
+                "cis-mcp: revert_patch_internal skipped patch {} (superseded by {})",
+                patch_id, newer
+            );
+            return;
+        }
         let Some(session_id) = self.patcher.patch_session(patch_id) else { return };
         let paths = self.patcher.peek_patch_paths(patch_id);
         if self
@@ -1759,6 +1803,11 @@ impl CisMcpRuntime {
         session_id: SessionId,
         paths: &[String],
     ) -> Result<(), crate::coordinator::CoordinatorError> {
+        if let Some(newer) = self.patcher.newer_open_patch_on_paths(patch_id) {
+            return Err(crate::coordinator::CoordinatorError::Persist(format!(
+                "patch {patch_id} superseded by newer open patch {newer}"
+            )));
+        }
         self.pre_write_snapshots
             .restore_patch(patch_id, Path::new(&self.repo_root))
             .map_err(|_| crate::coordinator::CoordinatorError::Persist("restore snapshot".into()))?;
@@ -1781,8 +1830,11 @@ impl CisMcpRuntime {
 
     /// Sweep speculative patches older than `ttl_secs` and revert them.
     /// Returns the number of patches reverted.
+    ///
+    /// Reverts newest-first so LIFO supersede checks succeed when stacks remain.
     pub fn sweep_speculative_orphans(&self, ttl_secs: u64) -> usize {
-        let expired = self.patcher.expired_patch_ids(ttl_secs);
+        let mut expired = self.patcher.expired_patch_ids(ttl_secs);
+        expired.sort_unstable_by(|a, b| b.cmp(a));
         let count = expired.len();
         for patch_id in expired {
             self.revert_patch_internal(patch_id);
@@ -3222,6 +3274,8 @@ impl CisMcpRuntime {
         let abs = resolve_repo_path(&self.repo_root, path)?;
         let abs_s = abs.to_string_lossy().into_owned();
         self.auth.validate_path(session_id, &abs_s)?;
+        // Same-path write implicitly confirms older open patches (at most one in-flight).
+        self.auto_confirm_older_patches_on_path(session_id, path, &abs_s);
         let patch_id = self
             .patcher
             .apply_speculative(
@@ -3284,6 +3338,8 @@ impl CisMcpRuntime {
         let abs = resolve_repo_path(&self.repo_root, path)?;
         let abs_s = abs.to_string_lossy().into_owned();
         self.auth.validate_path(session_id, &abs_s)?;
+        // Same-path write implicitly confirms older open patches (at most one in-flight).
+        self.auto_confirm_older_patches_on_path(session_id, path, &abs_s);
         let patch_id = self
             .patcher
             .apply_speculative(
@@ -3382,12 +3438,20 @@ impl CisMcpRuntime {
     }
 
     /// **Epic 3.3 §3.3:** revert a speculative patch (tombstone speculative revisions + release leases).
+    ///
+    /// LIFO only: refuses if a newer open patch still touches the same path(s).
     pub fn revert_patch(
         &self,
         session_id: u64,
         patch_id: u64,
     ) -> Result<RevertPatchResponse, AuthError> {
         self.require_session(session_id)?;
+        if let Some(newer) = self.patcher.newer_open_patch_on_paths(patch_id) {
+            return Err(patch_err(OptimisticPatchError::Superseded {
+                patch_id,
+                newer_patch_id: newer,
+            }));
+        }
         let paths = self.patcher.peek_patch_paths(patch_id);
         self.finish_revert_patch(patch_id, SessionId(session_id), &paths)
             .map_err(|e| {

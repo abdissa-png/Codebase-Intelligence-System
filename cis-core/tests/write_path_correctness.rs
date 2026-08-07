@@ -58,25 +58,118 @@ fn revert_removes_newly_created_file() {
     );
 }
 
-// ── (b) two open patches on one path — revert only one ──────────────────────
+// ── (b) same-path writes auto-collapse; LIFO revert when stacks remain ───────
 
 #[test]
-fn revert_one_of_two_patches_keeps_speculative_path() {
+fn second_write_auto_confirms_older_patch() {
     let (dir, rt) = make_runtime();
     let rel = "shared.py";
     let v1 = "def a():\n    pass\n";
     let v2 = "def b():\n    pass\n";
     fs::write(dir.path().join(rel), v1).unwrap();
 
-    let patch_a = rt.write_file(0, rel, v1, false).unwrap().patch_id;
-    let patch_b = rt.write_file(0, rel, v2, false).unwrap().patch_id;
+    let patch_a = rt.write_file(0, rel, v1, true).unwrap().patch_id;
+    let patch_b = rt.write_file(0, rel, v2, true).unwrap().patch_id;
     assert_ne!(patch_a, patch_b);
-
-    rt.revert_patch(0, patch_a).unwrap();
-    assert!(
-        rt.has_speculative_path(rel),
-        "path must remain speculative while patch_b is still open"
+    assert_eq!(
+        rt.patcher().open_patch_count(),
+        1,
+        "second write must auto-confirm the older patch"
     );
+    assert!(
+        rt.patcher().peek_patch_paths(patch_a).is_empty(),
+        "older patch must no longer be open"
+    );
+    assert_eq!(
+        rt.pending_patch_for_path(rel),
+        Some(patch_b),
+        "only the newest patch remains pending"
+    );
+
+    // Explicit confirm of the auto-collapsed id is a no-op / State error.
+    assert!(matches!(
+        rt.confirm_patch(0, patch_a),
+        Err(AuthError::State)
+    ));
+
+    // Graph speculative symbols should reflect the second write.
+    let g = rt.graph_mutex().read();
+    let spec: Vec<_> = g
+        .revisions()
+        .filter(|r| {
+            r.file_path == rel
+                && matches!(r.status, RevisionStatus::Speculative)
+                && !r.qualified_name.ends_with(".py")
+        })
+        .collect();
+    assert!(
+        !spec.is_empty(),
+        "expected speculative revisions after second write"
+    );
+    assert!(
+        spec.iter().any(|r| r.qualified_name.contains("b")),
+        "speculative set should include symbol from second content; got {:?}",
+        spec.iter().map(|r| &r.qualified_name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn revert_newest_after_auto_collapse_clears_path() {
+    let (dir, rt) = make_runtime();
+    let rel = "shared.py";
+    let original = "def orig():\n    pass\n";
+    let v1 = "def a():\n    pass\n";
+    let v2 = "def b():\n    pass\n";
+    fs::write(dir.path().join(rel), original).unwrap();
+
+    let _patch_a = rt.write_file(0, rel, v1, false).unwrap().patch_id;
+    let patch_b = rt.write_file(0, rel, v2, false).unwrap().patch_id;
+    assert_eq!(rt.patcher().open_patch_count(), 1);
+
+    rt.revert_patch(0, patch_b).unwrap();
+    assert!(
+        !rt.has_speculative_path(rel),
+        "after reverting the sole open patch, path must leave speculative set"
+    );
+    // Auto-confirm promoted A before B wrote; B's pre-write snapshot is post-A (v1).
+    assert_eq!(
+        fs::read_to_string(dir.path().join(rel)).unwrap(),
+        v1,
+        "revert of newest restores that patch's pre-write snapshot (post-previous write)"
+    );
+}
+
+#[test]
+fn revert_older_patch_while_newer_open_is_conflict() {
+    use cis_core::SessionId;
+
+    let (dir, rt) = make_runtime();
+    let rel = "shared.py";
+    let v1 = "def a():\n    pass\n";
+    fs::write(dir.path().join(rel), v1).unwrap();
+
+    let patch_a = rt.write_file(0, rel, v1, false).unwrap().patch_id;
+    // Bypass auto-collapse: stack a second open patch on the same abs path.
+    let abs = dir.path().join(rel).canonicalize().unwrap_or(dir.path().join(rel));
+    let abs_s = abs.to_string_lossy().into_owned();
+    let patch_b = rt
+        .patcher()
+        .apply_speculative(SessionId(0), vec![abs_s], None)
+        .unwrap();
+    assert!(patch_b > patch_a);
+
+    let err = rt.revert_patch(0, patch_a).unwrap_err();
+    assert!(
+        matches!(err, AuthError::Conflict),
+        "reverting an older patch while a newer one is open must Conflict, got {:?}",
+        err
+    );
+    assert_eq!(rt.patcher().open_patch_count(), 2);
+
+    rt.revert_patch(0, patch_b).unwrap();
+    assert_eq!(rt.patcher().open_patch_count(), 1);
+    rt.revert_patch(0, patch_a).unwrap();
+    assert_eq!(rt.patcher().open_patch_count(), 0);
 }
 
 // ── (c) crash replay preserves confirmed Active state ─────────────────────

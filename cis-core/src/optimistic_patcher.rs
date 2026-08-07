@@ -21,6 +21,18 @@ pub enum OptimisticPatchError {
     UnknownPatch(u64),
     #[error("session mismatch for patch {0}")]
     SessionMismatch(u64),
+    /// Reverting an older patch while a newer open patch still touches the same path.
+    #[error("409 conflict — patch {patch_id} superseded by newer open patch {newer_patch_id}")]
+    Superseded {
+        patch_id: u64,
+        newer_patch_id: u64,
+    },
+}
+
+fn path_matches_patch(rec_paths: &[String], rel_path: &str, abs_path: &str) -> bool {
+    rec_paths
+        .iter()
+        .any(|p| p == rel_path || p == abs_path)
 }
 
 #[derive(Debug)]
@@ -167,16 +179,61 @@ impl OptimisticPatcher {
             .map(|r| r.session)
     }
 
-    /// Find a pending patch_id whose registered paths contain `rel_path` (checked against abs and rel forms).
-    pub fn pending_patch_for_path(&self, rel_path: &str, repo_root: &str) -> Option<u64> {
+    /// Open patch ids whose registered paths contain `rel_path` (abs or rel), sorted ascending.
+    pub fn open_patches_for_path(&self, rel_path: &str, repo_root: &str) -> Vec<u64> {
         let abs_path = format!("{}/{}", repo_root.trim_end_matches('/'), rel_path);
         let patches = self.patches.lock().unwrap();
-        for (&id, rec) in patches.iter() {
-            if rec.paths.iter().any(|p| p == rel_path || p == &abs_path) {
-                return Some(id);
-            }
-        }
-        None
+        let mut ids: Vec<u64> = patches
+            .iter()
+            .filter(|(_, rec)| path_matches_patch(&rec.paths, rel_path, &abs_path))
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Newest (max id) pending patch whose registered paths contain `rel_path`.
+    ///
+    /// Prefer this over HashMap iteration order so FS sync confirms the patch matching
+    /// current disk content when multiple open patches briefly overlap.
+    pub fn pending_patch_for_path(&self, rel_path: &str, repo_root: &str) -> Option<u64> {
+        self.open_patches_for_path(rel_path, repo_root).into_iter().max()
+    }
+
+    /// If any open patch with a higher id shares a path with `patch_id`, return that newer id.
+    pub fn newer_open_patch_on_paths(&self, patch_id: u64) -> Option<u64> {
+        let patches = self.patches.lock().unwrap();
+        let Some(rec) = patches.get(&patch_id) else {
+            return None;
+        };
+        let my_paths: &Vec<String> = &rec.paths;
+        patches
+            .iter()
+            .filter(|(&id, other)| {
+                id > patch_id && other.paths.iter().any(|p| my_paths.iter().any(|mp| mp == p))
+            })
+            .map(|(&id, _)| id)
+            .max()
+    }
+
+    /// Same-session open patches on `rel_path`, sorted ascending (oldest first).
+    pub fn same_session_open_patches_for_path(
+        &self,
+        session: SessionId,
+        rel_path: &str,
+        repo_root: &str,
+    ) -> Vec<u64> {
+        let abs_path = format!("{}/{}", repo_root.trim_end_matches('/'), rel_path);
+        let patches = self.patches.lock().unwrap();
+        let mut ids: Vec<u64> = patches
+            .iter()
+            .filter(|(_, rec)| {
+                rec.session == session && path_matches_patch(&rec.paths, rel_path, &abs_path)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Return patch ids that were created more than `ttl_secs` ago.
@@ -373,5 +430,31 @@ mod tests {
         assert_eq!(patcher.open_patch_count(), 1);
         patcher.revert(id, SessionId(1)).unwrap();
         assert_eq!(patcher.open_patch_count(), 0);
+    }
+
+    #[test]
+    fn pending_patch_for_path_returns_newest() {
+        let leases = Arc::new(PathLeaseManager::new());
+        let spec = Arc::new(SpeculativePathTracker::new());
+        let patcher = OptimisticPatcher::new(Arc::clone(&leases), Arc::clone(&spec));
+        let root = "/repo";
+        let abs = "/repo/shared.py";
+        let a = patcher
+            .apply_speculative(SessionId(1), vec![abs.into()], None)
+            .unwrap();
+        let b = patcher
+            .apply_speculative(SessionId(1), vec![abs.into()], None)
+            .unwrap();
+        assert!(b > a);
+        assert_eq!(
+            patcher.pending_patch_for_path("shared.py", root),
+            Some(b)
+        );
+        assert_eq!(
+            patcher.open_patches_for_path("shared.py", root),
+            vec![a, b]
+        );
+        assert_eq!(patcher.newer_open_patch_on_paths(a), Some(b));
+        assert_eq!(patcher.newer_open_patch_on_paths(b), None);
     }
 }
