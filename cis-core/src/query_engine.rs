@@ -199,6 +199,81 @@ fn min_source_on_path(current: SourceType, edge: &GraphEdge) -> SourceType {
     }
 }
 
+/// Walk inbound edges whose **effective** target (after ETO) is `identity_id`.
+///
+/// Two paths:
+/// 1. [`InMemoryGraph::source_identities_targeting`] — canonical reverse index, then
+///    resolve each source and filter by effective target (drops edges retargeted away).
+/// 2. [`EdgeTargetOverrideStore::overrides_targeting`] — ETO rows that retarget an edge
+///    *to* `identity_id` from a different canonical target (not in `target_reverse`).
+///
+/// Dedupes by `edge_id`. `edge_filter` selects edge types (e.g. `Calls` only).
+/// `visit` returns `false` to stop early (e.g. hit limit).
+pub fn for_each_inbound_edge<'a, FFilter, FVisit>(
+    g: &'a InMemoryGraph,
+    eto: &EdgeTargetOverrideStore,
+    chain: &[BranchId],
+    identity_id: IdentityId,
+    absence: Option<&DeletionAbsenceStore>,
+    edge_filter: FFilter,
+    mut visit: FVisit,
+) where
+    FFilter: Fn(&GraphEdge) -> bool,
+    FVisit: FnMut(&'a NodeRevision, &'a GraphEdge) -> bool,
+{
+    let mut seen_edges: HashSet<[u8; 16]> = HashSet::new();
+
+    let mut consider = |src: &'a NodeRevision, e: &'a GraphEdge| -> bool {
+        if !edge_filter(e) {
+            return true;
+        }
+        if eto.effective_target_identity_in_chain(chain, e) != identity_id {
+            return true;
+        }
+        if !seen_edges.insert(e.edge_id) {
+            return true;
+        }
+        visit(src, e)
+    };
+
+    for sid in g.source_identities_targeting(identity_id) {
+        let Some(src) = resolve_identity_revision_with_absence(g, chain, sid, absence) else {
+            continue;
+        };
+        for e in g.outbound_edges(src.revision_id) {
+            if !consider(src, e) {
+                return;
+            }
+        }
+    }
+
+    // ETO may retarget an edge whose raw target is not `identity_id`.
+    for (eto_branch, source_rev, edge_id) in eto.overrides_targeting(identity_id) {
+        if !chain.iter().any(|b| *b == eto_branch) {
+            continue;
+        }
+        let Some(src) = g.get_revision(source_rev) else {
+            continue;
+        };
+        if !revision_on_chain(chain, src.branch_id) {
+            continue;
+        }
+        if let Some(store) = absence {
+            if store.is_deleted_in_chain(chain, src.identity_id) {
+                continue;
+            }
+        }
+        for e in g.outbound_edges(source_rev) {
+            if e.edge_id != edge_id {
+                continue;
+            }
+            if !consider(src, e) {
+                return;
+            }
+        }
+    }
+}
+
 fn inbound_edge_confidences(
     g: &InMemoryGraph,
     eto: &EdgeTargetOverrideStore,
@@ -209,38 +284,10 @@ fn inbound_edge_confidences(
     absence: Option<&DeletionAbsenceStore>,
 ) -> Vec<f64> {
     let mut confs = Vec::new();
-    let mut seen_edges: HashSet<[u8; 16]> = HashSet::new();
-
-    let mut push_if_effective = |e: &GraphEdge| {
-        if eto.effective_target_identity_in_chain(chain, e) != identity_id {
-            return;
-        }
-        if !seen_edges.insert(e.edge_id) {
-            return;
-        }
+    for_each_inbound_edge(g, eto, chain, identity_id, absence, |_| true, |_src, e| {
         confs.push(edge_confidence(e, now_ms, half_life_ms));
-    };
-
-    for sid in g.source_identities_targeting(identity_id) {
-        let Some(src) = resolve_identity_revision_with_absence(g, chain, sid, absence) else {
-            continue;
-        };
-        for e in g.outbound_edges(src.revision_id) {
-            push_if_effective(e);
-        }
-    }
-
-    // ETO may retarget an edge whose raw target is not `identity_id`.
-    for (eto_branch, source_rev, edge_id) in eto.overrides_targeting(identity_id) {
-        if !chain.iter().any(|b| *b == eto_branch) {
-            continue;
-        }
-        for e in g.outbound_edges(source_rev) {
-            if e.edge_id == edge_id {
-                push_if_effective(e);
-            }
-        }
-    }
+        true
+    });
     confs
 }
 
@@ -869,5 +916,162 @@ mod tests {
         assert!(resolve_identity_revision_with_absence(&g, &chain, iid, Some(&absence)).is_none());
         absence.clear_deleted(feature, iid);
         assert!(resolve_identity_revision_with_absence(&g, &chain, iid, Some(&absence)).is_some());
+    }
+
+    #[test]
+    fn inbound_walk_finds_canonical_and_eto_retarget() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(Arc::clone(&kv));
+        let mut g = InMemoryGraph::default();
+        let b = branch();
+        let chain = [b];
+        let target = IdentityId([50u8; 16]);
+        let wrong = IdentityId([51u8; 16]);
+        rev(&mut g, 50, 50, "target", RevisionStatus::Active);
+        rev(&mut g, 51, 51, "wrong", RevisionStatus::Active);
+        let canonical_caller = rev(&mut g, 60, 60, "canonical_caller", RevisionStatus::Active);
+        let eto_caller = rev(&mut g, 61, 61, "eto_caller", RevisionStatus::Active);
+        call_edge(&mut g, canonical_caller, target, 1);
+        let edge_id = {
+            let mut eid = [0u8; 16];
+            eid[0] = 2;
+            eid
+        };
+        let e = GraphEdge {
+            edge_id,
+            ty: EdgeType::Calls,
+            source_revision_id: eto_caller,
+            target_identity_id: wrong,
+            resolution: EdgeResolution {
+                target_signature_hash: [0u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: SourceSpan::UNKNOWN,
+        };
+        g.replace_edges_for_revision(eto_caller, vec![e]).unwrap();
+        eto.set_override(b, eto_caller, edge_id, target);
+
+        let mut names = Vec::new();
+        for_each_inbound_edge(
+            &g,
+            &eto,
+            &chain,
+            target,
+            None,
+            |e| e.ty == EdgeType::Calls,
+            |src, _e| {
+                names.push(src.qualified_name.clone());
+                true
+            },
+        );
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["canonical_caller".to_string(), "eto_caller".to_string()]
+        );
+    }
+
+    #[test]
+    fn inbound_walk_skips_eto_retargeted_away() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let b = branch();
+        let chain = [b];
+        let target = IdentityId([70u8; 16]);
+        let other = IdentityId([71u8; 16]);
+        rev(&mut g, 70, 70, "target", RevisionStatus::Active);
+        rev(&mut g, 71, 71, "other", RevisionStatus::Active);
+        let caller = rev(&mut g, 72, 72, "caller", RevisionStatus::Active);
+        let edge_id = {
+            let mut eid = [0u8; 16];
+            eid[0] = 9;
+            eid
+        };
+        let e = GraphEdge {
+            edge_id,
+            ty: EdgeType::Calls,
+            source_revision_id: caller,
+            target_identity_id: target,
+            resolution: EdgeResolution {
+                target_signature_hash: [0u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: SourceSpan::UNKNOWN,
+        };
+        g.replace_edges_for_revision(caller, vec![e]).unwrap();
+        eto.set_override(b, caller, edge_id, other);
+
+        let mut count = 0usize;
+        for_each_inbound_edge(
+            &g,
+            &eto,
+            &chain,
+            target,
+            None,
+            |e| e.ty == EdgeType::Calls,
+            |_src, _e| {
+                count += 1;
+                true
+            },
+        );
+        assert_eq!(count, 0, "ETO retarget away must hide caller from target");
+    }
+
+    #[test]
+    fn inbound_walk_calls_filter_excludes_imports() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let b = branch();
+        let chain = [b];
+        let target = IdentityId([80u8; 16]);
+        rev(&mut g, 80, 80, "target", RevisionStatus::Active);
+        let importer = rev(&mut g, 81, 81, "importer", RevisionStatus::Active);
+        let e = GraphEdge {
+            edge_id: [3u8; 16],
+            ty: EdgeType::Imports,
+            source_revision_id: importer,
+            target_identity_id: target,
+            resolution: EdgeResolution {
+                target_signature_hash: [0u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: SourceSpan::UNKNOWN,
+        };
+        g.replace_edges_for_revision(importer, vec![e]).unwrap();
+
+        let mut calls_only = 0usize;
+        for_each_inbound_edge(
+            &g,
+            &eto,
+            &chain,
+            target,
+            None,
+            |e| e.ty == EdgeType::Calls,
+            |_src, _e| {
+                calls_only += 1;
+                true
+            },
+        );
+        assert_eq!(calls_only, 0);
+
+        let mut any = 0usize;
+        for_each_inbound_edge(
+            &g,
+            &eto,
+            &chain,
+            target,
+            None,
+            |_| true,
+            |_src, _e| {
+                any += 1;
+                true
+            },
+        );
+        assert_eq!(any, 1);
     }
 }

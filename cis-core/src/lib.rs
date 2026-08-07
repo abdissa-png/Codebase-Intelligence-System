@@ -126,11 +126,11 @@ pub use confidence::{
 };
 pub use query_engine::{
     count_pruned_expand_neighbors, count_unresolved_definition_edges, expand_context_bfs,
-    expand_context_bfs_with_absence, file_hub_revision_for_path, is_opaque_traversal_gate,
-    node_hit_confidence, node_hit_confidence_with_absence, outbound_context_edges,
-    rename_successor_identity, resolve_definition_target, resolve_definition_target_with_absence,
-    resolve_edge_target, resolve_edge_target_with_absence, resolve_identity_revision,
-    resolve_identity_revision_with_absence, ExpandContextResult,
+    expand_context_bfs_with_absence, file_hub_revision_for_path, for_each_inbound_edge,
+    is_opaque_traversal_gate, node_hit_confidence, node_hit_confidence_with_absence,
+    outbound_context_edges, rename_successor_identity, resolve_definition_target,
+    resolve_definition_target_with_absence, resolve_edge_target, resolve_edge_target_with_absence,
+    resolve_identity_revision, resolve_identity_revision_with_absence, ExpandContextResult,
 };
 pub use coordinator::{CoordinatorError, CoordinatorPersistence, WriteCoordinator};
 pub use daemon_handles::CisDaemonHandles;

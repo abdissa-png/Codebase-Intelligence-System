@@ -2666,29 +2666,28 @@ impl CisMcpRuntime {
         let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
-        let sources = g.source_identities_targeting(rev.identity_id);
         let mut hits = Vec::new();
-        for sid in sources {
-            if hits.len() >= limit {
-                break;
-            }
-            if let Some(src_rev) = crate::query_engine::resolve_identity_revision_with_absence(
-                &g,
-                &chain,
-                sid,
-                Some(&absence),
-            ) {
-                for e in g.outbound_edges(src_rev.revision_id) {
-                    let effective = eto.effective_target_identity_in_chain(&chain, e);
-                    if effective == rev.identity_id {
-                        let conf =
-                            crate::confidence::edge_confidence(e, now, half);
-                        hits.push(hit_from_rev_and_edge(src_rev, e, conf));
-                        break;
-                    }
+        let mut seen_identities = HashSet::new();
+        crate::query_engine::for_each_inbound_edge(
+            &g,
+            &eto,
+            &chain,
+            rev.identity_id,
+            Some(&absence),
+            |_| true,
+            |src, e| {
+                if hits.len() >= limit {
+                    return false;
                 }
-            }
-        }
+                // One hit per source identity (matches prior MCP behavior).
+                if !seen_identities.insert(src.identity_id) {
+                    return true;
+                }
+                let conf = crate::confidence::edge_confidence(e, now, half);
+                hits.push(hit_from_rev_and_edge(src, e, conf));
+                hits.len() < limit
+            },
+        );
         let n = hits.len();
         self.audit.record_sync(session_id, "find_references");
         let mut meta = self.meta_at_commit(merge_in_progress, t0.elapsed().as_millis() as u64, n, None, false, None);
@@ -2721,35 +2720,26 @@ impl CisMcpRuntime {
         let half = policy_half_life_ms(&self.policy.snapshot());
         let chain = self.query_branch_chain(branch);
         let mut hits = Vec::new();
-        let mut seen = HashSet::new();
-        for r in g.revisions() {
-            if hits.len() >= limit {
-                break;
-            }
-            if !revision_on_chain(&chain, r.branch_id) {
-                continue;
-            }
-            if !seen.insert(r.identity_id) {
-                continue;
-            }
-            let Some(src) = crate::query_engine::resolve_identity_revision_with_absence(
-                &g,
-                &chain,
-                r.identity_id,
-                Some(&absence),
-            ) else {
-                continue;
-            };
-            for e in g.outbound_edges(src.revision_id) {
-                if e.ty == EdgeType::Calls
-                    && eto.effective_target_identity_in_chain(&chain, e) == target_id
-                {
-                    let conf = crate::confidence::edge_confidence(e, now, half);
-                    hits.push(hit_from_rev_and_edge(src, e, conf));
-                    break;
+        let mut seen_identities = HashSet::new();
+        crate::query_engine::for_each_inbound_edge(
+            &g,
+            &eto,
+            &chain,
+            target_id,
+            Some(&absence),
+            |e| e.ty == EdgeType::Calls,
+            |src, e| {
+                if hits.len() >= limit {
+                    return false;
                 }
-            }
-        }
+                if !seen_identities.insert(src.identity_id) {
+                    return true;
+                }
+                let conf = crate::confidence::edge_confidence(e, now, half);
+                hits.push(hit_from_rev_and_edge(src, e, conf));
+                hits.len() < limit
+            },
+        );
         let n = hits.len();
         self.audit.record_sync(session_id, "get_callers");
         let meta = self.meta_at_commit(merge_in_progress, t0.elapsed().as_millis() as u64, n, None, false, None);
