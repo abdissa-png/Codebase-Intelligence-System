@@ -628,6 +628,23 @@ fn scan_branch_bindings(
     map
 }
 
+/// Live-branch bindings for merge classification: `ri:` rows minus soft-deletes.
+///
+/// Soft-deleted identities (`deleted:{branch}:{identity}` with revision still Active)
+/// are treated as absent so Phase A classifies them as deletions rather than `Clean`.
+/// Base/msnap snapshots must **not** use this — they are historical.
+fn scan_branch_bindings_for_merge(
+    kv: &MemoryKv,
+    branch_id: BranchId,
+) -> HashMap<IdentityId, NodeRevisionId> {
+    let mut map = scan_branch_bindings(kv, branch_id);
+    map.retain(|iid, _| {
+        kv.get(&crate::deletion_absence::deleted_key(branch_id, *iid))
+            .is_none()
+    });
+    map
+}
+
 /// Snapshot current `ri:` bindings on a branch for pre-merge rollback.
 pub fn premerge_bindings_for_branch(
     kv: &MemoryKv,
@@ -780,8 +797,8 @@ pub fn phase_a_classify(
     base_branch: BranchId,
 ) -> PhaseAResult {
     let base_bindings = scan_branch_bindings(kv, base_branch);
-    let ours_bindings = scan_branch_bindings(kv, ours_branch);
-    let theirs_bindings = scan_branch_bindings(kv, theirs_branch);
+    let ours_bindings = scan_branch_bindings_for_merge(kv, ours_branch);
+    let theirs_bindings = scan_branch_bindings_for_merge(kv, theirs_branch);
 
     let mut all_identities = HashSet::new();
     all_identities.extend(base_bindings.keys());
@@ -831,8 +848,8 @@ pub fn phase_a_classify_with_base(
     theirs_branch: BranchId,
     base_bindings: &HashMap<IdentityId, NodeRevisionId>,
 ) -> PhaseAResult {
-    let ours_bindings = scan_branch_bindings(kv, ours_branch);
-    let theirs_bindings = scan_branch_bindings(kv, theirs_branch);
+    let ours_bindings = scan_branch_bindings_for_merge(kv, ours_branch);
+    let theirs_bindings = scan_branch_bindings_for_merge(kv, theirs_branch);
 
     let mut all_identities = HashSet::new();
     all_identities.extend(base_bindings.keys());
@@ -1091,8 +1108,17 @@ pub fn phase_b_promote(
             }
         } else {
             // Winner is None → identity was deleted; remove RI binding on target
+            // and plant a durable absence marker (covers soft-delete → hard unbind).
             let key = revision_binding_kv_key(target_branch, ci.identity_id);
             kv.delete(&key);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            kv.set(
+                &crate::deletion_absence::deleted_key(target_branch, ci.identity_id),
+                ts.to_le_bytes().to_vec(),
+            );
         }
     }
 

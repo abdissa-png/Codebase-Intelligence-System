@@ -154,6 +154,8 @@ pub struct InMemoryGraph {
     revisions_by_file: HashMap<(BranchId, String), Vec<NodeRevisionId>>,
     /// `(branch, identity) → revision ids` for O(k) primary recompute.
     revisions_by_identity: HashMap<(BranchId, IdentityId), Vec<NodeRevisionId>>,
+    /// Content-addressed reverse index: `body_hash → revision ids` (all branches).
+    revisions_by_body_hash: HashMap<[u8; 32], Vec<NodeRevisionId>>,
 }
 
 impl InMemoryGraph {
@@ -169,6 +171,9 @@ impl InMemoryGraph {
             }
             if o.branch_id != rev.branch_id || o.identity_id != rev.identity_id {
                 Self::remove_from_identity_index_map(&mut self.revisions_by_identity, o);
+            }
+            if o.body_hash != rev.body_hash {
+                Self::remove_from_body_hash_index_map(&mut self.revisions_by_body_hash, o);
             }
         }
         self.revisions.insert(rev.revision_id, rev.clone());
@@ -187,6 +192,14 @@ impl InMemoryGraph {
                 .unwrap_or(true)
         {
             Self::add_to_identity_index_map(&mut self.revisions_by_identity, &rev);
+        }
+        if old.is_none()
+            || old
+                .as_ref()
+                .map(|o| o.body_hash != rev.body_hash)
+                .unwrap_or(true)
+        {
+            Self::add_to_body_hash_index_map(&mut self.revisions_by_body_hash, &rev);
         }
         self.recompute_primary(rev.branch_id, rev.identity_id);
         if let Some(o) = old {
@@ -250,15 +263,39 @@ impl InMemoryGraph {
         }
     }
 
+    fn add_to_body_hash_index_map(
+        map: &mut HashMap<[u8; 32], Vec<NodeRevisionId>>,
+        rev: &NodeRevision,
+    ) {
+        let entry = map.entry(rev.body_hash).or_default();
+        if !entry.contains(&rev.revision_id) {
+            entry.push(rev.revision_id);
+        }
+    }
+
+    fn remove_from_body_hash_index_map(
+        map: &mut HashMap<[u8; 32], Vec<NodeRevisionId>>,
+        rev: &NodeRevision,
+    ) {
+        if let Some(v) = map.get_mut(&rev.body_hash) {
+            v.retain(|id| *id != rev.revision_id);
+            if v.is_empty() {
+                map.remove(&rev.body_hash);
+            }
+        }
+    }
+
     /// Rebuild **Phase 1** secondary indices from all revisions (snapshot load / recovery).
     pub fn rebuild_secondary_indices(&mut self) {
         self.primary_by_identity.clear();
         self.revisions_by_file.clear();
         self.revisions_by_identity.clear();
+        self.revisions_by_body_hash.clear();
         let revs: Vec<NodeRevision> = self.revisions.values().cloned().collect();
         for rev in &revs {
             Self::add_to_file_index_map(&mut self.revisions_by_file, rev);
             Self::add_to_identity_index_map(&mut self.revisions_by_identity, rev);
+            Self::add_to_body_hash_index_map(&mut self.revisions_by_body_hash, rev);
         }
         let mut identities: HashSet<(BranchId, IdentityId)> = HashSet::new();
         for rev in &revs {
@@ -276,6 +313,7 @@ impl InMemoryGraph {
         };
         Self::remove_from_file_index_map(&mut self.revisions_by_file, &rev);
         Self::remove_from_identity_index_map(&mut self.revisions_by_identity, &rev);
+        Self::remove_from_body_hash_index_map(&mut self.revisions_by_body_hash, &rev);
         if let Some(old) = self.edges_by_revision.remove(&revision_id) {
             Self::unlink_source_from_target_reverse(
                 &mut self.target_reverse,
@@ -419,6 +457,14 @@ impl InMemoryGraph {
     ) -> &[NodeRevisionId] {
         self.revisions_by_identity
             .get(&(branch_id, identity_id))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// All revision ids sharing a content-addressed `body_hash` (any branch/status).
+    pub fn revision_ids_for_body_hash(&self, body_hash: &[u8; 32]) -> &[NodeRevisionId] {
+        self.revisions_by_body_hash
+            .get(body_hash)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -1050,5 +1096,61 @@ mod tests {
             Some(r)
         );
         assert_eq!(g2.revision_ids_for_file(branch, "b.py"), &[r]);
+        assert_eq!(g2.revision_ids_for_body_hash(&[0u8; 32]), &[r]);
+    }
+
+    #[test]
+    fn body_hash_index_tracks_put_and_remove() {
+        let mut g = InMemoryGraph::default();
+        let branch = BranchId([0u8; 16]);
+        let identity = id(20);
+        let r1 = rid(50);
+        let r2 = rid(51);
+        let h1 = [7u8; 32];
+        let h2 = [8u8; 32];
+        g.put_revision(NodeRevision {
+            revision_id: r1,
+            identity_id: identity,
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: "a".into(),
+            file_path: "a.py".into(),
+            body_hash: h1,
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: r2,
+            identity_id: id(21),
+            branch_id: branch,
+            status: RevisionStatus::Active,
+            qualified_name: "b".into(),
+            file_path: "b.py".into(),
+            body_hash: h1,
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let mut ids = g.revision_ids_for_body_hash(&h1).to_vec();
+        ids.sort_by_key(|r| r.0);
+        assert_eq!(ids, vec![r1, r2]);
+
+        // Change body hash on r1 → moves index entry.
+        let mut updated = g.get_revision(r1).unwrap().clone();
+        updated.body_hash = h2;
+        g.put_revision(updated);
+        assert_eq!(g.revision_ids_for_body_hash(&h1), &[r2]);
+        assert_eq!(g.revision_ids_for_body_hash(&h2), &[r1]);
+
+        g.remove_revision(r2);
+        assert!(g.revision_ids_for_body_hash(&h1).is_empty());
+        assert_eq!(g.revision_ids_for_body_hash(&h2), &[r1]);
     }
 }

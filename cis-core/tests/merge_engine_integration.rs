@@ -283,6 +283,53 @@ fn theirs_delete_ours_unchanged_accepts_deletion() {
 }
 
 // ---------------------------------------------------------------------------
+// Soft-delete on ours (target): Active + deleted: marker must classify as deletion
+// ---------------------------------------------------------------------------
+#[test]
+fn soft_delete_on_ours_classifies_as_ours_only() {
+    use cis_core::{deleted_key, DeletionAbsenceStore};
+
+    let kv = Arc::new(MemoryKv::new());
+    let mut g = InMemoryGraph::default();
+    let base = BranchId([1u8; 16]);
+    let ours = BranchId([2u8; 16]); // main / target
+    let theirs = BranchId([3u8; 16]); // feature / source
+
+    let f1 = iid(1);
+    let r1 = rid(1);
+    g.put_identity(NodeIdentity {
+        identity_id: f1,
+        kind: NodeKind::Function,
+    });
+    // Shared Active revision on ours (soft-delete keeps status Active).
+    g.put_revision(make_rev(r1, f1, ours, "gone", [10u8; 32], [0u8; 32]));
+    bind(&kv, base, f1, r1);
+    bind(&kv, ours, f1, r1);
+    bind(&kv, theirs, f1, r1); // feature still inherits
+    DeletionAbsenceStore::new(Arc::clone(&kv)).mark_deleted(ours, f1);
+    assert!(kv.get(&deleted_key(ours, f1)).is_some());
+
+    let pa = phase_a_classify(&g, &kv, ours, theirs, base);
+    assert_eq!(
+        pa.classified[0].class,
+        MergeIdentityClass::OursOnly,
+        "soft-deleted on target + unchanged on source → OursOnly, not Clean"
+    );
+    assert!(pa.classified[0].ours_revision.is_none());
+    assert_eq!(pa.classified[0].theirs_revision, Some(r1));
+
+    let _pb = phase_b_promote(&kv, &mut g, ours, &pa.classified, None);
+    assert!(
+        kv.get(&revision_binding_kv_key(ours, f1)).is_none(),
+        "Phase B must unbind soft-deleted identity on target"
+    );
+    assert!(
+        kv.get(&deleted_key(ours, f1)).is_some(),
+        "Phase B must retain/refresh absence marker on target"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Scenario 6: Edge dangling after merge (target deleted)
 // ---------------------------------------------------------------------------
 #[test]

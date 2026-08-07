@@ -1968,10 +1968,22 @@ impl CisMcpRuntime {
     }
 
     /// Remove **`ri:{branch}:`** overlay keys and **`deleted:{branch}:`** absence markers
-    /// from durable KV (post-merge / branch cleanup).
+    /// from durable KV (post-merge / branch cleanup). Also drops `branch_parent:` /
+    /// `fork_ts:` and finalizes soft-deletes on the parent when it has no remaining children.
     pub fn purge_branch(&self, session_id: u64, branch_hex: &str) -> Result<PurgeBranchResponse, AuthError> {
         self.require_admin(session_id)?;
         let branch = parse_branch_id_hex(branch_hex).ok_or(AuthError::InvalidInput)?;
+        let parent = {
+            let key = format!("branch_parent:{}", hex16(&branch.0));
+            self.kv.get(&key).and_then(|bytes| {
+                if bytes.len() != 16 {
+                    return None;
+                }
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&bytes);
+                Some(BranchId(b))
+            })
+        };
         let prefix = format!("ri:{}:", hex16(&branch.0));
         let keys: Vec<String> = self
             .kv
@@ -1984,6 +1996,17 @@ impl CisMcpRuntime {
             self.kv.delete(&k);
         }
         n += absence_for_runtime(&self.kv).purge_branch(branch);
+        self.kv.delete(&format!("branch_parent:{}", hex16(&branch.0)));
+        self.kv.delete(&crate::deletion_absence::fork_ts_key(branch));
+        if let Some(parent) = parent {
+            if !crate::deletion_absence::has_child_branches(self.kv.as_ref(), parent) {
+                let mut g = self.coordinator.graph().write();
+                n += crate::identity_resolution::finalize_soft_deletes_without_children(
+                    &mut g,
+                    self.kv.as_ref(),
+                );
+            }
+        }
         let mut meta = QueryMeta::default();
         meta.policy_version = self.policy.current_version_label();
         meta.node_count = n;
@@ -2991,38 +3014,41 @@ impl CisMcpRuntime {
         if !ann_hits.is_empty() {
             let wanted: HashSet<[u8; 32]> = ann_hits.iter().map(|(h, _)| *h).collect();
             let mut seen_ids = HashSet::new();
-            for r in g.revisions() {
-                if !wanted.contains(&r.body_hash) {
-                    continue;
+            for hash in &wanted {
+                for &rid in g.revision_ids_for_body_hash(hash) {
+                    let Some(hit_rev) = g.get_revision(rid) else {
+                        continue;
+                    };
+                    if !revision_on_chain(&chain, hit_rev.branch_id) {
+                        continue;
+                    }
+                    if !seen_ids.insert(hit_rev.identity_id) {
+                        continue;
+                    }
+                    let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
+                        &g,
+                        &chain,
+                        hit_rev.identity_id,
+                        Some(&absence),
+                    ) else {
+                        continue;
+                    };
+                    if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
+                        continue;
+                    }
+                    match vector.vector_for_body(&r.body_hash) {
+                        Some(entry) if entry.model_id == model_id => embedded_count += 1,
+                        Some(_) | None => stale_count += 1,
+                    }
+                    // Keep ANN-matched hash for scoring even if resolved revision differs.
+                    rows.push(SemanticRow {
+                        revision_id_hex: hex16(&r.revision_id.0),
+                        qualified_name: r.qualified_name.clone(),
+                        body_hash: *hash,
+                        structural_score: structural_substring_score(&needle, &r.qualified_name),
+                        vector_score: 0.0,
+                    });
                 }
-                if !revision_on_chain(&chain, r.branch_id) {
-                    continue;
-                }
-                if !seen_ids.insert(r.identity_id) {
-                    continue;
-                }
-                let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
-                    &g,
-                    &chain,
-                    r.identity_id,
-                    Some(&absence),
-                ) else {
-                    continue;
-                };
-                if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
-                    continue;
-                }
-                match vector.vector_for_body(&r.body_hash) {
-                    Some(entry) if entry.model_id == model_id => embedded_count += 1,
-                    Some(_) | None => stale_count += 1,
-                }
-                rows.push(SemanticRow {
-                    revision_id_hex: hex16(&r.revision_id.0),
-                    qualified_name: r.qualified_name.clone(),
-                    body_hash: r.body_hash,
-                    structural_score: structural_substring_score(&needle, &r.qualified_name),
-                    vector_score: 0.0,
-                });
             }
         } else {
             let mut seen_ids = HashSet::new();

@@ -40,6 +40,11 @@ impl TombstoneGcWorker {
         policy: &RankingPolicy,
         now_ms: u64,
     ) -> Vec<NodeRevisionId> {
+        // Soft-deleted Actives whose branch no longer has children become tombstones first.
+        {
+            let mut g = graph.write();
+            let _ = crate::identity_resolution::finalize_soft_deletes_without_children(&mut g, kv);
+        }
         let g = graph.read();
         let bound = bound_revision_ids(kv);
         let protected_snapshots = snapshot_protected_revisions(kv, policy);
