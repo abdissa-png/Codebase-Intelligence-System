@@ -113,36 +113,58 @@ pub fn resolve_identity_revision<'a>(
 
 /// Like [`resolve_identity_revision`], but honors durable deletion absence markers.
 ///
-/// Nearest-first: if any branch in `chain` has `deleted:{branch}:{identity}`, the identity
-/// is treated as absent (does not fall through to an ancestor Active revision).
+/// Nearest-first walk over `chain` (`[child, parent, …]`). Soft-deleted Active revisions
+/// (absence marker, status still live) and tombstones are skipped when the deletion was
+/// planted **after** the querying branch forked (temporal COW). Own-branch / pre-fork
+/// deletions stop inheritance (do not fall through to an ancestor Active).
 ///
 /// Live primaries (`Active`/`Speculative`) never include tombstones. Per branch, if only a
-/// tombstone remains: bridge via `RENAMED_FROM` when present, otherwise treat as deleted
-/// (do not inherit a parent Active).
+/// tombstone remains and it applies to this query: bridge via `RENAMED_FROM` when present,
+/// otherwise treat as deleted.
 pub fn resolve_identity_revision_with_absence<'a>(
     g: &'a InMemoryGraph,
     chain: &[BranchId],
     identity_id: IdentityId,
     absence: Option<&DeletionAbsenceStore>,
 ) -> Option<&'a NodeRevision> {
-    if let Some(store) = absence {
-        if store.is_deleted_in_chain(chain, identity_id) {
-            return None;
-        }
-    }
     for &branch_id in chain {
+        let honored_absent = absence
+            .map(|store| {
+                store.is_deleted_on_branch(branch_id, identity_id)
+                    && store.should_honor_deletion_for_query(chain, branch_id, identity_id)
+            })
+            .unwrap_or(false);
+
         if let Some(primary) = g.primary_revision_for_identity(branch_id, identity_id) {
             if matches!(
                 primary.status,
                 RevisionStatus::Active | RevisionStatus::Speculative
             ) {
+                if honored_absent {
+                    // Soft-deleted for this query — stop; do not inherit parent.
+                    return None;
+                }
                 return Some(primary);
             }
         }
+
+        // Absence without a live primary (e.g. tombstone already GC'd).
+        if honored_absent {
+            return None;
+        }
+
         if let Some(tomb) = g.tombstone_revision_for_identity(branch_id, identity_id) {
+            if let Some(store) = absence {
+                // Post-fork ancestor tombstone: skip and keep walking toward older parents.
+                if store.is_deleted_on_branch(branch_id, identity_id)
+                    && !store.should_honor_deletion_for_query(chain, branch_id, identity_id)
+                {
+                    continue;
+                }
+            }
             if let Some(successor) = rename_successor_identity(g, tomb.revision_id) {
                 if let Some(store) = absence {
-                    if store.is_deleted_in_chain(chain, successor) {
+                    if store.is_deleted_for_query(chain, successor) {
                         return None;
                     }
                 }
@@ -259,7 +281,7 @@ pub fn for_each_inbound_edge<'a, FFilter, FVisit>(
             continue;
         }
         if let Some(store) = absence {
-            if store.is_deleted_in_chain(chain, src.identity_id) {
+            if store.is_deleted_for_query(chain, src.identity_id) {
                 continue;
             }
         }

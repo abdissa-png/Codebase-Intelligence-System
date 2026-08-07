@@ -57,6 +57,9 @@ pub fn fork_branch_bindings(kv: &MemoryKv, parent: BranchId, child: BranchId) ->
     if kv.get(&parent_meta).is_none() {
         kv.set(&parent_meta, parent.0.to_vec());
     }
+    // Temporal COW: record when this child forked so post-fork parent deletions
+    // do not hide inherited symbols for the child.
+    crate::deletion_absence::record_fork_timestamp(kv, child);
     count
 }
 
@@ -153,6 +156,7 @@ mod tests {
         assert_eq!(fork_branch_bindings(kv.as_ref(), parent, child), 1);
         let chex = child.0.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         assert!(kv.get(&format!("ri:{chex}:{idhex}")).is_some());
+        assert!(crate::deletion_absence::fork_timestamp(kv.as_ref(), child).is_some());
     }
 
     #[test]

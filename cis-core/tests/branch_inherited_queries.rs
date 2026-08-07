@@ -341,3 +341,136 @@ fn deleted_file_hides_inherited_symbols_on_feature() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn parent_delete_after_fork_child_keeps_inherited_symbol() {
+    // Temporal COW: deleting on main after feature forked must not hide the symbol
+    // from feature. Main itself must still hide it.
+    let root = temp_repo("parent-del-cow");
+    let rt = CisMcpRuntime::new_dev(&root.to_string_lossy());
+    let rel = "cow.py";
+    fs::write(
+        root.join(rel),
+        "def keep():\n    return 1\n\ndef gone():\n    return 2\n",
+    )
+    .unwrap();
+    rt.reindex_python_paths(&[rel]).expect("ingest main");
+
+    rt.create_branch(0, "feature", Some("main")).unwrap();
+    // Ensure fork_ts < deletion_ts (same-ms wall clock would make del_ts <= fork_ts).
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    rt.switch_branch(0, "main").unwrap();
+    rt.write_file(0, rel, "def keep():\n    return 1\n", true)
+        .unwrap();
+
+    let on_main_gone = rt.find_symbol(0, "gone", None, 10, false).unwrap();
+    assert!(
+        !names(&on_main_gone.matches)
+            .iter()
+            .any(|n| n.contains("gone")),
+        "main must hide gone after delete: {:?}",
+        names(&on_main_gone.matches)
+    );
+    let on_main_keep = rt.find_symbol(0, "keep", None, 10, false).unwrap();
+    assert!(
+        names(&on_main_keep.matches)
+            .iter()
+            .any(|n| n.contains("keep")),
+        "main must still see keep: {:?}",
+        names(&on_main_keep.matches)
+    );
+
+    // Soft-delete: shared revision stays Active for children.
+    {
+        let g = rt.graph_mutex().read();
+        let gone_live = g.revisions().any(|r| {
+            r.qualified_name.contains("gone")
+                && matches!(
+                    r.status,
+                    cis_core::RevisionStatus::Active | cis_core::RevisionStatus::Speculative
+                )
+        });
+        assert!(
+            gone_live,
+            "parent soft-delete must leave Active revision for child inheritance"
+        );
+    }
+
+    rt.switch_branch(0, "feature").unwrap();
+    let on_feat_gone = rt.find_symbol(0, "gone", None, 10, false).unwrap();
+    assert!(
+        names(&on_feat_gone.matches)
+            .iter()
+            .any(|n| n.contains("gone")),
+        "feature must keep gone after post-fork parent delete: {:?}",
+        names(&on_feat_gone.matches)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn finalize_soft_deletes_when_last_child_gone() {
+    use cis_core::{
+        finalize_soft_deletes_without_children, fork_ts_key, RevisionStatus,
+    };
+
+    let root = temp_repo("soft-finalize");
+    let rt = CisMcpRuntime::new_dev(&root.to_string_lossy());
+    let rel = "sf.py";
+    fs::write(
+        root.join(rel),
+        "def keep():\n    return 1\n\ndef gone():\n    return 2\n",
+    )
+    .unwrap();
+    rt.reindex_python_paths(&[rel]).expect("ingest");
+    let created = rt.create_branch(0, "feature", Some("main")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    rt.switch_branch(0, "main").unwrap();
+    rt.write_file(0, rel, "def keep():\n    return 1\n", true)
+        .unwrap();
+
+    {
+        let g = rt.graph_mutex().read();
+        assert!(g.revisions().any(|r| {
+            r.qualified_name.contains("gone")
+                && matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative)
+        }));
+    }
+
+    // Simulate last-child purge: drop branch_parent / fork_ts / ri: for feature.
+    let feature = parse_branch(&created.branch_id_hex);
+    let feature_hex: String = feature
+        .0
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let ri_prefix = format!("ri:{feature_hex}:");
+    for (k, _) in rt.kv().scan_prefix(&ri_prefix) {
+        rt.kv().delete(&k);
+    }
+    rt.kv().delete(&format!("branch_parent:{feature_hex}"));
+    rt.kv().delete(&fork_ts_key(feature));
+
+    let n = {
+        let mut g = rt.graph_mutex().write();
+        finalize_soft_deletes_without_children(&mut g, rt.kv().as_ref())
+    };
+    assert!(n >= 1, "expected at least one soft-delete finalized, got {n}");
+
+    {
+        let g = rt.graph_mutex().read();
+        let gone = g
+            .revisions()
+            .find(|r| r.qualified_name.contains("gone"))
+            .expect("gone revision still present");
+        assert!(
+            matches!(gone.status, RevisionStatus::Tombstone),
+            "soft-delete must harden to Tombstone after last child gone, got {:?}",
+            gone.status
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}

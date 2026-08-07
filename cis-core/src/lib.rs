@@ -135,7 +135,10 @@ pub use query_engine::{
 pub use coordinator::{CoordinatorError, CoordinatorPersistence, WriteCoordinator};
 pub use daemon_handles::CisDaemonHandles;
 pub use degraded::{disk_free_percent, DiskPressureFlag, VectorDegradedController};
-pub use deletion_absence::{deleted_key, DeletionAbsenceStore};
+pub use deletion_absence::{
+    child_branches, deleted_key, fork_timestamp, fork_ts_key, has_child_branches,
+    list_deleted_markers, record_fork_timestamp, DeletionAbsenceStore,
+};
 pub use edge_target_override::{
     delete_eto_for_source_revision, eto_key, retarget_inbound_edges_for_rename,
     tombstone_needed_for_inbound_bridge, EdgeTargetOverrideStore,
@@ -184,7 +187,8 @@ pub use language_indexer::{
     default_indexers, indexer_for_path, IndexError, LanguageIndexer, PythonIndexer,
 };
 pub use identity_resolution::{
-    best_tombstone_rename, tombstone_all_file_symbols, tombstone_all_file_symbols_with_absence,
+    best_tombstone_rename, finalize_soft_deletes_without_children, tombstone_all_file_symbols,
+    tombstone_all_file_symbols_with_absence, tombstone_orphaned_file_symbols,
     tombstone_orphaned_file_symbols_with_absence, RenameConfig, ResolveOutcome,
 };
 pub use identity_resolver::{

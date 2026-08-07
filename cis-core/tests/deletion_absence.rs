@@ -277,6 +277,16 @@ fn durable_prefix_includes_deleted() {
         cis_core::DURABLE_KV_PREFIXES.iter().any(|p| *p == "deleted:"),
         "deleted: must be durable across restart"
     );
+    assert!(
+        cis_core::DURABLE_KV_PREFIXES.iter().any(|p| *p == "fork_ts:"),
+        "fork_ts: must be durable across restart"
+    );
+    assert!(
+        cis_core::DURABLE_KV_PREFIXES
+            .iter()
+            .any(|p| *p == "branch_parent:"),
+        "branch_parent: must be durable across restart"
+    );
 }
 
 #[test]

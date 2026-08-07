@@ -592,6 +592,13 @@ fn do_tombstone(
         if let Some(rev) = graph.get_revision(rid).cloned() {
             if let Some(store) = absence {
                 store.mark_deleted(rev.branch_id, rev.identity_id);
+                // Soft-delete when child branches inherit this revision: keep status
+                // Active so post-fork children still resolve via chain walk. The
+                // absence marker hides it on THIS branch (temporal COW).
+                if crate::deletion_absence::has_child_branches(store.kv().as_ref(), rev.branch_id)
+                {
+                    continue;
+                }
             }
             let mut updated = rev;
             updated.status = RevisionStatus::Tombstone;
@@ -599,6 +606,41 @@ fn do_tombstone(
             graph.put_revision(updated);
         }
     }
+}
+
+/// Flip soft-deleted Active revisions to Tombstone once their branch has no children.
+///
+/// Soft-delete keeps revisions Active so post-fork children can inherit. After the last
+/// child is purged, those Actives are no longer needed and become normal tombstones
+/// (eligible for retention GC).
+///
+/// Returns the number of revisions converted.
+pub fn finalize_soft_deletes_without_children(
+    graph: &mut InMemoryGraph,
+    kv: &crate::kv::MemoryKv,
+) -> usize {
+    let ts = now_ms();
+    let mut n = 0usize;
+    for (branch, identity) in crate::deletion_absence::list_deleted_markers(kv) {
+        if crate::deletion_absence::has_child_branches(kv, branch) {
+            continue;
+        }
+        let Some(primary) = graph.primary_revision_for_identity(branch, identity).cloned() else {
+            continue;
+        };
+        if !matches!(
+            primary.status,
+            RevisionStatus::Active | RevisionStatus::Speculative
+        ) {
+            continue;
+        }
+        let mut updated = primary;
+        updated.status = RevisionStatus::Tombstone;
+        updated.tombstoned_at_ms = Some(ts);
+        graph.put_revision(updated);
+        n += 1;
+    }
+    n
 }
 
 /// Plant branch-local tombstones that hide inherited (other-branch) live symbols on `file_path`
