@@ -36,6 +36,9 @@ pub enum Language {
     Rust,
     Java,
     Cpp,
+    JavaScript,
+    CSharp,
+    C,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,14 +294,11 @@ impl InMemoryGraph {
         self.revisions_by_file.clear();
         self.revisions_by_identity.clear();
         self.revisions_by_body_hash.clear();
-        let revs: Vec<NodeRevision> = self.revisions.values().cloned().collect();
-        for rev in &revs {
+        let mut identities: HashSet<(BranchId, IdentityId)> = HashSet::new();
+        for rev in self.revisions.values() {
             Self::add_to_file_index_map(&mut self.revisions_by_file, rev);
             Self::add_to_identity_index_map(&mut self.revisions_by_identity, rev);
             Self::add_to_body_hash_index_map(&mut self.revisions_by_body_hash, rev);
-        }
-        let mut identities: HashSet<(BranchId, IdentityId)> = HashSet::new();
-        for rev in &revs {
             identities.insert((rev.branch_id, rev.identity_id));
         }
         for (branch, identity) in identities {
@@ -636,20 +636,47 @@ impl InMemoryGraph {
     }
 
     /// Rebuild graph + **TargetReverseIndex** from a snapshot.
+    ///
+    /// Bulk-inserts revisions/edges then rebuilds secondary indices once. Using
+    /// [`Self::put_revision`] per row was O(n²)-ish on warm load (recompute primary
+    /// + index maintenance per symbol) and made MCP startup miss Cursor's handshake
+    /// timeout on multi‑thousand-symbol workspaces.
     pub fn from_snapshot(snap: GraphSnapshot) -> Result<Self, &'static str> {
         let mut g = InMemoryGraph::default();
+        let n_identities = snap.identities.len();
+        let n_revisions = snap.revisions.len();
+        let n_edges = snap.edges.len();
+        g.identities.reserve(n_identities);
         for id in snap.identities {
-            g.put_identity(id);
+            g.identities.insert(id.identity_id, id);
         }
+        g.revisions.reserve(n_revisions);
         for rev in snap.revisions {
-            g.put_revision(rev);
+            g.revisions.insert(rev.revision_id, rev);
         }
-        let mut by_rev: HashMap<NodeRevisionId, Vec<GraphEdge>> = HashMap::new();
+        let mut by_rev: HashMap<NodeRevisionId, Vec<GraphEdge>> =
+            HashMap::with_capacity(n_edges.min(n_revisions));
         for e in snap.edges {
             by_rev.entry(e.source_revision_id).or_default().push(e);
         }
+        g.edges_by_revision.reserve(by_rev.len());
         for (rev, edges) in by_rev {
-            g.replace_edges_for_revision(rev, edges)?;
+            let source_identity = g
+                .revisions
+                .get(&rev)
+                .map(|r| r.identity_id)
+                .ok_or("unknown revision")?;
+            validate_edge_cardinality(&edges).map_err(|_| "cardinality_violation")?;
+            for e in &edges {
+                if e.source_revision_id != rev {
+                    return Err("edge source_revision_id must match replace_edges_for_revision");
+                }
+                g.target_reverse
+                    .entry(e.target_identity_id)
+                    .or_default()
+                    .insert(source_identity);
+            }
+            g.edges_by_revision.insert(rev, edges);
         }
         g.rebuild_secondary_indices();
         Ok(g)

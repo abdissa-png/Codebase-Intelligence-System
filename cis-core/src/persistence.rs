@@ -91,6 +91,9 @@ pub struct KvSnapshotFile {
 }
 
 /// Atomic JSON write: unique `*.tmp` → `fsync` → `rename`.
+///
+/// Writes **compact** JSON (not pretty). Pretty snapshots inflated `.cis/graph.json` to
+/// multi‑MB whitespace and made warm MCP startup parse/rebuild take tens of seconds.
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -108,11 +111,15 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()>
             .write(true)
             .truncate(true)
             .open(&tmp)?;
-        serde_json::to_writer_pretty(&mut f, value).map_err(|e| {
+        serde_json::to_writer(&mut f, value).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
         })?;
         f.flush()?;
-        f.sync_all()?;
+        if !std::env::var_os("CIS_SNAPSHOT_FSYNC").is_some_and(|v| {
+            v == "0" || v.eq_ignore_ascii_case("false")
+        }) {
+            f.sync_all()?;
+        }
     }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
@@ -121,10 +128,20 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()>
     Ok(())
 }
 
+/// When true, [`load_state_from_cis_dir`] skips `vector.json` (load later for MCP warm start).
+pub fn defer_vector_snapshot_load() -> bool {
+    std::env::var_os("CIS_DEFER_VECTOR_LOAD").is_some_and(|v| {
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
+}
+
 pub fn load_graph_snapshot(path: &Path) -> io::Result<InMemoryGraph> {
-    let f = File::open(path)?;
-    let snap: GraphSnapshot = serde_json::from_reader(f)
+    let t0 = std::time::Instant::now();
+    let bytes = fs::read(path)?;
+    let t_read = t0.elapsed();
+    let snap: GraphSnapshot = serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let t_parse = t0.elapsed();
     if snap.version != GRAPH_SNAPSHOT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -134,7 +151,17 @@ pub fn load_graph_snapshot(path: &Path) -> io::Result<InMemoryGraph> {
             ),
         ));
     }
-    InMemoryGraph::from_snapshot(snap).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let g = InMemoryGraph::from_snapshot(snap)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    eprintln!(
+        "cisd: graph.json read={:.1}s parse={:.1}s rebuild={:.1}s total={:.1}s ({} bytes)",
+        t_read.as_secs_f64(),
+        (t_parse - t_read).as_secs_f64(),
+        (t0.elapsed() - t_parse).as_secs_f64(),
+        t0.elapsed().as_secs_f64(),
+        bytes.len()
+    );
+    Ok(g)
 }
 
 pub fn save_graph_snapshot(path: &Path, graph: &InMemoryGraph) -> io::Result<()> {
@@ -209,6 +236,7 @@ pub fn load_state_from_cis_dir(
     vector: &InMemoryVectorStore,
 ) -> PersistenceLoadReport {
     let mut report = PersistenceLoadReport::default();
+    let t_graph = std::time::Instant::now();
     match crate::graph_store::load_graph_with_backend(cis, graph) {
         Ok(true) => {
             report.graph_loaded = true;
@@ -234,16 +262,50 @@ pub fn load_state_from_cis_dir(
             }
         }
     }
+    if report.graph_loaded {
+        eprintln!(
+            "cisd: loaded graph ({} revs, {} edges) in {:.1}s",
+            report.graph_revisions,
+            report.graph_edges,
+            t_graph.elapsed().as_secs_f64()
+        );
+    }
     let vpath = vector_snapshot_path(cis);
-    if vpath.exists() {
+    if vpath.exists() && !defer_vector_snapshot_load() {
+        let t_vec = std::time::Instant::now();
         match load_vector_snapshot(&vpath) {
             Ok(snap) => {
                 report.vector_loaded = true;
                 report.vector_chunks = snap.chunk_count();
                 snap.restore_into(vector);
+                eprintln!(
+                    "cisd: loaded vector snapshot ({} chunks) in {:.1}s",
+                    report.vector_chunks,
+                    t_vec.elapsed().as_secs_f64()
+                );
             }
             Err(e) => report.vector_error = Some(e.to_string()),
         }
+    } else if vpath.exists() {
+        eprintln!("cisd: deferring vector.json load (CIS_DEFER_VECTOR_LOAD)");
+    }
+    report
+}
+
+/// Load only `vector.json` into an existing vector store (after deferred startup).
+pub fn load_vector_into(cis: &Path, vector: &InMemoryVectorStore) -> PersistenceLoadReport {
+    let mut report = PersistenceLoadReport::default();
+    let vpath = vector_snapshot_path(cis);
+    if !vpath.exists() {
+        return report;
+    }
+    match load_vector_snapshot(&vpath) {
+        Ok(snap) => {
+            report.vector_loaded = true;
+            report.vector_chunks = snap.chunk_count();
+            snap.restore_into(vector);
+        }
+        Err(e) => report.vector_error = Some(e.to_string()),
     }
     report
 }
@@ -343,18 +405,28 @@ pub fn open_persisted_coordinator(
 ) -> std::io::Result<Arc<WriteCoordinator>> {
     let cis = cis_dir(&repo_root);
     std::fs::create_dir_all(&cis)?;
+    let t0 = std::time::Instant::now();
     let wal: Arc<dyn MutationLogStore> = if std::env::var_os("CIS_WAL_MEMORY")
         .is_some_and(|v| v == "1")
     {
         Arc::new(MutationLog::new())
     } else {
         let path = wal_path(&cis);
-        Arc::new(DurableMutationLog::open(&path)?)
+        let w = DurableMutationLog::open(&path)?;
+        eprintln!("cisd: wal open in {:.1}s", t0.elapsed().as_secs_f64());
+        Arc::new(w)
     };
-    Ok(Arc::new(WriteCoordinator::open(
+    let t1 = std::time::Instant::now();
+    let coord = Arc::new(WriteCoordinator::open(
         wal,
         Some(CoordinatorPersistence { cis_dir: cis }),
-    )))
+    ));
+    eprintln!(
+        "cisd: graph/vector snapshot load in {:.1}s (defer_vector={})",
+        t1.elapsed().as_secs_f64(),
+        defer_vector_snapshot_load()
+    );
+    Ok(coord)
 }
 
 #[derive(Debug, Default, Clone)]

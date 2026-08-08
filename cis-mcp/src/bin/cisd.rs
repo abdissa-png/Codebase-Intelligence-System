@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cis_core::{
-    cis_dir, embedder_from_env, kv_snapshot_path, load_env_file, load_kv_snapshot,
-    open_persisted_coordinator, ActiveRankingPolicy, BodyStore,
+    cis_dir, defer_vector_snapshot_load, embedder_from_env, kv_snapshot_path, load_env_file,
+    load_kv_snapshot, load_vector_into, open_persisted_coordinator, ActiveRankingPolicy, BodyStore,
     CisDaemonHandles, CisMcpRuntime, EmbeddingWorker, MemoryKv, MergeRecoveryGate,
     MergeSagaOrchestrator, PolicyFileReloader, PolicyReloadOutcome, VectorCleanupQueue,
     VectorCleanupWorker, disk_free_percent, sweep_all_expired_merge_intents,
 };
-use cis_mcp::{build_runtime, run_stdio};
+use cis_mcp::{build_runtime, run_stdio_slot, McpRuntimeSlot};
 
 fn policy_path() -> PathBuf {
     std::env::var_os("CIS_POLICY_PATH")
@@ -380,6 +380,169 @@ fn coord_embed_policy_thresholds(coord: &cis_core::WriteCoordinator, policy: &ci
     coord.set_embedding_queue_thresholds(policy.embedding_queue_hwm, policy.embedding_queue_lwm);
 }
 
+struct PreparedDaemon {
+    coord: Arc<cis_core::WriteCoordinator>,
+    kv: Arc<MemoryKv>,
+    handles: CisDaemonHandles,
+    dlq: Arc<VectorCleanupQueue>,
+    version_label: String,
+}
+
+/// Open WAL/graph, recover, spawn daemon workers. Heavy — do not block MCP handshake on this.
+fn prepare_daemon(
+    repo: &PathBuf,
+    policy_snap: &cis_core::RankingPolicySnapshot,
+    reloader: Option<Arc<PolicyFileReloader>>,
+    mcp_mode: bool,
+    version_label: String,
+) -> Result<PreparedDaemon, String> {
+    let coord = open_persisted_coordinator(repo).map_err(|e| e.to_string())?;
+    if let Some(dir) = coord.persistence_dir() {
+        eprintln!("cisd: persistence at {:?}", dir);
+    }
+    coord.set_embedding_queue_thresholds(
+        policy_snap.embedding_queue_hwm,
+        policy_snap.embedding_queue_lwm,
+    );
+    let kv = Arc::new(MemoryKv::new());
+    let cis = cis_dir(repo);
+    if cis.is_dir() {
+        let kpath = kv_snapshot_path(&cis);
+        if kpath.exists() {
+            if let Err(e) = load_kv_snapshot(&kpath, kv.as_ref()) {
+                eprintln!("cisd: kv snapshot load failed: {e}");
+            }
+        }
+    }
+    let saga = Arc::new(MergeSagaOrchestrator::new(Arc::clone(&kv)));
+    let rep = coord.reconcile_on_startup(saga.as_ref());
+    eprintln!("cisd: startup recovery {:?}", rep);
+    if rep.wal_replay_failed {
+        return Err("WAL replay failed — refusing to start".into());
+    }
+
+    let handles = CisDaemonHandles::open(repo, policy_snap);
+    handles.audit.resume_from_kv(&kv);
+    let branches: Vec<cis_wal::BranchId> = kv
+        .scan_prefix("branch_reg:")
+        .into_iter()
+        .filter_map(|(_k, v)| {
+            if v.len() == 16 {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&v);
+                Some(cis_wal::BranchId(b))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let body_store_startup = BodyStore::new(Arc::clone(&kv));
+    {
+        let merge_control_startup = cis_core::MergeControl::new(Arc::clone(&kv));
+        let gate = cis_core::MergeRecoveryGate::new(Arc::clone(&kv));
+        let mut g = coord.graph().write();
+        let merge_rep = cis_core::recover_inflight_merges(
+            &mut *g,
+            kv.as_ref(),
+            &body_store_startup,
+            saga.as_ref(),
+            &merge_control_startup,
+            coord.vector_chunk_store(),
+            &gate,
+            None,
+        );
+        drop(g);
+        let compensated = saga.compensate_orphans();
+        eprintln!(
+            "cisd: merge recovery resumed={} compensated_by_recover={} orphans_purged={}",
+            merge_rep.resumed, merge_rep.compensated, compensated
+        );
+    }
+    let run_consistency = std::env::var_os("CIS_STARTUP_CONSISTENCY").is_some_and(|v| {
+        v == "1" || v.eq_ignore_ascii_case("true")
+    }) || (!mcp_mode
+        && !std::env::var_os("CIS_STARTUP_CONSISTENCY").is_some_and(|v| {
+            v == "0" || v.eq_ignore_ascii_case("false")
+        }));
+    if run_consistency {
+        let consistency =
+            cis_core::check_consistency(coord.graph(), &kv, &body_store_startup, &branches);
+        let startup_now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        handles.last_consistency.update(&consistency, startup_now_ms);
+        if !consistency.is_clean() {
+            handles
+                .audit
+                .record_sync(0, format!("startup_consistency {}", consistency.summary()));
+            eprintln!("cisd: startup consistency check: {}", consistency.summary());
+        }
+    } else {
+        eprintln!(
+            "cisd: skipping startup consistency check (set CIS_STARTUP_CONSISTENCY=1 to enable)"
+        );
+    }
+    let merge_control = Arc::new(cis_core::MergeControl::new(Arc::clone(&kv)));
+    let body_store = Arc::new(BodyStore::new(Arc::clone(&kv)));
+    let dlq = vector_dlq();
+    spawn_background_threads(
+        Arc::clone(&coord),
+        Arc::clone(&kv),
+        saga,
+        reloader,
+        policy_snap.merge_ttl_hours,
+        Arc::clone(&dlq),
+        handles.clone(),
+        repo.clone(),
+        merge_control,
+        body_store,
+    );
+    Ok(PreparedDaemon {
+        coord,
+        kv,
+        handles,
+        dlq,
+        version_label,
+    })
+}
+
+fn boot_mcp_runtime(
+    repo: PathBuf,
+    policy_snap: cis_core::RankingPolicySnapshot,
+    reloader: Option<Arc<PolicyFileReloader>>,
+    version_label: String,
+) -> Result<Arc<CisMcpRuntime>, String> {
+    let prepared = prepare_daemon(&repo, &policy_snap, reloader, true, version_label.clone())?;
+    eprintln!(
+        "cisd: MCP workspace ready for tools (policy_version={} dlq_depth={})",
+        prepared.version_label,
+        prepared.dlq.depth()
+    );
+    let rt = CisMcpRuntime::attach_coordinator(
+        &repo,
+        prepared.coord,
+        prepared.kv,
+        Some(prepared.handles),
+    );
+    let rt = build_runtime(Some(rt)).map_err(|e| e.to_string())?;
+    if defer_vector_snapshot_load() {
+        let coord_bg = Arc::clone(rt.coordinator());
+        let cis_bg = cis_dir(&repo);
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let rep = load_vector_into(&cis_bg, coord_bg.vector());
+            eprintln!(
+                "cisd: background vector load done in {:.1}s (loaded={} chunks={})",
+                t.elapsed().as_secs_f64(),
+                rep.vector_loaded,
+                rep.vector_chunks
+            );
+        });
+    }
+    Ok(rt)
+}
+
 fn main() {
     load_env_file(None);
     let mcp_mode = std::env::args().any(|a| a == "--mcp" || a == "-mcp");
@@ -411,132 +574,60 @@ fn main() {
     let repo = std::env::var_os("CIS_REPO_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let coord = match open_persisted_coordinator(&repo) {
-        Ok(c) => {
-            if let Some(dir) = c.persistence_dir() {
-                eprintln!("cisd: persistence at {:?}", dir);
-            }
-            c
-        }
-        Err(e) => {
-            eprintln!("cisd: cannot open persisted coordinator: {}", e);
-            std::process::exit(1);
-        }
-    };
-    coord.set_embedding_queue_thresholds(
-        policy_snap.embedding_queue_hwm,
-        policy_snap.embedding_queue_lwm,
-    );
-    let kv = Arc::new(MemoryKv::new());
-    let cis = cis_dir(&repo);
-    if cis.is_dir() {
-        let kpath = kv_snapshot_path(&cis);
-        if kpath.exists() {
-            if let Err(e) = load_kv_snapshot(&kpath, kv.as_ref()) {
-                eprintln!("cisd: kv snapshot load failed: {e}");
-            }
-        }
-    }
-    let saga = Arc::new(MergeSagaOrchestrator::new(Arc::clone(&kv)));
-    let rep = coord.reconcile_on_startup(saga.as_ref());
-    eprintln!("cisd: startup recovery {:?}", rep);
-    if rep.wal_replay_failed {
-        eprintln!("cisd: WAL replay failed — refusing to start");
-        std::process::exit(1);
+
+    // MCP clients (Cursor) time out if initialize/tools/list wait on full warm-start.
+    // Defer vector.json by default; structural tools work without embeddings loaded.
+    if mcp_mode && std::env::var_os("CIS_DEFER_VECTOR_LOAD").is_none() {
+        std::env::set_var("CIS_DEFER_VECTOR_LOAD", "1");
     }
 
-    let handles = CisDaemonHandles::open(&repo, &policy_snap);
-    handles.audit.resume_from_kv(&kv);
-    let branches: Vec<cis_wal::BranchId> = kv
-        .scan_prefix("branch_reg:")
-        .into_iter()
-        .filter_map(|(_k, v)| {
-            if v.len() == 16 {
-                let mut b = [0u8; 16];
-                b.copy_from_slice(&v);
-                Some(cis_wal::BranchId(b))
-            } else {
-                None
-            }
-        })
-        .collect();
-    let body_store_startup = BodyStore::new(Arc::clone(&kv));
-    // Resume in-flight merges before compensating orphans / stuck locks.
-    {
-        let merge_control_startup = cis_core::MergeControl::new(Arc::clone(&kv));
-        let gate = cis_core::MergeRecoveryGate::new(Arc::clone(&kv));
-        let mut g = coord.graph().write();
-        let merge_rep = cis_core::recover_inflight_merges(
-            &mut *g,
-            kv.as_ref(),
-            &body_store_startup,
-            saga.as_ref(),
-            &merge_control_startup,
-            coord.vector_chunk_store(),
-            &gate,
-            None,
-        );
-        drop(g);
-        let compensated = saga.compensate_orphans();
-        eprintln!(
-            "cisd: merge recovery resumed={} compensated_by_recover={} orphans_purged={}",
-            merge_rep.resumed, merge_rep.compensated, compensated
-        );
-    }
-    let consistency = cis_core::check_consistency(
-        coord.graph(),
-        &kv,
-        &body_store_startup,
-        &branches,
-    );
-    let startup_now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    handles.last_consistency.update(&consistency, startup_now_ms);
-    if !consistency.is_clean() {
-        handles.audit.record_sync(0, format!("startup_consistency {}", consistency.summary()));
-        eprintln!("cisd: startup consistency check: {}", consistency.summary());
-    }
-    let merge_control = Arc::new(cis_core::MergeControl::new(Arc::clone(&kv)));
-    let body_store = Arc::new(BodyStore::new(Arc::clone(&kv)));
-
-    let dlq = vector_dlq();
-    spawn_background_threads(
-        Arc::clone(&coord),
-        Arc::clone(&kv),
-        saga,
-        reloader,
-        policy_snap.merge_ttl_hours,
-        Arc::clone(&dlq),
-        handles.clone(),
-        repo.clone(),
-        merge_control,
-        body_store,
-    );
-
+    // Cursor MCP IPC metadata timeout defaults to 10s — answer handshake before WAL/graph boot.
     if mcp_mode {
+        let slot = McpRuntimeSlot::new();
+        let slot_bg = Arc::clone(&slot);
+        let repo_bg = repo.clone();
+        let policy_bg = policy_snap.clone();
+        let reloader_bg = reloader.clone();
+        let version_bg = version_label.clone();
+        std::thread::Builder::new()
+            .name("cis-mcp-boot".into())
+            .spawn(move || match boot_mcp_runtime(repo_bg, policy_bg, reloader_bg, version_bg)
+            {
+                Ok(rt) => {
+                    eprintln!("cisd: MCP boot complete — tools/call unlocked");
+                    slot_bg.set_ready(rt);
+                }
+                Err(e) => {
+                    eprintln!("cisd: MCP boot failed: {e}");
+                    slot_bg.set_failed(e);
+                }
+            })
+            .expect("spawn cis-mcp-boot");
         eprintln!(
-            "cisd: MCP stdio mode (policy_version={} dlq_depth={})",
-            version_label,
-            dlq.depth()
+            "cisd: MCP stdio accepting initialize/tools/list (workspace loading; policy={})",
+            version_label
         );
-        let rt = CisMcpRuntime::attach_coordinator(&repo, coord, kv, Some(handles));
-        let rt = build_runtime(Some(rt)).unwrap_or_else(|e| {
-            eprintln!("cisd: MCP bootstrap failed: {}", e);
-            std::process::exit(1);
-        });
-        if let Err(e) = run_stdio(rt) {
+        if let Err(e) = run_stdio_slot(slot) {
             eprintln!("cisd: MCP stdio exited: {}", e);
             std::process::exit(1);
         }
         return;
     }
 
+    let prepared = match prepare_daemon(&repo, &policy_snap, reloader, false, version_label.clone())
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cisd: {e}");
+            std::process::exit(1);
+        }
+    };
+
     eprintln!(
         "cisd: ready policy_version={} vector_dlq_depth={} (Ctrl+C to exit; use --mcp for stdio MCP)",
-        version_label,
-        dlq.depth()
+        prepared.version_label,
+        prepared.dlq.depth()
     );
+    let _keep = (prepared.coord, prepared.kv, prepared.handles, prepared.dlq);
     std::thread::park();
 }

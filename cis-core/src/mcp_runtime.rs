@@ -1234,23 +1234,16 @@ impl CisMcpRuntime {
     /// Refresh MCP index counters from the in-memory graph (after snapshot load or ingest).
     pub fn sync_index_status_from_graph(&self) {
         let g = self.coordinator.graph().read();
-        let symbols_indexed = g
-            .revisions()
-            .filter(|r| matches!(r.status, RevisionStatus::Active))
-            .count();
-        let edges_indexed: usize = g
-            .revisions()
-            .filter(|r| matches!(r.status, RevisionStatus::Active))
-            .map(|r| g.outbound_edges(r.revision_id).len())
-            .sum();
-        let files: HashSet<String> = g
-            .revisions()
-            .filter(|r| matches!(r.status, RevisionStatus::Active))
-            .map(|r| r.file_path.clone())
-            .filter(|p| {
-                p.ends_with(".py") || p.ends_with(".ts") || p.ends_with(".tsx")
-            })
-            .collect();
+        let mut symbols_indexed = 0usize;
+        let mut edges_indexed = 0usize;
+        let mut files: HashSet<String> = HashSet::new();
+        for r in g.revisions().filter(|r| matches!(r.status, RevisionStatus::Active)) {
+            symbols_indexed += 1;
+            edges_indexed += g.outbound_edges(r.revision_id).len();
+            if crate::language_indexer::path_is_indexable(&r.file_path) {
+                files.insert(r.file_path.clone());
+            }
+        }
         let model_id = self.embedder.model_id().to_string();
         let vector = self.coordinator.vector();
         let snap = vector.export_snapshot();
@@ -1260,19 +1253,27 @@ impl CisMcpRuntime {
             .filter(|v| v.model_id == model_id)
             .count();
         let embed_chunks_registered = snap.chunks.len();
-        let mut embedded = 0usize;
-        let mut stale = 0usize;
-        for r in g.revisions().filter(|r| matches!(r.status, RevisionStatus::Active)) {
-            match vector.vector_for_body(&r.body_hash) {
-                Some(entry) if entry.model_id == model_id => embedded += 1,
-                Some(_) | None => stale += 1,
+        // When vectors are deferred/empty, skip O(n) body-hash probes and disk walks so
+        // MCP initialize is not blocked on embedding bookkeeping.
+        let (embedded, stale, body_blobs_stored) = if unique_vectors == 0 && embed_chunks_registered == 0
+        {
+            (0, symbols_indexed, 0)
+        } else {
+            let mut embedded = 0usize;
+            let mut stale = 0usize;
+            for r in g.revisions().filter(|r| matches!(r.status, RevisionStatus::Active)) {
+                match vector.vector_for_body(&r.body_hash) {
+                    Some(entry) if entry.model_id == model_id => embedded += 1,
+                    Some(_) | None => stale += 1,
+                }
             }
-        }
-        let body_blobs_stored = self
-            .body_blob_store
-            .list_hashes()
-            .map(|h| h.len())
-            .unwrap_or(0);
+            let body_blobs_stored = self
+                .body_blob_store
+                .list_hashes()
+                .map(|h| h.len())
+                .unwrap_or(0);
+            (embedded, stale, body_blobs_stored)
+        };
         drop(g);
         let ann_size = self.ann_index.lock().unwrap().len();
         let mut st = self.index_status.lock().unwrap();
@@ -1916,8 +1917,14 @@ impl CisMcpRuntime {
         self.require_session(session_id)?;
         let branch = branch_id.unwrap_or(self.active_branch());
         let t0 = Instant::now();
+        // Filter to registered language extensions (py/ts/rs/go/…); skip build artifacts.
+        let indexable: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|p| crate::language_indexer::path_is_indexable(p))
+            .collect();
         let rep = self
-            .reindex_python_paths_on_branch(paths, branch)
+            .reindex_paths_on_branch(&indexable, branch)
             .map_err(|e| {
                 eprintln!("cis-mcp: reindex_paths: {:?}", e);
                 AuthError::InvalidInput
@@ -1926,7 +1933,7 @@ impl CisMcpRuntime {
             self.sync_index_status_from_graph();
         }
         self.sync_bodies_after_commit(branch);
-        let patches_confirmed = self.confirm_pending_patches_for_paths(paths);
+        let patches_confirmed = self.confirm_pending_patches_for_paths(&indexable);
         let persisted_snapshots = crate::fs_sync::reindex_persist_snapshots_enabled();
         let mut meta = self.meta_at_commit(false, t0.elapsed().as_millis() as u64, 0, None, false, None);
         meta.node_count = rep.applied;
