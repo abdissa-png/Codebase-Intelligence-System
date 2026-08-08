@@ -220,7 +220,18 @@ pub fn apply_index_events_with_config(
     }
 
     let mut rep = IngestApplyReport::default();
-    for ev in events {
+    let progress_total = events.len();
+    let progress_every = (progress_total / 10).max(10);
+    let progress_t0 = std::time::Instant::now();
+    for (ev_i, ev) in events.into_iter().enumerate() {
+        if progress_total >= 20 && (ev_i + 1) % progress_every == 0 {
+            eprintln!(
+                "cis-mcp: index ingest progress {}/{} ({:.0}s)",
+                ev_i + 1,
+                progress_total,
+                progress_t0.elapsed().as_secs_f64()
+            );
+        }
         if merge_lock_holder(kv.as_ref(), ev.branch_id).is_some() {
             requeue.enqueue(ev);
             rep.requeued_merge_lock += 1;
@@ -515,7 +526,14 @@ pub fn apply_index_events_with_config(
                 if edges.is_empty() {
                     continue;
                 }
-                let target_rid = rid_remap.get(&stable_rid).copied().unwrap_or(stable_rid);
+                // Prefer the remapped content-addressed revision when present.
+                // Skip edges whose source was never created (typed locals, etc.)
+                // instead of failing the whole file ingest with Graph("edge_replace").
+                let target_rid = match rid_remap.get(&stable_rid).copied() {
+                    Some(rid) => rid,
+                    None if g.get_revision(stable_rid).is_some() => stable_rid,
+                    None => continue,
+                };
                 let remapped: Vec<GraphEdge> = edges
                     .into_iter()
                     .map(|mut e| {
@@ -524,14 +542,19 @@ pub fn apply_index_events_with_config(
                     })
                     .collect();
                 g.replace_edges_for_revision(target_rid, remapped)
-                    .map_err(|_| "edge_replace")?;
+                    .map_err(|e| e)?;
             }
             for e in rename_edges {
                 let rid = e.source_revision_id;
+                if g.get_revision(rid).is_none() {
+                    continue;
+                }
                 let mut list = g.outbound_edges(rid).to_vec();
+                // RenamedFrom is max-1; keep a single rename edge if already present.
+                list.retain(|x| x.ty != crate::graph::EdgeType::RenamedFrom);
                 list.push(e);
                 g.replace_edges_for_revision(rid, list)
-                    .map_err(|_| "edge_replace")?;
+                    .map_err(|err| err)?;
             }
             {
                 let eto = crate::edge_target_override::EdgeTargetOverrideStore::new(kv_c);
@@ -1484,5 +1507,48 @@ mod tests {
             }
         }
         panic!("not found");
+    }
+
+    /// Regression: typed locals used to emit Uses edges on unknown revisions,
+    /// failing ingest with CoordinatorError::Graph("edge_replace").
+    #[cfg(feature = "ts-typescript")]
+    #[test]
+    fn ingest_typed_local_uses_does_not_edge_replace() {
+        use cis_wal::MutationLog;
+
+        use crate::coordinator::WriteCoordinator;
+        use crate::saga::MergeSagaOrchestrator;
+        use crate::MemoryKv;
+
+        let wal: Arc<dyn cis_wal::MutationLogStore> = Arc::new(MutationLog::new());
+        let coord = WriteCoordinator::new(Arc::clone(&wal));
+        let kv = Arc::new(MemoryKv::new());
+        let saga = MergeSagaOrchestrator::new(Arc::new(MemoryKv::new()));
+        let _ = coord.reconcile_on_startup(&saga);
+        let branch = BranchId([0u8; 16]);
+        let path = "typed_local.ts";
+        let src = "class Board {}\nconst x: Board = null as any;\nfunction run(b: Board) { return b; }\n";
+        let events = vec![IndexEvent {
+            branch_id: branch,
+            path: path.into(),
+            kind: FsChangeKind::Modified,
+            old_path: None,
+        }];
+        let s = src.to_string();
+        apply_index_events(
+            &IndexEventQueue::new(),
+            &coord,
+            Arc::clone(&kv),
+            events,
+            move |_p| Ok(s.clone()),
+            None,
+            None,
+        )
+        .expect("typed local Uses must not fail edge_replace");
+        let g = coord.graph().read();
+        assert!(
+            g.revisions().any(|r| r.file_path == path && matches!(r.status, RevisionStatus::Active)),
+            "file should be indexed"
+        );
     }
 }

@@ -14,7 +14,10 @@ use crate::index_model::{
 };
 
 fn path_matches_stripped_module(path: &str, stripped: &str) -> bool {
-    const EXTS: &[&str] = &[".ts", ".tsx", ".py", ".rs", ".go", ".js", ".jsx"];
+    const EXTS: &[&str] = &[
+        ".ts", ".tsx", ".py", ".rs", ".go", ".js", ".jsx", ".java", ".cs", ".c",
+        ".h", ".cpp", ".cxx", ".cc", ".hpp", ".hxx", ".hh",
+    ];
     for ext in EXTS {
         let file = format!("{stripped}{ext}");
         if path == file || path.ends_with(&format!("/{file}")) {
@@ -24,18 +27,33 @@ fn path_matches_stripped_module(path: &str, stripped: &str) -> bool {
     false
 }
 
-/// Resolve an import module string to a repo-relative file path via `mod_map`.
-fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Option<String> {
-    if let Some(p) = mod_map.get(module) {
-        return Some(p.clone());
+/// Strip Rust path prefixes (`crate.` / `self.` / leading `super.`) so imports like
+/// `crate.coordinator` match mod-map keys such as `cis-core.src.coordinator`.
+fn strip_rust_path_prefixes(module: &str) -> &str {
+    let mut s = module;
+    loop {
+        if let Some(rest) = s.strip_prefix("crate.") {
+            s = rest;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("self.") {
+            s = rest;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("super.") {
+            s = rest;
+            continue;
+        }
+        break;
     }
-    let mut stripped = module.trim();
-    while stripped.starts_with("./") || stripped.starts_with("../") {
-        stripped = stripped
-            .trim_start_matches("./")
-            .trim_start_matches("../");
+    s
+}
+
+fn lookup_module_candidates(candidate: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+    if candidate.is_empty() {
+        return None;
     }
-    if let Some(p) = mod_map.get(stripped) {
+    if let Some(p) = mod_map.get(candidate) {
         return Some(p.clone());
     }
     // Path-segment / file-suffix match only — never bare `ends_with("utils")`
@@ -43,12 +61,37 @@ fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Optio
     mod_map
         .iter()
         .find(|(k, v)| {
-            *k == stripped
-                || k.ends_with(&format!("/{stripped}"))
-                || k.ends_with(&format!(".{stripped}"))
-                || path_matches_stripped_module(v, stripped)
+            *k == candidate
+                || k.ends_with(&format!("/{candidate}"))
+                || k.ends_with(&format!(".{candidate}"))
+                || path_matches_stripped_module(v, candidate)
         })
         .map(|(_, v)| v.clone())
+}
+
+/// Resolve an import module string to a repo-relative file path via `mod_map`.
+fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+    // Normalize Rust `::` separators to `.` (indexers may emit either).
+    let normalized = module.trim().replace("::", ".");
+    if let Some(p) = lookup_module_candidates(&normalized, mod_map) {
+        return Some(p);
+    }
+    let mut stripped = normalized.as_str();
+    while stripped.starts_with("./") || stripped.starts_with("../") {
+        stripped = stripped
+            .trim_start_matches("./")
+            .trim_start_matches("../");
+    }
+    if let Some(p) = lookup_module_candidates(stripped, mod_map) {
+        return Some(p);
+    }
+    let rust_stripped = strip_rust_path_prefixes(stripped);
+    if rust_stripped != stripped {
+        if let Some(p) = lookup_module_candidates(rust_stripped, mod_map) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 pub(crate) fn build_import_bindings(
@@ -126,7 +169,7 @@ pub(crate) fn infer_type_of_receiver(
     import_bindings: &HashMap<String, ImportBinding>,
 ) -> Option<(String, String)> {
     match receiver {
-        CallReceiver::Bare(name) if name == "self" => Some((
+        CallReceiver::Bare(name) if name == "self" || name == "this" => Some((
             path.to_string(),
             caller_class.to_string(),
         )),
@@ -241,7 +284,8 @@ pub(crate) fn resolve_symbol_in_file_index(path: &str, simple_name: &str, index:
 
 /// Revision / identity hash key for a function (calls / uses owners).
 /// Prefers Function symbols so class+function collisions attach edges to the def.
-fn identity_key_for_owner(index: &FileIndex, stable_key: &str) -> String {
+/// Returns `None` when `stable_key` is not a symbol in this file.
+fn identity_key_for_owner(index: &FileIndex, stable_key: &str) -> Option<String> {
     index
         .symbols
         .iter()
@@ -264,11 +308,10 @@ fn identity_key_for_owner(index: &FileIndex, stable_key: &str) -> String {
         })
         .or_else(|| index.symbols.iter().find(|s| s.stable_key == stable_key))
         .map(|s| s.identity_key())
-        .unwrap_or_else(|| stable_key.to_string())
 }
 
 /// Prefer a Class symbol when resolving extends / class owners.
-fn identity_key_for_class(index: &FileIndex, class_key: &str) -> String {
+fn identity_key_for_class(index: &FileIndex, class_key: &str) -> Option<String> {
     index
         .symbols
         .iter()
@@ -281,7 +324,13 @@ fn identity_key_for_class(index: &FileIndex, class_key: &str) -> String {
         })
         .or_else(|| index.symbols.iter().find(|s| s.stable_key == class_key))
         .map(|s| s.identity_key())
-        .unwrap_or_else(|| class_key.to_string())
+}
+
+/// Anchor edges to a real symbol revision; fall back to `$file` for typed locals.
+fn owner_revision_ikey(index: &FileIndex, stable_key: &str) -> String {
+    identity_key_for_owner(index, stable_key)
+        .or_else(|| identity_key_for_owner(index, "$file"))
+        .unwrap_or_else(|| "$file".to_string())
 }
 
 pub(crate) fn resolve_symbol_in_graph(
@@ -672,7 +721,10 @@ pub(crate) fn attach_import_and_call_edges(
         }
     }
     for ext in &index.extends {
-        let class_ikey = identity_key_for_class(index, &ext.class_stable_key);
+        let Some(class_ikey) = identity_key_for_class(index, &ext.class_stable_key) else {
+            // Extends without a class symbol cannot be anchored — skip.
+            continue;
+        };
         let class_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &class_ikey));
         let class_scope = scope_start_line_for_key(index, &ext.class_stable_key);
         if let Some(tiid) = resolve_type_name_to_identity(
@@ -696,7 +748,9 @@ pub(crate) fn attach_import_and_call_edges(
         }
     }
     for u in &index.uses {
-        let owner_ikey = identity_key_for_owner(index, &u.owner_stable_key);
+        // Typed locals (non-symbols) fall back to the file hub so ingest never
+        // tries to replace edges for a revision that was never created.
+        let owner_ikey = owner_revision_ikey(index, &u.owner_stable_key);
         let owner_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &owner_ikey));
         let owner_scope = scope_start_line_for_key(index, &u.owner_stable_key);
         if let Some(tiid) = resolve_type_name_to_identity(
@@ -720,7 +774,11 @@ pub(crate) fn attach_import_and_call_edges(
         }
     }
     for call in &index.calls {
-        let caller_ikey = identity_key_for_owner(index, &call.caller_stable_key);
+        let Some(caller_ikey) = identity_key_for_owner(index, &call.caller_stable_key)
+            .or_else(|| identity_key_for_owner(index, "$file"))
+        else {
+            continue;
+        };
         let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &caller_ikey));
         let caller_scope = scope_start_line_for_key(index, &call.caller_stable_key);
         if let Some(tiid) = resolve_call_target(
@@ -774,11 +832,13 @@ pub fn paths_on_branch(
     graph.active_file_paths_on_branch(branch)
 }
 
-/// Collect distinct `.py` file paths with active revisions on a branch.
+/// Collect distinct indexed source paths with active revisions on a branch.
+///
+/// Historically Python-only; now keeps any path registered in [`crate::language_indexer::default_indexers`].
 pub fn python_paths_on_branch(graph: &crate::graph::InMemoryGraph, branch: BranchId) -> HashSet<String> {
     paths_on_branch(graph, branch)
         .into_iter()
-        .filter(|p| p.ends_with(".py"))
+        .filter(|p| crate::language_indexer::path_is_indexable(p))
         .collect()
 }
 
@@ -891,6 +951,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_module_path_strips_crate_prefix_for_rust() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert(
+            "cis-core.src.coordinator".to_string(),
+            "cis-core/src/coordinator.rs".to_string(),
+        );
+        assert_eq!(
+            resolve_module_path("crate.coordinator", &mod_map),
+            Some("cis-core/src/coordinator.rs".to_string())
+        );
+        assert_eq!(
+            resolve_module_path("crate::coordinator", &mod_map),
+            Some("cis-core/src/coordinator.rs".to_string())
+        );
+    }
+
+    #[test]
     fn build_import_bindings_maps_named_imports() {
         let mut mod_map = HashMap::new();
         mod_map.insert("helpers".to_string(), "lib/helpers.py".to_string());
@@ -949,6 +1026,98 @@ mod tests {
             &batch_indexes,
         );
         assert!(target.is_some());
+    }
+
+    #[test]
+    fn resolve_write_coordinator_open_via_crate_import() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "cis-core/src/mcp_runtime.rs";
+        let callee_path = "cis-core/src/coordinator.rs";
+        let mut mod_map = HashMap::new();
+        mod_map.insert(
+            "cis-core.src.coordinator".to_string(),
+            callee_path.to_string(),
+        );
+
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "WriteCoordinator".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::WriteCoordinator"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "WriteCoordinator.open".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::WriteCoordinator.open"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+
+        let mut caller_idx = FileIndex::default();
+        caller_idx.imports.push(ParsedImport {
+            module: "crate.coordinator".to_string(),
+            style: ImportStyle::Names,
+            names: vec!["WriteCoordinator".to_string()],
+            span: span(),
+        });
+        caller_idx.symbols.push(ParsedSymbol {
+            stable_key: "boot".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{caller_path}::boot"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "boot".to_string(),
+            callee: CallReceiver::Attr {
+                object: Box::new(CallReceiver::bare("WriteCoordinator")),
+                name: "open".to_string(),
+            },
+            span: span(),
+        });
+
+        let mut batch_indexes = HashMap::new();
+        batch_indexes.insert(callee_path.to_string(), callee_idx);
+
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &mod_map,
+            None,
+            &batch_indexes,
+        )
+        .expect("WriteCoordinator::open should resolve across crate:: import");
+        let expected = IdentityId(stable_id_bytes(
+            "id",
+            callee_path,
+            "WriteCoordinator.open",
+        ));
+        assert_eq!(target, expected);
+
+        let edges = attach_import_and_call_edges(
+            caller_path,
+            branch,
+            &caller_idx,
+            &mod_map,
+            None,
+            &batch_indexes,
+        );
+        let file_hub = NodeRevisionId(stable_rev_id_bytes(branch, caller_path, "$file"));
+        let imports = edges.get(&file_hub).expect("file hub import edges");
+        assert!(
+            imports.iter().any(|e| e.ty == EdgeType::Imports),
+            "crate::coordinator named import should create Imports edges"
+        );
+        let boot_rid = NodeRevisionId(stable_rev_id_bytes(branch, caller_path, "boot"));
+        let calls = edges.get(&boot_rid).expect("boot call edges");
+        assert!(
+            calls.iter().any(|e| e.ty == EdgeType::Calls && e.target_identity_id == target),
+            "boot should Call WriteCoordinator.open"
+        );
     }
 
     #[test]
@@ -1214,6 +1383,49 @@ mod tests {
         assert!(
             edges.contains_key(&file_hub),
             "typescript file should produce import edges via language dispatch"
+        );
+    }
+
+    #[test]
+    fn typed_local_uses_anchor_to_file_hub_not_orphan_revision() {
+        use crate::graph::NodeKind;
+        use crate::index_model::{ParsedSymbol, ParsedUse, whole_file_span};
+        let branch = BranchId([0u8; 16]);
+        let path = "typed.ts";
+        let mut index = FileIndex::default();
+        index.symbols.push(ParsedSymbol {
+            stable_key: "$file".into(),
+            disambiguator: String::new(),
+            qualified_name: path.into(),
+            kind: NodeKind::File,
+            span: whole_file_span("const x: Board = null;\n"),
+        });
+        index.symbols.push(ParsedSymbol {
+            stable_key: "Board".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{path}::Board"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        // Owner "x" is NOT a symbol — previously created an unknown revision id.
+        index.uses.push(ParsedUse {
+            owner_stable_key: "x".into(),
+            type_name: "Board".into(),
+            span: span(),
+        });
+        let mut batch = HashMap::new();
+        batch.insert(path.to_string(), index.clone());
+        let edges =
+            attach_import_and_call_edges(path, branch, &index, &HashMap::new(), None, &batch);
+        let file_hub = NodeRevisionId(stable_rev_id_bytes(branch, path, "$file"));
+        let orphan = NodeRevisionId(stable_rev_id_bytes(branch, path, "x"));
+        assert!(
+            edges.contains_key(&file_hub),
+            "typed local uses must anchor to $file hub"
+        );
+        assert!(
+            !edges.contains_key(&orphan),
+            "must not emit edges for non-symbol owner revisions"
         );
     }
 }
