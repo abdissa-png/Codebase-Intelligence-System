@@ -1,4 +1,6 @@
-//! CIS **MCP** server — JSON-RPC over stdio with `Content-Length` framing (**FR-4.1**, **FR-4.5**, **FR-4.11**).
+//! CIS **MCP** server — JSON-RPC over stdio (**FR-4.1**, **FR-4.5**, **FR-4.11**).
+//! Default framing is newline-delimited JSON (Cursor / `@modelcontextprotocol/sdk`);
+//! `Content-Length` framing is still accepted on read (`CIS_MCP_CONTENT_LENGTH=1` to write it).
 //! Prefer **`cisd --mcp`** (single process with background policy / merge TTL / vector cleanup).
 //! `cis-mcp` execs sibling `cisd --mcp` unless `CIS_STANDALONE_MCP=1`.
 //! Env: `CIS_REPO_ROOT` (default `.`), `CIS_MCP_SKIP_INDEX=1` skips startup Python walk.
@@ -8,13 +10,78 @@
 //! Build with `--features python-ast` to enable tree-sitter Python ingest from `cis-core`.
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use cis_core::{
     resolve_commit_anchor_to_wal_log, CisMcpRuntime, HybridSearchCandidate, MergeProgressEvent,
     MergeProgressSink, QueryMeta,
 };
 use cis_wal::{BranchId, NodeRevisionId};
 use serde_json::{json, Value};
+
+/// Shared slot so MCP can answer `initialize` / `tools/list` while workspace boot runs.
+enum McpRuntimeSlotState {
+    Loading,
+    Ready(Arc<CisMcpRuntime>),
+    Failed(String),
+}
+
+/// Filled by a background boot thread; stdio handshake does not wait on it.
+pub struct McpRuntimeSlot {
+    state: Mutex<McpRuntimeSlotState>,
+    cv: Condvar,
+}
+
+impl McpRuntimeSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(McpRuntimeSlotState::Loading),
+            cv: Condvar::new(),
+        })
+    }
+
+    pub fn set_ready(&self, rt: Arc<CisMcpRuntime>) {
+        let mut g = self.state.lock().unwrap();
+        *g = McpRuntimeSlotState::Ready(rt);
+        self.cv.notify_all();
+    }
+
+    pub fn set_failed(&self, err: impl Into<String>) {
+        let mut g = self.state.lock().unwrap();
+        *g = McpRuntimeSlotState::Failed(err.into());
+        self.cv.notify_all();
+    }
+
+    pub fn wait(&self, timeout: Duration) -> Result<Arc<CisMcpRuntime>, String> {
+        let mut g = self.state.lock().unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match &*g {
+                McpRuntimeSlotState::Ready(rt) => return Ok(Arc::clone(rt)),
+                McpRuntimeSlotState::Failed(e) => return Err(e.clone()),
+                McpRuntimeSlotState::Loading => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Err(
+                            "workspace still loading (CIS warm-start); retry in a moment".into(),
+                        );
+                    }
+                    let (next, timeout_result) =
+                        self.cv.wait_timeout(g, deadline.saturating_duration_since(now)).unwrap();
+                    g = next;
+                    if timeout_result.timed_out() {
+                        if matches!(*g, McpRuntimeSlotState::Loading) {
+                            return Err(
+                                "workspace still loading (CIS warm-start); retry in a moment"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 const MCP_READ_TOOLS: &[&str] = &[
     "find_symbol",
@@ -59,37 +126,75 @@ const MCP_WRITE_TOOLS: &[&str] = &[
 ];
 const MCP_DIAG_TOOLS: &[&str] = &["verify_audit_chain", "check_graph_consistency"];
 
+/// Official MCP TypeScript SDK (Cursor) uses **newline-delimited JSON** on stdio.
+/// Older / LSP-style clients use `Content-Length` framing — accept both on read.
 fn read_mcp_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
-    let mut len: Option<usize> = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
             return Ok(None);
         }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
         }
-        let rest = line
+        // NDJSON: one JSON object per line (Cursor / @modelcontextprotocol/sdk).
+        if trimmed.starts_with('{') {
+            return Ok(Some(trimmed.as_bytes().to_vec()));
+        }
+        // Content-Length framing (optional headers, blank line, then body).
+        let mut len: Option<usize> = None;
+        let rest = trimmed
             .strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("Content-Length: "));
+            .or_else(|| trimmed.strip_prefix("Content-Length: "));
         if let Some(r) = rest {
             len = Some(r.trim().parse().map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Content-Length: {e}"))
             })?);
         }
+        loop {
+            let mut hdr = String::new();
+            if reader.read_line(&mut hdr)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF in Content-Length headers",
+                ));
+            }
+            let hdr = hdr.trim_end_matches(['\r', '\n']);
+            if hdr.is_empty() {
+                break;
+            }
+            let rest = hdr
+                .strip_prefix("Content-Length:")
+                .or_else(|| hdr.strip_prefix("Content-Length: "));
+            if let Some(r) = rest {
+                len = Some(r.trim().parse().map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("Content-Length: {e}"))
+                })?);
+            }
+        }
+        let n = len.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+        })?;
+        let mut buf = vec![0u8; n];
+        reader.read_exact(&mut buf)?;
+        return Ok(Some(buf));
     }
-    let n = len.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-    })?;
-    let mut buf = vec![0u8; n];
-    reader.read_exact(&mut buf)?;
-    Ok(Some(buf))
+}
+
+fn mcp_write_content_length() -> bool {
+    std::env::var_os("CIS_MCP_CONTENT_LENGTH").is_some_and(|v| v == "1")
 }
 
 fn write_mcp_message<W: Write>(w: &mut W, body: &[u8]) -> io::Result<()> {
-    write!(w, "Content-Length: {}\r\n\r\n", body.len())?;
-    w.write_all(body)?;
+    if mcp_write_content_length() {
+        write!(w, "Content-Length: {}\r\n\r\n", body.len())?;
+        w.write_all(body)?;
+    } else {
+        // Match @modelcontextprotocol/sdk serializeMessage: JSON + '\n'
+        w.write_all(body)?;
+        w.write_all(b"\n")?;
+    }
     w.flush()?;
     Ok(())
 }
@@ -452,7 +557,7 @@ fn write_tool_schema(name: &str) -> Value {
             "properties": {
                 "path": { "type": "string", "description": "Repo-relative path" },
                 "content": { "type": "string" },
-                "reindex": { "type": "boolean", "description": "When true (default), re-index .py after write on the default branch" },
+                "reindex": { "type": "boolean", "description": "When true (default), re-index after write when the extension is registered (py/ts/tsx/rs/go/js/…)" },
                 "session_id": { "type": "integer" }
             },
             "required": ["path", "content"]
@@ -462,7 +567,7 @@ fn write_tool_schema(name: &str) -> Value {
             "properties": {
                 "path": { "type": "string" },
                 "new_content": { "type": "string", "description": "Full file contents, or a unified diff (---/+++ with @@ hunks) when the payload looks like a patch" },
-                "reindex": { "type": "boolean", "description": "When true (default), re-index .py after write on the default branch" },
+                "reindex": { "type": "boolean", "description": "When true (default), re-index after write when the extension is registered (py/ts/tsx/rs/go/js/…)" },
                 "session_id": { "type": "integer" }
             },
             "required": ["path", "new_content"]
@@ -473,7 +578,7 @@ fn write_tool_schema(name: &str) -> Value {
                 "paths": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Repo-relative paths (typically .py)"
+                    "description": "Repo-relative source paths (py/ts/tsx/js/jsx/rs/go/java/c/cpp/cs/…); non-indexable and build-artifact paths are skipped"
                 },
                 "branch_id": { "type": "string", "description": "32-char hex BranchId; omit for default/main" },
                 "session_id": { "type": "integer" }
@@ -601,7 +706,7 @@ fn write_tool_description(name: &str) -> String {
         "ingest_cis_config" => "FR-1.4: load .cis/grammar.lock and .cis/ranking_policy.yaml into the runtime.".into(),
         "write_file" => "Write file under repo root with lease + audit (FR-4.2).".into(),
         "apply_patch" => "FR-4.2: write path after optional unified diff apply, or full-file replace (lease + audit).".into(),
-        "reindex_paths" => "Ingest specific repo-relative paths on a branch overlay (forks RI when branch_id is not main). Confirms pending patches for those paths and clears .cis_confirm_* sidecars. Set CIS_REINDEX_PERSIST=0 to skip writing .cis/ until save_workspace.".into(),
+        "reindex_paths" => "Ingest specific repo-relative source paths on a branch overlay (any registered language: py/ts/tsx/js/jsx/rs/go/java/c/cpp/cs/…). Skips build artifacts (node_modules, target, vendor, …). Confirms pending patches for those paths and clears .cis_confirm_* sidecars. Set CIS_REINDEX_PERSIST=0 to skip writing .cis/ until save_workspace.".into(),
         "confirm_patch" => "After verifying an agent write: promote speculative revisions to Active, release leases, clear .cis_confirm_{patch_id}.".into(),
         "revert_patch" => "Discard a speculative patch: tombstone revisions, release leases, clear confirm sidecar.".into(),
         "sweep_confirm_sidecars" => "Remove orphan .cis_confirm_* files with no matching pending patch.".into(),
@@ -1884,7 +1989,20 @@ fn tool_call<W: Write>(rt: &CisMcpRuntime, params: &Value, out: &mut W) -> Value
     })
 }
 
-fn handle_jsonrpc<W: Write>(rt: &CisMcpRuntime, req: &Value, out: &mut W) -> Option<Value> {
+fn initialize_result() -> Value {
+    json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "cis-mcp", "version": env!("CARGO_PKG_VERSION") }
+    })
+}
+
+fn handle_jsonrpc_method<W: Write>(
+    rt: Option<&CisMcpRuntime>,
+    slot: Option<&McpRuntimeSlot>,
+    req: &Value,
+    out: &mut W,
+) -> Option<Value> {
     let method = req.get("method")?.as_str()?;
     if method.starts_with("notifications/") {
         return None;
@@ -1892,14 +2010,40 @@ fn handle_jsonrpc<W: Write>(rt: &CisMcpRuntime, req: &Value, out: &mut W) -> Opt
     let id = req.get("id").cloned();
 
     let result = match method {
-        "initialize" => json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "cis-mcp", "version": env!("CARGO_PKG_VERSION") }
-        }),
+        "initialize" => initialize_result(),
         "tools/list" => json!({ "tools": tool_definitions() }),
-        "tools/call" => tool_call(rt, req.get("params").unwrap_or(&json!({})), out),
         "ping" => json!({}),
+        "tools/call" => {
+            let rt = if let Some(rt) = rt {
+                rt
+            } else {
+                let slot = slot.expect("tools/call requires runtime or slot");
+                match slot.wait(Duration::from_secs(120)) {
+                    Ok(rt) => {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": tool_call(
+                                rt.as_ref(),
+                                req.get("params").unwrap_or(&json!({})),
+                                out,
+                            )
+                        }));
+                    }
+                    Err(e) => {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": e }],
+                                "isError": true
+                            }
+                        }));
+                    }
+                }
+            };
+            tool_call(rt, req.get("params").unwrap_or(&json!({})), out)
+        }
         _ => {
             return Some(json!({
                 "jsonrpc": "2.0",
@@ -1917,6 +2061,10 @@ fn handle_jsonrpc<W: Write>(rt: &CisMcpRuntime, req: &Value, out: &mut W) -> Opt
         "id": id,
         "result": result
     }))
+}
+
+fn handle_jsonrpc<W: Write>(rt: &CisMcpRuntime, req: &Value, out: &mut W) -> Option<Value> {
+    handle_jsonrpc_method(Some(rt), None, req, out)
 }
 
 pub fn dump_tool_names() {
@@ -1972,7 +2120,7 @@ fn bootstrap_if_needed(rt: Arc<CisMcpRuntime>) -> io::Result<()> {
     let force_reindex = std::env::var_os("CIS_FORCE_REINDEX").is_some_and(|v| v == "1");
     if !skip_index && (!graph_loaded || force_reindex) {
         if let Err(e) = rt.as_ref().bootstrap_python_index_from_repo() {
-            eprintln!("cis-mcp: python index bootstrap: {:?}", e);
+            eprintln!("cis-mcp: index bootstrap: {:?}", e);
         }
     } else if skip_index && !graph_loaded {
         eprintln!("cis-mcp: CIS_MCP_SKIP_INDEX=1 and no graph.json — starting with empty graph");
@@ -2021,7 +2169,7 @@ mod mcp_arg_tests {
     }
 }
 
-/// JSON-RPC MCP loop on stdio (**Content-Length** framing).
+/// JSON-RPC MCP loop on stdio (NDJSON by default; see module docs).
 pub fn run_stdio(rt: Arc<CisMcpRuntime>) -> io::Result<()> {
     let stdin = io::stdin().lock();
     let mut reader = BufReader::new(stdin);
@@ -2032,6 +2180,27 @@ pub fn run_stdio(rt: Arc<CisMcpRuntime>) -> io::Result<()> {
             continue;
         };
         if let Some(resp) = handle_jsonrpc(rt.as_ref(), &v, &mut stdout) {
+            write_mcp_message(&mut stdout, &serde_json::to_vec(&resp).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+            })?)?;
+        }
+    }
+    Ok(())
+}
+
+/// Like [`run_stdio`], but answers `initialize` / `tools/list` / `ping` before workspace boot finishes.
+///
+/// Cursor's MCP IPC metadata timeout defaults to **10s**; CIS warm-start is often ~7s and tip over.
+pub fn run_stdio_slot(slot: Arc<McpRuntimeSlot>) -> io::Result<()> {
+    let stdin = io::stdin().lock();
+    let mut reader = BufReader::new(stdin);
+    let mut stdout = io::stdout().lock();
+
+    while let Some(msg) = read_mcp_message(&mut reader)? {
+        let Ok(v) = serde_json::from_slice::<Value>(&msg) else {
+            continue;
+        };
+        if let Some(resp) = handle_jsonrpc_method(None, Some(slot.as_ref()), &v, &mut stdout) {
             write_mcp_message(&mut stdout, &serde_json::to_vec(&resp).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
             })?)?;
@@ -2058,7 +2227,8 @@ mod progress_tests {
         .unwrap();
         let body = String::from_utf8(buf.into_inner()).unwrap();
         assert!(body.contains("notifications/progress"));
-        let v: Value = serde_json::from_str(body.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let line = body.lines().next().expect("ndjson line");
+        let v: Value = serde_json::from_str(line).unwrap();
         assert_eq!(v["method"], "notifications/progress");
         assert_eq!(v["params"]["progressToken"], "tok-1");
         assert_eq!(v["params"]["progress"], 2.0);
