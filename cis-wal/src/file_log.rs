@@ -1,8 +1,13 @@
 //! JSON snapshot persistence for **`MutationLog`** (**FR-1.7**, **NFR-R2**).
 //!
-//! Writes atomically: unique temp → `fsync` → `rename` → **`wal.json`**.
+//! Writes atomically: unique temp → optional `fsync` → `rename` → **`wal.json`**.
 //! A process-wide flush mutex serializes snapshot+rename so concurrent writers
 //! cannot tear or lose records.
+//!
+//! ## Performance knobs (env)
+//! - `CIS_WAL_FLUSH_EVERY=N` — persist every N mutations (default `1`). Use higher
+//!   values (e.g. `64`) during cold bootstrap; dirty state is flushed on Drop.
+//! - `CIS_WAL_FSYNC=0` — skip `sync_all` (still atomic rename). Faster on slow disks.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -22,7 +27,21 @@ struct WalSnapshot {
     records: Vec<MutationRecord>,
 }
 
-/// File-backed WAL wrapping in-memory [`MutationLog`]; every mutation **flushes** full snapshot.
+fn flush_every() -> u64 {
+    std::env::var("CIS_WAL_FLUSH_EVERY")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
+}
+
+fn fsync_enabled() -> bool {
+    !std::env::var_os("CIS_WAL_FSYNC").is_some_and(|v| {
+        v == "0" || v.eq_ignore_ascii_case("false")
+    })
+}
+
+/// File-backed WAL wrapping in-memory [`MutationLog`]; mutations flush per policy.
 #[derive(Debug)]
 pub struct DurableMutationLog {
     path: PathBuf,
@@ -30,6 +49,8 @@ pub struct DurableMutationLog {
     /// Serializes snapshot materialization + rename.
     flush_lock: Mutex<()>,
     flush_seq: AtomicU64,
+    /// Mutations since the last successful durable flush.
+    dirty_ops: AtomicU64,
 }
 
 impl DurableMutationLog {
@@ -41,6 +62,7 @@ impl DurableMutationLog {
             log,
             flush_lock: Mutex::new(()),
             flush_seq: AtomicU64::new(0),
+            dirty_ops: AtomicU64::new(0),
         };
         d.flush()?;
         Ok(d)
@@ -63,6 +85,7 @@ impl DurableMutationLog {
             log,
             flush_lock: Mutex::new(()),
             flush_seq: AtomicU64::new(0),
+            dirty_ops: AtomicU64::new(0),
         })
     }
 
@@ -76,8 +99,7 @@ impl DurableMutationLog {
 
     pub fn append(&self, record: MutationRecord) -> Result<LogId, MutationLogError> {
         let id = self.log.append(record)?;
-        self.flush()
-            .map_err(|e| MutationLogError::Persist(e.to_string()))?;
+        self.note_dirty_and_maybe_flush()?;
         Ok(id)
     }
 
@@ -87,8 +109,7 @@ impl DurableMutationLog {
         phase: crate::phase::MutationPhase,
     ) -> Result<(), MutationLogError> {
         self.log.update_phase(id, phase)?;
-        self.flush()
-            .map_err(|e| MutationLogError::Persist(e.to_string()))?;
+        self.note_dirty_and_maybe_flush()?;
         Ok(())
     }
 
@@ -97,9 +118,28 @@ impl DurableMutationLog {
         wal_max_bytes: u64,
     ) -> Result<WalCompactionReport, MutationLogError> {
         let rep = self.log.truncate_committed(wal_max_bytes);
+        // Compaction always persists immediately.
         self.flush()
             .map_err(|e| MutationLogError::Persist(e.to_string()))?;
+        self.dirty_ops.store(0, Ordering::SeqCst);
         Ok(rep)
+    }
+
+    /// Force a durable snapshot regardless of `CIS_WAL_FLUSH_EVERY`.
+    pub fn flush_now(&self) -> io::Result<()> {
+        self.flush()?;
+        self.dirty_ops.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn note_dirty_and_maybe_flush(&self) -> Result<(), MutationLogError> {
+        let n = self.dirty_ops.fetch_add(1, Ordering::SeqCst) + 1;
+        if n >= flush_every() {
+            self.flush()
+                .map_err(|e| MutationLogError::Persist(e.to_string()))?;
+            self.dirty_ops.store(0, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -123,12 +163,24 @@ impl DurableMutationLog {
                 .write(true)
                 .truncate(true)
                 .open(&tmp)?;
-            serde_json::to_writer_pretty(&mut f, &snap)?;
+            // Compact JSON — pretty-printing made cold bootstrap rewrite multi‑MB wal
+            // snapshots on every mutation phase.
+            serde_json::to_writer(&mut f, &snap)?;
             f.flush()?;
-            f.sync_all()?;
+            if fsync_enabled() {
+                f.sync_all()?;
+            }
         }
         fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+}
+
+impl Drop for DurableMutationLog {
+    fn drop(&mut self) {
+        if self.dirty_ops.load(Ordering::SeqCst) > 0 {
+            let _ = self.flush();
+        }
     }
 }
 
@@ -166,6 +218,11 @@ impl MutationLogStore for DurableMutationLog {
         wal_max_bytes: u64,
     ) -> Result<WalCompactionReport, MutationLogError> {
         DurableMutationLog::truncate_committed(self, wal_max_bytes)
+    }
+
+    fn flush_persistent(&self) -> Result<(), MutationLogError> {
+        self.flush_now()
+            .map_err(|e| MutationLogError::Persist(e.to_string()))
     }
 }
 
@@ -207,6 +264,7 @@ mod tests {
                 .append(mk(MutationPhase::Pending, vec![r]))
                 .unwrap();
             wal.update_phase(id, MutationPhase::GraphDone).unwrap();
+            wal.flush_now().unwrap();
         }
 
         let wal2 = DurableMutationLog::open(&path).unwrap();

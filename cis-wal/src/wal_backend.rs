@@ -16,6 +16,11 @@ pub trait MutationLogStore: Send + Sync + std::fmt::Debug {
     }
     fn next_allocate_id(&self) -> LogId;
     fn truncate_committed(&self, wal_max_bytes: u64) -> Result<WalCompactionReport, MutationLogError>;
+    /// Force a durable snapshot when the backend buffers flushes (`CIS_WAL_FLUSH_EVERY`).
+    /// In-memory backends no-op.
+    fn flush_persistent(&self) -> Result<(), MutationLogError> {
+        Ok(())
+    }
 }
 
 impl MutationLogStore for MutationLog {

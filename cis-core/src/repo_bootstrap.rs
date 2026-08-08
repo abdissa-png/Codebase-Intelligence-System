@@ -38,7 +38,7 @@ pub fn collect_source_files(root: &Path, extensions: &[&str], out: &mut Vec<Path
     index_walk::collect_source_files(root, extensions, out);
 }
 
-/// Collect files for all default indexers (`.py`, `.ts`, `.tsx`).
+/// Collect files for all default indexers (extensions from [`crate::language_indexer::default_indexers`]).
 pub fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) {
     let exts: Vec<&str> = crate::language_indexer::default_indexers()
         .iter()
@@ -158,6 +158,22 @@ pub fn bootstrap_python_workspace_on_coordinator(
 
     let mut paths = Vec::new();
     collect_indexable_files(&root, &mut paths);
+    eprintln!(
+        "cis-mcp: index bootstrap walking {} source files under {}",
+        paths.len(),
+        root.display()
+    );
+
+    // Cold bootstrap is WAL-write heavy (several phase updates per file). Batch flushes
+    // and skip fsync unless the caller already configured otherwise.
+    let prev_flush = std::env::var("CIS_WAL_FLUSH_EVERY").ok();
+    let prev_fsync = std::env::var("CIS_WAL_FSYNC").ok();
+    if prev_flush.is_none() {
+        std::env::set_var("CIS_WAL_FLUSH_EVERY", "64");
+    }
+    if prev_fsync.is_none() {
+        std::env::set_var("CIS_WAL_FSYNC", "0");
+    }
 
     let q = IndexEventQueue::new();
     let events: Vec<IndexEvent> = paths
@@ -175,6 +191,7 @@ pub fn bootstrap_python_workspace_on_coordinator(
 
     let rename_config = load_rename_config(&root);
     let root_clone = root.clone();
+    let t0 = std::time::Instant::now();
     let rep = apply_index_events_with_config(
         &q,
         coord,
@@ -185,6 +202,24 @@ pub fn bootstrap_python_workspace_on_coordinator(
         None,
         Some(rename_config),
     )?;
+    if let Err(e) = coord.wal().flush_persistent() {
+        eprintln!("cis-mcp: WAL flush after bootstrap: {e}");
+    }
+    match prev_flush {
+        Some(v) => std::env::set_var("CIS_WAL_FLUSH_EVERY", v),
+        None => std::env::remove_var("CIS_WAL_FLUSH_EVERY"),
+    }
+    match prev_fsync {
+        Some(v) => std::env::set_var("CIS_WAL_FSYNC", v),
+        None => std::env::remove_var("CIS_WAL_FSYNC"),
+    }
+    eprintln!(
+        "cis-mcp: index bootstrap ingest done in {:.1}s (applied={} parse_errors={} skipped={})",
+        t0.elapsed().as_secs_f64(),
+        rep.applied,
+        rep.parse_errors,
+        rep.skipped_non_py + rep.skipped_empty_py,
+    );
 
     let g = coord.graph().read();
     sync_revision_index_from_graph(&g, revision_index, kv.as_ref(), branch);
@@ -194,7 +229,7 @@ pub fn bootstrap_python_workspace_on_coordinator(
     Ok(rep)
 }
 
-/// Walk `repo_root` for indexable sources and ingest via the shared coordinator (alias for Python bootstrap today).
+/// Walk `repo_root` for indexable sources and ingest via the shared coordinator.
 pub fn bootstrap_index_from_repo(
     coord: &WriteCoordinator,
     repo_root: &str,
