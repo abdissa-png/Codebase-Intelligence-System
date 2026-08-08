@@ -16,3 +16,6 @@ fixtures/
 # Python helpers
 __pycache__/
 *.pyc
+
+# Docs viewer
+docs

@@ -49,7 +49,7 @@ State lives under `.cis/` in the repo root (graph, KV, WAL, bodies, audit log, m
 ### Build
 
 ```bash
-cargo build --release -p cis-mcp --features python-ast,body-sqlite,api-embeddings
+cargo build --release -p cis-mcp --features python-ast,all-languages,body-sqlite,api-embeddings
 ```
 
 Binaries: `target/release/cisd`, `target/release/cis-mcp`, `target/release/cis`.
@@ -173,7 +173,7 @@ CIS reads an optional `.env` in the repo root (does not override variables alrea
 | `CIS_FS_SYNC` | on | Set `0` to disable filesystem watcher |
 | `CIS_FS_POLL_ONLY` | off | Force mtime polling instead of native notify |
 | `CIS_INDEX_DEBOUNCE_MS` | — | Debounce delay before re-indexing after FS events |
-| `CIS_MCP_SKIP_INDEX` | off | Skip startup Python walk |
+| `CIS_MCP_SKIP_INDEX` | off | Skip startup source walk (all registered languages) |
 | `CIS_GIT_BRANCH_SYNC` | off | Set `1` to mirror git `HEAD` into CIS branches |
 | `CIS_POLICY_PATH` | `.cis/ranking_policy.yaml` | Search ranking policy file |
 | `CIS_EMBED_API_URL` | — | OpenAI-compatible `/v1/embeddings` endpoint |
@@ -189,15 +189,22 @@ See `cis-core` sources and `cis-mcp/src/lib.rs` module docs for the full set of 
 | Feature | Crate | Effect |
 |---------|-------|--------|
 | `python-ast` | cis-mcp → cis-core | Tree-sitter Python ingest (classes, methods, calls) |
+| `all-languages` | cis-mcp → cis-core | Tree-sitter indexers for Python, TypeScript/TSX, JavaScript/JSX, Rust, Go, Java, C, C++, C# |
+| `ts-rust` / `ts-go` / `ts-javascript` / `ts-typescript` / `ts-java` / `ts-c` / `ts-cpp` / `ts-csharp` | cis-mcp → cis-core | Enable a single language grammar |
 | `body-sqlite` | cis-mcp → cis-core | SQLite body/metadata backends; enables `cis` migrate commands |
 | `api-embeddings` | cis-mcp → cis-core | HTTP embedding provider for semantic search |
 | `fs-notify` | cis-mcp → cis-core | Native filesystem notifications (default on) |
+
+Python and TypeScript/TSX are always registered. Other languages activate when their `ts-*` (or `all-languages`) feature is enabled at build time.
 
 ## Testing
 
 ```bash
 # Core library + integration tests
 cargo test -p cis-core --features tree-sitter,body-sqlite
+
+# All language indexers (Rust/Go/JS/TS/Java/C/C++/C#)
+cargo test -p cis-core --features tree-sitter-all --lib '_indexer::'
 
 # Fast concurrency stress suite
 cargo test -p cis-core --features tree-sitter,body-sqlite --test stress_fast

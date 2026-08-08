@@ -21,6 +21,8 @@ jobs:
           git clone --depth 1 https://github.com/abdissa-png/A-chess-game-using-Pygame.git fixtures/chess_pygame
       - name: Unit tests (tree-sitter)
         run: cargo test -p cis-core --features tree-sitter --lib
+      - name: Multi-language indexer tests
+        run: cargo test -p cis-core --features tree-sitter-all --lib '_indexer::'
       - name: Chess cross-file calls
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_cross_file_calls
       - name: Chess SQLite exploration
@@ -98,6 +100,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build cisd
-        run: cargo build -p cis-mcp --features python-ast,body-sqlite,api-embeddings --bin cisd --bin cis
+        run: cargo build -p cis-mcp --features python-ast,all-languages,body-sqlite,api-embeddings --bin cisd --bin cis
       - name: WAL crate tests
         run: cargo test -p cis-wal
