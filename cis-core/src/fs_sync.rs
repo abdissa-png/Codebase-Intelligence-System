@@ -345,7 +345,18 @@ pub fn reindex_paths_on_coordinator(
     Ok(rep)
 }
 
-/// Python-only wrapper around [`reindex_paths_on_coordinator`].
+/// Filter `paths` to those registered in [`crate::language_indexer::default_indexers`]
+/// and not under builtin skip dirs / generated filenames.
+fn filter_indexable_paths(paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|p| crate::language_indexer::path_is_indexable(p))
+        .collect()
+}
+
+/// Re-index registered language sources (Python/TS/… depending on Cargo features).
+///
+/// Historically Python-only; now filters via [`crate::language_indexer::path_is_indexable`].
 pub fn reindex_python_paths_on_coordinator(
     coord: &WriteCoordinator,
     repo_root: &str,
@@ -355,17 +366,14 @@ pub fn reindex_python_paths_on_coordinator(
     paths: Vec<String>,
     rename_config: Option<RenameConfig>,
 ) -> Result<IngestApplyReport, CoordinatorError> {
-    let py_paths: Vec<String> = paths
-        .into_iter()
-        .filter(|p| p.ends_with(".py"))
-        .collect();
+    let indexable = filter_indexable_paths(paths);
     reindex_paths_on_coordinator(
         coord,
         repo_root,
         kv,
         revision_index,
         branch,
-        py_paths,
+        indexable,
         rename_config,
     )
 }
@@ -385,11 +393,8 @@ pub fn reindex_python_paths_with_config(
     rename_config: Option<RenameConfig>,
 ) -> Result<IngestApplyReport, CoordinatorError> {
     let root = PathBuf::from(repo_root);
-    let py_paths: Vec<String> = paths
-        .into_iter()
-        .filter(|p| p.ends_with(".py"))
-        .collect();
-    if py_paths.is_empty() {
+    let indexable = filter_indexable_paths(paths);
+    if indexable.is_empty() {
         return Ok(IngestApplyReport::default());
     }
 
@@ -404,7 +409,7 @@ pub fn reindex_python_paths_with_config(
         kv,
         revision_index,
         branch,
-        py_paths,
+        indexable,
         rename_config,
     )?;
 
@@ -536,12 +541,20 @@ pub fn flush_debounced_reindex(rt: &crate::mcp_runtime::CisMcpRuntime) {
             }
         }
     }
-    // Normal re-index for events that weren't handled via confirm/revert
-    let path_refs: Vec<&str> = batch.iter().map(|e| e.path.as_str()).collect();
+    // Normal re-index for events that weren't handled via confirm/revert.
+    // `reindex_python_paths` now accepts all registered language extensions.
+    let path_refs: Vec<&str> = batch
+        .iter()
+        .map(|e| e.path.as_str())
+        .filter(|p| crate::language_indexer::path_is_indexable(p))
+        .collect();
+    if path_refs.is_empty() {
+        return;
+    }
     match rt.reindex_python_paths(&path_refs) {
         Ok(rep) if rep.applied > 0 => {
             rt.record_reindex_batch(rep.applied);
-            let paths: Vec<String> = batch.iter().map(|e| e.path.clone()).collect();
+            let paths: Vec<String> = path_refs.iter().map(|p| (*p).to_string()).collect();
             rt.mark_paths_indexed(&paths);
             eprintln!(
                 "cis-fs-sync: re-indexed {} file(s) (debounced)",
@@ -729,17 +742,23 @@ fn run_notify_blocking(
                 return;
             };
             let kind = notify_kind_to_fs_change(event.kind);
+            let watched = watched_extensions();
             let rels: Vec<String> = event
                 .paths
                 .iter()
                 .filter_map(|p| {
-                    if p.extension().and_then(|x| x.to_str()) != Some("py") {
+                    let ext = p.extension().and_then(|x| x.to_str())?;
+                    if !watched.iter().any(|w| w == ext) {
                         return None;
                     }
                     let Ok(rel) = p.strip_prefix(&root) else {
                         return None;
                     };
-                    Some(rel.to_string_lossy().replace('\\', "/"))
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    if !crate::language_indexer::path_is_indexable(&rel) {
+                        return None;
+                    }
+                    Some(rel)
                 })
                 .collect();
             if matches!(kind, FsChangeKind::Renamed | FsChangeKind::Moved) && rels.len() >= 2 {
