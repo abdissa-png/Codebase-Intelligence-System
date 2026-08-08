@@ -15,6 +15,12 @@ pub struct GrammarLock {
     pub java: Option<String>,
     #[serde(default)]
     pub cpp: Option<String>,
+    #[serde(default)]
+    pub javascript: Option<String>,
+    #[serde(default)]
+    pub csharp: Option<String>,
+    #[serde(default)]
+    pub c: Option<String>,
 }
 
 impl GrammarLock {

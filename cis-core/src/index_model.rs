@@ -457,7 +457,7 @@ pub(crate) fn whole_file_span(content: &str) -> SourceSpan {
     }
 }
 
-#[cfg(feature = "tree-sitter")]
+#[cfg(feature = "ts-runtime")]
 pub(crate) fn span_from_tree_sitter_node(node: tree_sitter::Node) -> SourceSpan {
     let start = node.start_position();
     let end = node.end_position();

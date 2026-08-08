@@ -14,6 +14,17 @@ default = ["fs-notify"]
 fs-notify = ["cis-core/fs-notify"]
 # Enable richer Python ingest (classes/methods + call extraction) via cis-core tree-sitter path.
 python-ast = ["cis-core/tree-sitter"]
+# Enable all tree-sitter language grammars (Python + Rust + Go + JS + TS + Java + C + C++ + C#).
+all-languages = ["cis-core/tree-sitter-all"]
+# Individual language tree-sitter features forwarded to cis-core.
+ts-rust = ["cis-core/ts-rust"]
+ts-go = ["cis-core/ts-go"]
+ts-javascript = ["cis-core/ts-javascript"]
+ts-typescript = ["cis-core/ts-typescript"]
+ts-java = ["cis-core/ts-java"]
+ts-c = ["cis-core/ts-c"]
+ts-cpp = ["cis-core/ts-cpp"]
+ts-csharp = ["cis-core/ts-csharp"]
 # Phase 6 — external HTTP embedding API (OpenAI-compatible).
 api-embeddings = ["cis-core/api-embeddings"]
 # Phase 8 — SQLite body/metadata backends for migration tools.

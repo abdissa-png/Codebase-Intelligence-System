@@ -47,6 +47,20 @@ mod index_walk;
 mod index_model;
 mod call_resolve;
 mod python_indexer;
+#[cfg(feature = "ts-rust")]
+mod rust_indexer;
+#[cfg(feature = "ts-go")]
+mod go_indexer;
+#[cfg(feature = "ts-javascript")]
+mod javascript_indexer;
+#[cfg(feature = "ts-java")]
+mod java_indexer;
+#[cfg(feature = "ts-c")]
+mod c_indexer;
+#[cfg(feature = "ts-cpp")]
+mod cpp_indexer;
+#[cfg(feature = "ts-csharp")]
+mod csharp_indexer;
 mod ingest;
 mod kv;
 mod language_indexer;
@@ -184,7 +198,8 @@ pub use graph_delete_queue::{DeleteJob, DeleteReason, GraphDeleteQueue};
 pub use graph_mutation::GraphMutationSet;
 pub use identity_cas::{IdentityProvisionalCas, ALLOCATING_TTL_MS};
 pub use language_indexer::{
-    default_indexers, indexer_for_path, IndexError, LanguageIndexer, PythonIndexer,
+    default_indexers, indexer_for_path, path_is_indexable, IndexError, LanguageIndexer,
+    PythonIndexer,
 };
 pub use identity_resolution::{
     best_tombstone_rename, finalize_soft_deletes_without_children, tombstone_all_file_symbols,
@@ -253,8 +268,9 @@ pub use optimistic_patcher::{OptimisticPatcher, OptimisticPatchError};
 pub use path_lease::{LeaseError, PathLeaseManager, SessionId, SpeculativePathTracker};
 pub use pre_write_snapshot::PreWriteSnapshotStore;
 pub use persistence::{
-    cis_dir, graph_snapshot_path, kv_snapshot_path, load_kv_snapshot, load_state_from_cis_dir,
-    load_workspace_into, open_persisted_coordinator, save_graph_snapshot, save_kv_snapshot,
+    cis_dir, defer_vector_snapshot_load, graph_snapshot_path, kv_snapshot_path, load_kv_snapshot,
+    load_state_from_cis_dir, load_vector_into, load_workspace_into, open_persisted_coordinator,
+    save_graph_snapshot, save_kv_snapshot,
     save_vector_snapshot, save_workspace_snapshots, snapshot_persist_enabled,
     vector_snapshot_path, wal_path, PersistenceLoadReport, VectorSnapshot,
 };
@@ -270,7 +286,10 @@ pub use ranking_policy::{
     EdgeTypeWeights, HybridSearchPolicy, OverlapDefinition, PolicyLoadError, PolicyValidationError,
     RankingPolicy, RankingPolicySnapshot, RecencyPolicy, RecencySource,
 };
-pub use index_walk::index_respect_gitignore;
+pub use index_walk::{
+    index_respect_gitignore, is_builtin_skip_dir, is_skipped_source_filename,
+    path_has_builtin_skip_dir,
+};
 pub use repo_bootstrap::{
     bootstrap_index_from_repo, bootstrap_python_workspace_into_graph,
     bootstrap_python_workspace_on_coordinator, collect_indexable_files, collect_py_files,
