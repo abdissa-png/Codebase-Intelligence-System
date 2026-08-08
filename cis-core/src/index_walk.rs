@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 /// Whether `.gitignore` (and nested ignore files) are honored during indexing.
 ///
-/// Set `CIS_INDEX_RESPECT_GITIGNORE=0` to restore the legacy recursive walk.
+/// Set `CIS_INDEX_RESPECT_GITIGNORE=0` to restore the legacy recursive walk
+/// (builtin skip dirs still apply).
 pub fn index_respect_gitignore() -> bool {
     !std::env::var_os("CIS_INDEX_RESPECT_GITIGNORE").is_some_and(|v| {
         v == "0" || v.eq_ignore_ascii_case("false")
@@ -12,10 +13,78 @@ pub fn index_respect_gitignore() -> bool {
 }
 
 /// Built-in directory names skipped even when no `.gitignore` exists.
-const BUILTIN_SKIP_DIRS: &[&str] = &[".git", ".cis"];
+///
+/// Covers VCS/CIS state plus common language toolchain / build outputs so MCP
+/// bootstrap and FS sync do not ingest vendored or generated trees.
+const BUILTIN_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".cis",
+    // Python
+    "__pycache__",
+    ".venv",
+    ".venv-embed",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "site-packages",
+    // JavaScript / TypeScript
+    "node_modules",
+    "dist",
+    "coverage",
+    ".next",
+    ".nuxt",
+    // Rust
+    "target",
+    // Go
+    "vendor",
+    // Java / C# / general build
+    "build",
+    "out",
+    "bin",
+    "obj",
+    ".gradle",
+    ".idea",
+    // CMake / C++
+    "cmake-build-debug",
+    "cmake-build-release",
+];
+
+/// True when `name` is a directory we never index.
+pub fn is_builtin_skip_dir(name: &str) -> bool {
+    BUILTIN_SKIP_DIRS.iter().any(|d| {
+        name.eq_ignore_ascii_case(d)
+    })
+}
+
+/// True when a repo-relative path has a builtin-skipped directory component.
+pub fn path_has_builtin_skip_dir(rel: &str) -> bool {
+    rel.split(['/', '\\'])
+        .any(|comp| !comp.is_empty() && is_builtin_skip_dir(comp))
+}
+
+/// True for generated/minified artifacts we never want as source symbols.
+pub fn is_skipped_source_filename(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.ends_with(".min.js")
+        || lower.ends_with(".min.jsx")
+        || lower.ends_with(".min.ts")
+        || lower.ends_with(".min.tsx")
+        || lower.ends_with(".min.css")
+        || lower.ends_with(".pyc")
+        || lower.ends_with(".pyo")
+        || lower.ends_with(".class")
+        || lower.ends_with(".o")
+        || lower.ends_with(".obj")
+        || lower.ends_with(".a")
+        || lower.ends_with(".so")
+        || lower.ends_with(".dylib")
+        || lower.ends_with(".dll")
+        || lower.ends_with(".exe")
+}
 
 fn is_builtin_skip(name: &str, is_dir: bool) -> bool {
-    is_dir && BUILTIN_SKIP_DIRS.contains(&name)
+    is_dir && is_builtin_skip_dir(name)
 }
 
 /// Recursively collect source files with any of the given extensions under `root`.
@@ -24,7 +93,7 @@ pub fn collect_source_files(root: &Path, extensions: &[&str], out: &mut Vec<Path
         let mut ig = GitignoreWalker::new(root);
         collect_source_files_gitignore(root, root, extensions, &mut ig, out);
     } else {
-        collect_source_files_naive(root, extensions, out);
+        collect_source_files_naive(root, root, extensions, out);
     }
 }
 
@@ -55,10 +124,11 @@ fn collect_source_files_gitignore(
         }
         if is_dir {
             collect_source_files_gitignore(root, &p, extensions, ig, out);
-        } else if p
-            .extension()
-            .and_then(|x| x.to_str())
-            .is_some_and(|ext| extensions.contains(&ext))
+        } else if !is_skipped_source_filename(&name)
+            && p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|ext| extensions.contains(&ext))
         {
             out.push(p);
         }
@@ -66,18 +136,28 @@ fn collect_source_files_gitignore(
     ig.pop_dir();
 }
 
-fn collect_source_files_naive(root: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
+fn collect_source_files_naive(
+    root: &Path,
+    dir: &Path,
+    extensions: &[&str],
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let p = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if p.is_dir() {
-            collect_source_files_naive(&p, extensions, out);
-        } else if p
-            .extension()
-            .and_then(|x| x.to_str())
-            .is_some_and(|ext| extensions.contains(&ext))
+            if is_builtin_skip_dir(&name) {
+                continue;
+            }
+            collect_source_files_naive(root, &p, extensions, out);
+        } else if !is_skipped_source_filename(&name)
+            && p
+                .extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|ext| extensions.contains(&ext))
         {
             out.push(p);
         }
@@ -160,8 +240,12 @@ impl GitignoreWalker {
                 continue;
             }
             let matched = if rule.anchored {
+                // Match the entry itself, or anything nested under an ignored name
+                // (git treats ignored directories as pruning the whole subtree).
                 rel == rule.pattern
                     || rel.strip_prefix("./") == Some(&rule.pattern)
+                    || rel.starts_with(&format!("{}/", rule.pattern))
+                    || rel.contains(&format!("/{}/", rule.pattern))
                     || rel.ends_with(&format!("/{}", rule.pattern))
                     || (is_dir && rel == rule.pattern.trim_end_matches('/'))
             } else {
@@ -268,16 +352,43 @@ mod tests {
 
             let mut paths = Vec::new();
             collect_source_files(tmp.path(), &["py"], &mut paths);
-            assert_eq!(paths.len(), 2, "paths: {:?}", paths);
+            assert_eq!(paths.len(), 1, "paths: {:?}", paths);
             assert!(paths.iter().any(|p| p.ends_with("src/main.py")));
-            assert!(paths.iter().any(|p| p.to_string_lossy().contains(".venv")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".venv")));
             assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".git/")));
             assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".cis/")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains("__pycache__")));
         });
     }
 
     #[test]
-    fn collect_naive_when_disabled() {
+    fn collect_skips_lang_build_dirs() {
+        with_gitignore_env(true, || {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::create_dir_all(tmp.path().join("src")).unwrap();
+            fs::write(tmp.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+            fs::write(tmp.path().join("src/app.ts"), "export const x = 1;\n").unwrap();
+            fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+            fs::write(tmp.path().join("target/debug/lib.rs"), "// build\n").unwrap();
+            fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+            fs::write(tmp.path().join("node_modules/pkg/index.js"), "module.exports=1\n").unwrap();
+            fs::create_dir_all(tmp.path().join("vendor/mod")).unwrap();
+            fs::write(tmp.path().join("vendor/mod/x.go"), "package mod\n").unwrap();
+            fs::write(tmp.path().join("src/bundle.min.js"), "var a=1;\n").unwrap();
+
+            let mut paths = Vec::new();
+            collect_source_files(tmp.path(), &["rs", "ts", "js", "go"], &mut paths);
+            assert!(paths.iter().any(|p| p.ends_with("src/lib.rs")));
+            assert!(paths.iter().any(|p| p.ends_with("src/app.ts")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains("target/")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains("node_modules")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains("vendor/")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains("bundle.min.js")));
+        });
+    }
+
+    #[test]
+    fn collect_naive_still_skips_builtin_dirs() {
         with_gitignore_env(false, || {
             let tmp = tempfile::tempdir().unwrap();
             write_tree(tmp.path());
@@ -286,9 +397,17 @@ mod tests {
             let mut paths = Vec::new();
             collect_source_files(tmp.path(), &["py"], &mut paths);
 
-            assert!(paths.len() > 1, "naive walk should include .venv: {:?}", paths);
-            assert!(paths.iter().any(|p| p.to_string_lossy().contains(".venv")));
+            assert!(paths.iter().any(|p| p.ends_with("src/main.py")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".venv")));
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".git/")));
         });
+    }
+
+    #[test]
+    fn path_has_builtin_skip_dir_detects_components() {
+        assert!(path_has_builtin_skip_dir("target/debug/foo.rs"));
+        assert!(path_has_builtin_skip_dir("frontend/node_modules/pkg/index.js"));
+        assert!(!path_has_builtin_skip_dir("src/main.py"));
     }
 
     #[test]
@@ -296,5 +415,34 @@ mod tests {
         assert!(glob_match("**/*__pycache__", "src/foo/__pycache__"));
         assert!(glob_match(".venv/**", ".venv/lib/site.py"));
         assert!(!glob_match(".venv/", "src/main.py"));
+    }
+
+    #[test]
+    fn gitignore_prunes_ignored_directory_subtree() {
+        with_gitignore_env(true, || {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join(".gitignore"), "vendor-src\n").unwrap();
+            fs::write(tmp.path().join("ok.py"), "def ok():\n    pass\n").unwrap();
+            fs::create_dir_all(tmp.path().join("vendor-src/pkg")).unwrap();
+            fs::write(tmp.path().join("vendor-src/pkg/lib.py"), "# skip\n").unwrap();
+            let mut paths = Vec::new();
+            collect_source_files(tmp.path(), &["py"], &mut paths);
+            assert_eq!(paths.len(), 1, "paths: {:?}", paths);
+            assert!(paths[0].ends_with("ok.py"));
+        });
+    }
+
+    #[test]
+    fn builtin_skips_venv_embed() {
+        with_gitignore_env(false, || {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("ok.py"), "def ok():\n    pass\n").unwrap();
+            fs::create_dir_all(tmp.path().join(".venv-embed/lib")).unwrap();
+            fs::write(tmp.path().join(".venv-embed/lib/site.py"), "# skip\n").unwrap();
+            let mut paths = Vec::new();
+            collect_source_files(tmp.path(), &["py"], &mut paths);
+            assert_eq!(paths.len(), 1);
+            assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".venv-embed")));
+        });
     }
 }
