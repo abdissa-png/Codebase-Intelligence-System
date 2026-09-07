@@ -40,19 +40,9 @@ fn hex_branch_id(branch_id: BranchId) -> String {
 pub fn fork_branch_bindings(kv: &MemoryKv, parent: BranchId, child: BranchId) -> usize {
     let parent_hex = hex_branch_id(parent);
     let child_hex = hex_branch_id(child);
-    let prefix = format!("ri:{parent_hex}:");
-    let mut count = 0usize;
-    for (k, v) in kv.scan_prefix(&prefix) {
-        let parts: Vec<&str> = k.split(':').collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let child_key = format!("ri:{child_hex}:{}", parts[2]);
-        if kv.get(&child_key).is_none() {
-            kv.set(&child_key, v);
-            count += 1;
-        }
-    }
+    let src_prefix = format!("ri:{parent_hex}:");
+    let dst_prefix = format!("ri:{child_hex}:");
+    let count = kv.copy_prefix_remap(&src_prefix, &dst_prefix);
     let parent_meta = format!("branch_parent:{child_hex}");
     if kv.get(&parent_meta).is_none() {
         kv.set(&parent_meta, parent.0.to_vec());
@@ -186,5 +176,29 @@ mod tests {
         kv.set(&format!("branch_parent:{}", hex_branch_id(b)), a.0.to_vec());
         let chain = branch_ancestry(&kv, a);
         assert_eq!(chain, vec![a, b]);
+    }
+
+    #[cfg(feature = "body-sqlite")]
+    #[test]
+    fn fork_branch_bindings_sqlite_is_constant_statements() {
+        let kv = MemoryKv::open_sqlite_in_memory();
+        let parent = BranchId([1u8; 16]);
+        let child = BranchId([2u8; 16]);
+        let phex = hex_branch_id(parent);
+        for i in 0..50u8 {
+            let mut ident = [0u8; 16];
+            ident[15] = i;
+            let idhex: String = ident.iter().map(|b| format!("{b:02x}")).collect();
+            kv.set(&format!("ri:{phex}:{idhex}"), vec![i]);
+        }
+        let before = kv.sql_write_count();
+        assert_eq!(fork_branch_bindings(&kv, parent, child), 50);
+        let writes = kv.sql_write_count().saturating_sub(before);
+        assert!(
+            writes <= 4,
+            "fork_branch_bindings should be O(1) SQL writes, got {writes}"
+        );
+        let chex = hex_branch_id(child);
+        assert_eq!(kv.scan_prefix(&format!("ri:{chex}:")).len(), 50);
     }
 }

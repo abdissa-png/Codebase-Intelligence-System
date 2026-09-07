@@ -201,6 +201,9 @@ pub fn save_vector_snapshot(path: &Path, store: &InMemoryVectorStore) -> io::Res
 }
 
 pub fn save_kv_snapshot(path: &Path, kv: &MemoryKv) -> io::Result<()> {
+    if kv.is_sqlite_backed() && !crate::kv::kv_json_export_enabled() {
+        return Ok(());
+    }
     let subset = durable_kv_subset_for_persist(&kv.snapshot());
     let file = KvSnapshotFile {
         version: KV_SNAPSHOT_VERSION,
@@ -227,6 +230,47 @@ pub fn load_kv_snapshot(path: &Path, kv: &MemoryKv) -> io::Result<usize> {
         entries: file.entries,
     });
     Ok(n)
+}
+
+/// Open the workspace KV: SQLite when `CIS_KV_BACKEND=sqlite`, otherwise RAM (`kv.json` loaded by callers).
+///
+/// If the SQLite `kv` table is empty and `kv.json` exists, durable keys are imported once.
+pub fn open_workspace_kv(cis: &Path) -> MemoryKv {
+    match crate::kv::kv_backend_from_env() {
+        crate::kv::KvBackendKind::Sqlite => {
+            #[cfg(feature = "body-sqlite")]
+            {
+                match MemoryKv::open_sqlite(cis) {
+                    Ok(kv) => {
+                        if kv.durable_row_count() == 0 {
+                            let kpath = kv_snapshot_path(cis);
+                            if kpath.is_file() {
+                                if let Err(e) = load_kv_snapshot(&kpath, &kv) {
+                                    eprintln!(
+                                        "cis: kv.json import into sqlite failed ({e}); starting empty"
+                                    );
+                                }
+                            }
+                        }
+                        return kv;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cis: CIS_KV_BACKEND=sqlite open failed ({e}); using memory+json"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(feature = "body-sqlite"))]
+            {
+                eprintln!(
+                    "cis: CIS_KV_BACKEND=sqlite requires --features body-sqlite; using memory+json"
+                );
+            }
+        }
+        crate::kv::KvBackendKind::Json => {}
+    }
+    MemoryKv::new()
 }
 
 /// Load persisted graph/vector when present; missing files are OK.
@@ -343,14 +387,22 @@ pub fn load_workspace_into(
         let sub = load_state_from_cis_dir(&cis, &mut *g, vector);
         report = sub;
     }
-    let kpath = kv_snapshot_path(&cis);
-    if kpath.exists() {
-        match load_kv_snapshot(&kpath, kv) {
-            Ok(n) => {
-                report.kv_loaded = true;
-                report.kv_entries = n;
+    if kv.is_sqlite_backed() {
+        let n = kv.durable_row_count();
+        if n > 0 {
+            report.kv_loaded = true;
+            report.kv_entries = n;
+        }
+    } else {
+        let kpath = kv_snapshot_path(&cis);
+        if kpath.exists() {
+            match load_kv_snapshot(&kpath, kv) {
+                Ok(n) => {
+                    report.kv_loaded = true;
+                    report.kv_entries = n;
+                }
+                Err(e) => report.kv_error = Some(e.to_string()),
             }
-            Err(e) => report.kv_error = Some(e.to_string()),
         }
     }
     if let Ok(n) = hydrate_ris_from_metadata_store(&cis, kv) {
@@ -584,5 +636,42 @@ mod tests {
         assert!(kv2.get("wal:deadbeef").is_none());
         assert_eq!(kv2.get("merge_lock:deadbeef"), Some(vec![1]));
         assert_eq!(kv2.get(&revision_binding_kv_key(b, ident)), Some(rev.0.to_vec()));
+    }
+
+    #[cfg(feature = "body-sqlite")]
+    #[test]
+    fn sqlite_kv_skips_json_unless_exported() {
+        std::env::remove_var("CIS_KV_JSON_EXPORT");
+        let dir = tempfile::tempdir().unwrap();
+        let kv = MemoryKv::open_sqlite(dir.path()).unwrap();
+        kv.set("ri:aa:01", vec![1]);
+        let path = dir.path().join("kv.json");
+        save_kv_snapshot(&path, &kv).unwrap();
+        assert!(!path.exists(), "sqlite KV must not rewrite kv.json by default");
+
+        std::env::set_var("CIS_KV_JSON_EXPORT", "1");
+        save_kv_snapshot(&path, &kv).unwrap();
+        std::env::remove_var("CIS_KV_JSON_EXPORT");
+        assert!(path.is_file());
+        let kv2 = MemoryKv::new();
+        assert_eq!(load_kv_snapshot(&path, &kv2).unwrap(), 1);
+        assert_eq!(kv2.get("ri:aa:01"), Some(vec![1]));
+    }
+
+    #[cfg(feature = "body-sqlite")]
+    #[test]
+    fn sqlite_kv_imports_kv_json_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_kv = MemoryKv::new();
+        json_kv.set("ri:aa:01", vec![7]);
+        json_kv.set("eto:skip", vec![9]);
+        save_kv_snapshot(&dir.path().join("kv.json"), &json_kv).unwrap();
+
+        std::env::set_var("CIS_KV_BACKEND", "sqlite");
+        let imported = open_workspace_kv(dir.path());
+        std::env::remove_var("CIS_KV_BACKEND");
+        assert!(imported.is_sqlite_backed());
+        assert_eq!(imported.get("ri:aa:01"), Some(vec![7]));
+        assert!(imported.get("eto:skip").is_none());
     }
 }

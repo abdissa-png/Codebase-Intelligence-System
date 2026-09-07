@@ -814,13 +814,15 @@ impl CisMcpRuntime {
         let injector = fault_injector
             .or_else(crate::fault_injection::injector_from_env)
             .unwrap_or_else(|| std::sync::Arc::new(crate::fault_injection::NoOpFaultInjector));
-        let kv = std::sync::Arc::new(MemoryKv::new());
+        let root_path = std::path::PathBuf::from(&repo_root);
+        let cis = cis_dir(&root_path);
+        let _ = std::fs::create_dir_all(&cis);
+        let kv = std::sync::Arc::new(crate::persistence::open_workspace_kv(&cis));
         kv.set_fault_injector(std::sync::Arc::clone(&injector));
         let wal: std::sync::Arc<dyn MutationLogStore> = {
             if std::env::var_os("CIS_WAL_MEMORY").is_some_and(|v| v == "1") {
                 std::sync::Arc::new(cis_wal::MutationLog::new())
             } else {
-                let cis = cis_dir(std::path::Path::new(&repo_root));
                 let wp = crate::persistence::wal_path(&cis);
                 if wp.exists() {
                     match cis_wal::DurableMutationLog::open(&wp) {
@@ -841,9 +843,6 @@ impl CisMcpRuntime {
                 }
             }
         };
-        let root_path = std::path::PathBuf::from(&repo_root);
-        let cis = cis_dir(&root_path);
-        let _ = std::fs::create_dir_all(&cis);
         let coordinator = std::sync::Arc::new(WriteCoordinator::open(
             wal,
             Some(CoordinatorPersistence { cis_dir: cis }),
@@ -879,6 +878,7 @@ impl CisMcpRuntime {
     /// Caller must have run [`WriteCoordinator::reconcile_on_startup`] and loaded `.cis` snapshots on
     /// `coordinator` (e.g. via [`crate::open_persisted_coordinator`]). This path loads **`kv.json`** and
     /// hydrates the revision index from the coordinator graph without re-opening WAL/graph.
+    /// Loads **`kv.json`** only when the KV is not already sqlite-backed.
     pub fn attach_coordinator(
         repo_root: impl AsRef<std::path::Path>,
         coordinator: std::sync::Arc<WriteCoordinator>,
@@ -1202,7 +1202,7 @@ impl CisMcpRuntime {
         })
     }
 
-    /// Load **`kv.json`** and bind revision index from the coordinator graph (graph already loaded).
+    /// Load durable KV (`kv.json` or sqlite) and bind revision index from the coordinator graph.
     pub fn load_persisted_kv_and_hydrate_revision_index(
         &self,
     ) -> crate::persistence::PersistenceLoadReport {
@@ -1211,14 +1211,22 @@ impl CisMcpRuntime {
         if !cis.is_dir() {
             return report;
         }
-        let kpath = crate::persistence::kv_snapshot_path(&cis);
-        if kpath.exists() {
-            match crate::persistence::load_kv_snapshot(&kpath, self.kv.as_ref()) {
-                Ok(n) => {
-                    report.kv_loaded = true;
-                    report.kv_entries = n;
+        if self.kv.is_sqlite_backed() {
+            let n = self.kv.durable_row_count();
+            if n > 0 {
+                report.kv_loaded = true;
+                report.kv_entries = n;
+            }
+        } else {
+            let kpath = crate::persistence::kv_snapshot_path(&cis);
+            if kpath.exists() {
+                match crate::persistence::load_kv_snapshot(&kpath, self.kv.as_ref()) {
+                    Ok(n) => {
+                        report.kv_loaded = true;
+                        report.kv_entries = n;
+                    }
+                    Err(e) => report.kv_error = Some(e.to_string()),
                 }
-                Err(e) => report.kv_error = Some(e.to_string()),
             }
         }
         let g = self.coordinator.graph().read();

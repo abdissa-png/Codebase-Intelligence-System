@@ -20,6 +20,7 @@ fn usage() {
     eprintln!("Environment:");
     eprintln!("  CIS_BODY_BACKEND=file|sqlite   (default: file)");
     eprintln!("  CIS_METADATA_BACKEND=json|sqlite (default: json)");
+    eprintln!("  CIS_KV_BACKEND=json|sqlite     (default: json)");
     eprintln!("  CIS_GRAPH_BACKEND=json|sqlite  (default: json)");
     eprintln!("  CIS_MIGRATION_STRICT=1         fail if sqlite feature/backend missing");
 }

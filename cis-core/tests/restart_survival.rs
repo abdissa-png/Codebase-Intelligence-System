@@ -38,6 +38,8 @@ fn clear_cis_integration_test_env() {
     std::env::remove_var("CIS_BODY_BACKEND");
     std::env::remove_var("CIS_METADATA_BACKEND");
     std::env::remove_var("CIS_GRAPH_BACKEND");
+    std::env::remove_var("CIS_KV_BACKEND");
+    std::env::remove_var("CIS_KV_JSON_EXPORT");
 }
 
 fn find_qualified_name(coord: &WriteCoordinator, needle: &str) -> bool {
@@ -330,6 +332,7 @@ fn sqlite_backends_survive_restart() {
     std::env::remove_var("CIS_WAL_MEMORY");
     std::env::set_var("CIS_BODY_BACKEND", "sqlite");
     std::env::set_var("CIS_METADATA_BACKEND", "sqlite");
+    std::env::set_var("CIS_KV_BACKEND", "sqlite");
     let root = temp_repo("sqlite-backends");
     let py_src = "def persistMe():\n    '''sqlite survival.'''\n    return 1\n";
     fs::write(root.join("persist.py"), py_src).unwrap();
@@ -347,13 +350,31 @@ fn sqlite_backends_survive_restart() {
             cis_core::bodies_db_path(&cis).is_file(),
             "bodies.db should exist with body sqlite backend"
         );
+        assert!(
+            rt.kv().is_sqlite_backed(),
+            "CIS_KV_BACKEND=sqlite should open a sqlite-backed KV"
+        );
+        assert!(
+            rt.kv().durable_row_count() > 0,
+            "ingest should write durable ri:/branch_reg rows into store.db"
+        );
+        assert!(
+            !cis.join("kv.json").exists(),
+            "sqlite KV must not rewrite kv.json by default"
+        );
     }
 
     {
         std::env::set_var("CIS_WAL_MEMORY", "1");
         std::env::set_var("CIS_BODY_BACKEND", "sqlite");
         std::env::set_var("CIS_METADATA_BACKEND", "sqlite");
+        std::env::set_var("CIS_KV_BACKEND", "sqlite");
         let rt = cis_core::CisMcpRuntime::new_dev(&root.to_string_lossy());
+        assert!(rt.kv().is_sqlite_backed());
+        assert!(
+            rt.kv().durable_row_count() > 0,
+            "durable KV rows must survive in store.db without kv.json"
+        );
         let rep = rt.load_persisted_workspace();
         assert!(rep.graph_loaded, "graph must load after sqlite restart");
         let hits = rt
@@ -374,6 +395,7 @@ fn sqlite_backends_survive_restart() {
     }
     std::env::remove_var("CIS_BODY_BACKEND");
     std::env::remove_var("CIS_METADATA_BACKEND");
+    std::env::remove_var("CIS_KV_BACKEND");
 }
 
 #[test]

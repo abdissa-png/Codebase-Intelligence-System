@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cis_core::{
     body_store_with_blobs, cis_dir, defer_vector_snapshot_load, embedder_from_env, kv_snapshot_path, load_env_file,
-    load_kv_snapshot, load_vector_into, open_persisted_coordinator, ActiveRankingPolicy, BodyStore,
+    load_kv_snapshot, load_vector_into, open_persisted_coordinator, open_workspace_kv,
+    ActiveRankingPolicy, BodyStore,
     CisDaemonHandles, CisMcpRuntime, EmbeddingWorker, MemoryKv, MergeRecoveryGate,
     MergeSagaOrchestrator, PolicyFileReloader, PolicyReloadOutcome, VectorCleanupQueue,
     VectorCleanupWorker, disk_free_percent, sweep_all_expired_merge_intents,
@@ -404,13 +405,15 @@ fn prepare_daemon(
         policy_snap.embedding_queue_hwm,
         policy_snap.embedding_queue_lwm,
     );
-    let kv = Arc::new(MemoryKv::new());
     let cis = cis_dir(repo);
-    if cis.is_dir() {
-        let kpath = kv_snapshot_path(&cis);
-        if kpath.exists() {
-            if let Err(e) = load_kv_snapshot(&kpath, kv.as_ref()) {
-                eprintln!("cisd: kv snapshot load failed: {e}");
+    let kv = Arc::new(open_workspace_kv(&cis));
+    if !kv.is_sqlite_backed() {
+        if cis.is_dir() {
+            let kpath = kv_snapshot_path(&cis);
+            if kpath.exists() {
+                if let Err(e) = load_kv_snapshot(&kpath, kv.as_ref()) {
+                    eprintln!("cisd: kv snapshot load failed: {e}");
+                }
             }
         }
     }

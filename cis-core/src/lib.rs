@@ -63,6 +63,8 @@ mod cpp_indexer;
 mod csharp_indexer;
 mod ingest;
 mod kv;
+#[cfg(feature = "body-sqlite")]
+mod sqlite_kv;
 mod language_indexer;
 #[cfg(feature = "ts-runtime")]
 pub mod indexer_eval;
@@ -223,7 +225,11 @@ pub use ingest::{
     IdentityResolverShell,
     IngestApplyReport, IndexEvent, IndexEventQueue,
 };
-pub use kv::{durable_kv_subset, durable_kv_subset_for_persist, CasError, MemoryKv, DURABLE_KV_PREFIXES, KvSnapshot};
+pub use kv::{
+    durable_kv_subset, durable_kv_subset_for_persist, is_durable_kv_key, kv_backend_from_env,
+    kv_json_export_enabled, CasError, KvBackendKind, KvSnapshot, KvStore, MemoryKv,
+    DURABLE_KV_PREFIXES,
+};
 pub use lsp_pool::{
     lsp_cache_key, lsp_cache_value_with_timestamp, LspCacheSweeper, LspPoolState, LspSessionFlags,
 };
@@ -273,6 +279,7 @@ pub use pre_write_snapshot::PreWriteSnapshotStore;
 pub use persistence::{
     cis_dir, defer_vector_snapshot_load, graph_snapshot_path, kv_snapshot_path, load_kv_snapshot,
     load_state_from_cis_dir, load_vector_into, load_workspace_into, open_persisted_coordinator,
+    open_workspace_kv,
     save_graph_snapshot, save_kv_snapshot,
     save_vector_snapshot, save_workspace_snapshots, snapshot_persist_enabled,
     vector_snapshot_path, wal_path, PersistenceLoadReport, VectorSnapshot,
