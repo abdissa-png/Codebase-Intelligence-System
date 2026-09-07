@@ -141,7 +141,7 @@ pub fn lineage_for_identity(
     opts: &LineageOptions,
 ) -> Option<Vec<LineageStep>> {
     let head = resolve_identity_revision_with_absence(g, chain, identity_id, absence)?;
-    Some(lineage_from_revision(g, chain, head, opts))
+    Some(lineage_from_revision(g, chain, &head, opts))
 }
 
 /// Lowest common ancestor revision id between two heads (shared revision in both lineages).

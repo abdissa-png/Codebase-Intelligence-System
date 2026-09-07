@@ -2,11 +2,16 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
+/// Incremented by [`GraphStore::load_into`]. Phase 4 MCP sqlite boot must not bump this.
+pub static LOAD_INTO_CALLS: AtomicU64 = AtomicU64::new(0);
+
 use crate::graph::{
-    GraphEdge, GraphSnapshot, InMemoryGraph, NodeIdentity, NodeRevision, GRAPH_SNAPSHOT_VERSION,
+    EdgeType, GraphEdge, GraphSnapshot, InMemoryGraph, NodeIdentity, NodeRevision,
+    GRAPH_SNAPSHOT_VERSION,
 };
 use crate::persistence::{graph_snapshot_path, load_graph_snapshot, save_graph_snapshot};
 
@@ -32,6 +37,64 @@ pub fn graph_json_export_enabled() -> bool {
     std::env::var_os("CIS_GRAPH_JSON_EXPORT").is_some_and(|v| {
         v == "1" || v.eq_ignore_ascii_case("true")
     })
+}
+
+/// Opt-in RAM vs SQL query compare on `find_symbol` / `get_callers` (`CIS_GRAPH_SHADOW=1`).
+///
+/// Phase 4: MCP queries return SQL. Shadow still compares when RAM overlay is populated.
+pub fn graph_shadow_enabled() -> bool {
+    std::env::var_os("CIS_GRAPH_SHADOW").is_some_and(|v| {
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
+}
+
+/// Compare RAM vs SQL [`crate::graph_view::GraphView`] results (Phase 3 shadow reads).
+#[cfg(feature = "body-sqlite")]
+pub fn shadow_graph_view_diffs(
+    ram: &InMemoryGraph,
+    sql: &SqliteGraphStore,
+    chain: &[BranchId],
+    needle: &str,
+    caller_target: Option<IdentityId>,
+) -> Vec<String> {
+    use crate::graph_view::GraphView;
+
+    let mut diffs = Vec::new();
+    let ram_qn: Vec<_> = GraphView::find_revisions_qn_contains(ram, chain, needle, 0)
+        .into_iter()
+        .map(|r| r.revision_id)
+        .collect();
+    let sql_qn: Vec<_> = GraphView::find_revisions_qn_contains(sql, chain, needle, 0)
+        .into_iter()
+        .map(|r| r.revision_id)
+        .collect();
+    if ram_qn != sql_qn {
+        diffs.push(format!(
+            "find_qn_contains needle={needle:?} ram={ram_qn:?} sql={sql_qn:?}"
+        ));
+    }
+    if let Some(id) = ram_qn.first() {
+        if GraphView::get_revision(ram, *id) != GraphView::get_revision(sql, *id) {
+            diffs.push(format!("get_revision mismatch for {id:?}"));
+        }
+        if GraphView::outbound_edges(ram, *id) != GraphView::outbound_edges(sql, *id) {
+            diffs.push(format!("outbound_edges mismatch for {id:?}"));
+        }
+    }
+    if let Some(target) = caller_target {
+        let ram_in: Vec<_> = GraphView::inbound_edges_to(ram, target, Some(EdgeType::Calls))
+            .into_iter()
+            .map(|(_, e)| e.edge_id)
+            .collect();
+        let sql_in: Vec<_> = GraphView::inbound_edges_to(sql, target, Some(EdgeType::Calls))
+            .into_iter()
+            .map(|(_, e)| e.edge_id)
+            .collect();
+        if ram_in != sql_in {
+            diffs.push(format!("inbound_calls ram={ram_in:?} sql={sql_in:?}"));
+        }
+    }
+    diffs
 }
 
 pub fn graph_db_path(cis: &Path) -> PathBuf {
@@ -91,6 +154,7 @@ impl JsonGraphStore {
 
 impl GraphStore for JsonGraphStore {
     fn load_into(&self, graph: &mut InMemoryGraph) -> io::Result<bool> {
+        LOAD_INTO_CALLS.fetch_add(1, Ordering::SeqCst);
         let path = graph_snapshot_path(&self.cis_dir);
         if !path.is_file() {
             return Ok(false);
@@ -196,6 +260,632 @@ mod sqlite {
                 .lock()
                 .map_err(|e| io::Error::other(format!("graph.db lock: {e}")))?;
             f(&conn)
+        }
+
+        fn blob16(v: &[u8]) -> Option<[u8; 16]> {
+            (v.len() == 16).then(|| {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(v);
+                a
+            })
+        }
+
+        fn blob32(v: &[u8]) -> Option<[u8; 32]> {
+            (v.len() == 32).then(|| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(v);
+                a
+            })
+        }
+
+        fn revision_from_parts(
+            rid: Vec<u8>,
+            iid: Vec<u8>,
+            bid: Vec<u8>,
+            st: i64,
+            qn: String,
+            fp: String,
+            bh: Vec<u8>,
+            sh: Vec<u8>,
+            lang: i64,
+            extra: Vec<u8>,
+        ) -> io::Result<Option<NodeRevision>> {
+            let Some(rb) = Self::blob16(&rid) else {
+                return Ok(None);
+            };
+            let Some(ib) = Self::blob16(&iid) else {
+                return Ok(None);
+            };
+            let Some(bb) = Self::blob16(&bid) else {
+                return Ok(None);
+            };
+            let Some(body_hash) = Self::blob32(&bh) else {
+                return Ok(None);
+            };
+            let Some(signature_hash) = Self::blob32(&sh) else {
+                return Ok(None);
+            };
+            let ex: RevisionExtra = serde_json::from_slice(&extra)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Some(NodeRevision {
+                revision_id: NodeRevisionId(rb),
+                identity_id: IdentityId(ib),
+                branch_id: BranchId(bb),
+                status: RevisionStatus::from_i64(st),
+                qualified_name: qn,
+                file_path: fp,
+                body_hash,
+                signature_hash,
+                language: Language::from_i64(lang),
+                parent_revision_id: ex.parent_revision_id,
+                rename_source_id: ex.rename_source_id,
+                span: ex.span,
+                tombstoned_at_ms: ex.tombstoned_at_ms,
+            }))
+        }
+
+        fn edge_from_parts(
+            eid: Vec<u8>,
+            src: Vec<u8>,
+            tgt: Vec<u8>,
+            ty: i64,
+            extra: Vec<u8>,
+        ) -> io::Result<Option<GraphEdge>> {
+            let Some(eb) = Self::blob16(&eid) else {
+                return Ok(None);
+            };
+            let Some(sb) = Self::blob16(&src) else {
+                return Ok(None);
+            };
+            let Some(tb) = Self::blob16(&tgt) else {
+                return Ok(None);
+            };
+            let ex: EdgeExtra = serde_json::from_slice(&extra)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Some(GraphEdge {
+                edge_id: eb,
+                ty: EdgeType::from_i64(ty),
+                source_revision_id: NodeRevisionId(sb),
+                target_identity_id: IdentityId(tb),
+                resolution: crate::graph::EdgeResolution {
+                    target_signature_hash: ex.resolution_target_sig,
+                    resolver: SourceType::from_u8(ex.resolution_resolver),
+                    last_validation_ms: ex.resolution_last_validation_ms,
+                },
+                anchor: ex.anchor,
+            }))
+        }
+
+        const REV_COLS: &'static str = "revision_id, identity_id, branch_id, status, qualified_name, file_path,
+            body_hash, signature_hash, language, extra";
+
+        fn map_revision_tuple(
+            rid: Vec<u8>,
+            iid: Vec<u8>,
+            bid: Vec<u8>,
+            st: i64,
+            qn: String,
+            fp: String,
+            bh: Vec<u8>,
+            sh: Vec<u8>,
+            lang: i64,
+            extra: Vec<u8>,
+        ) -> io::Result<Option<NodeRevision>> {
+            Self::revision_from_parts(rid, iid, bid, st, qn, fp, bh, sh, lang, extra)
+        }
+
+        fn like_contains(needle: &str) -> String {
+            let escaped = needle
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%{escaped}%")
+        }
+
+        /// Indexed PK lookup — does not hydrate the graph.
+        pub fn query_revision(&self, id: NodeRevisionId) -> io::Result<Option<NodeRevision>> {
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT {} FROM revisions WHERE revision_id = ?1", Self::REV_COLS))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut rows = stmt
+                    .query(params![id.0.as_slice()])
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? else {
+                    return Ok(None);
+                };
+                Self::map_revision_tuple(
+                    row.get(0).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(1).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(2).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(3).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(4).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(5).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(6).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(7).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(8).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(9).map_err(|e| io::Error::other(e.to_string()))?,
+                )
+            })
+        }
+
+        pub fn query_outbound_edges(&self, id: NodeRevisionId) -> io::Result<Vec<GraphEdge>> {
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT edge_id, source_revision_id, target_identity_id, ty, extra
+                         FROM edges WHERE source_revision_id = ?1 ORDER BY edge_id",
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let iter = stmt
+                    .query_map(params![id.0.as_slice()], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                        ))
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut out = Vec::new();
+                for r in iter {
+                    let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(e) = Self::edge_from_parts(t.0, t.1, t.2, t.3, t.4)? {
+                        out.push(e);
+                    }
+                }
+                Ok(out)
+            })
+        }
+
+        pub fn query_primary_revision(
+            &self,
+            branch_id: BranchId,
+            identity_id: IdentityId,
+        ) -> io::Result<Option<NodeRevision>> {
+            self.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT {} FROM revisions
+                     WHERE branch_id = ?1 AND identity_id = ?2 AND status IN (0, 1)
+                     ORDER BY CASE status WHEN 0 THEN 0 ELSE 1 END, revision_id
+                     LIMIT 1",
+                    Self::REV_COLS
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut rows = stmt
+                    .query(params![branch_id.0.as_slice(), identity_id.0.as_slice()])
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? else {
+                    return Ok(None);
+                };
+                Self::map_revision_tuple(
+                    row.get(0).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(1).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(2).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(3).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(4).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(5).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(6).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(7).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(8).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(9).map_err(|e| io::Error::other(e.to_string()))?,
+                )
+            })
+        }
+
+        pub fn query_revision_ids_for_file(
+            &self,
+            branch_id: BranchId,
+            file_path: &str,
+        ) -> io::Result<Vec<NodeRevisionId>> {
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT revision_id FROM revisions WHERE branch_id = ?1 AND file_path = ?2 ORDER BY revision_id")
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let iter = stmt
+                    .query_map(params![branch_id.0.as_slice(), file_path], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut out = Vec::new();
+                for r in iter {
+                    let v = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(id) = Self::blob16(&v) {
+                        out.push(NodeRevisionId(id));
+                    }
+                }
+                Ok(out)
+            })
+        }
+
+        pub fn query_tombstone_revision(
+            &self,
+            branch_id: BranchId,
+            identity_id: IdentityId,
+        ) -> io::Result<Option<NodeRevision>> {
+            self.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT {} FROM revisions
+                     WHERE branch_id = ?1 AND identity_id = ?2 AND status = 2
+                     ORDER BY revision_id LIMIT 1",
+                    Self::REV_COLS
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut rows = stmt
+                    .query(params![branch_id.0.as_slice(), identity_id.0.as_slice()])
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? else {
+                    return Ok(None);
+                };
+                Self::map_revision_tuple(
+                    row.get(0).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(1).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(2).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(3).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(4).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(5).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(6).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(7).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(8).map_err(|e| io::Error::other(e.to_string()))?,
+                    row.get(9).map_err(|e| io::Error::other(e.to_string()))?,
+                )
+            })
+        }
+
+        pub fn query_revision_ids_for_body_hash(
+            &self,
+            body_hash: &[u8; 32],
+        ) -> io::Result<Vec<NodeRevisionId>> {
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT revision_id FROM revisions WHERE body_hash = ?1")
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let iter = stmt
+                    .query_map(params![body_hash.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut out = Vec::new();
+                for r in iter {
+                    let v = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(id) = Self::blob16(&v) {
+                        out.push(NodeRevisionId(id));
+                    }
+                }
+                Ok(out)
+            })
+        }
+
+        pub fn query_index_counts(&self) -> io::Result<crate::graph_view::GraphIndexCounts> {
+            self.with_conn(|conn| {
+                let revisions: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let identities: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM identities", [], |r| r.get(0))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let edges: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let active_revisions: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM revisions WHERE status = 0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let active_outbound_edges: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM edges e
+                         JOIN revisions r ON r.revision_id = e.source_revision_id
+                         WHERE r.status = 0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let indexable_files: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(DISTINCT file_path) FROM revisions WHERE status = 0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                Ok(crate::graph_view::GraphIndexCounts {
+                    active_revisions: active_revisions as usize,
+                    active_outbound_edges: active_outbound_edges as usize,
+                    indexable_files: indexable_files as usize,
+                    identities: identities as usize,
+                    revisions: revisions as usize,
+                    edges: edges as usize,
+                })
+            })
+        }
+
+        pub fn durable_revision_count(&self) -> io::Result<usize> {
+            self.with_conn(|conn| Ok(Self::revision_count(conn)? as usize))
+        }
+
+        pub fn query_identity_ids_on_branch(&self, branch_id: BranchId) -> io::Result<Vec<IdentityId>> {
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT identity_id FROM revisions WHERE branch_id = ?1")
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let iter = stmt
+                    .query_map(params![branch_id.0.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut out = Vec::new();
+                for r in iter {
+                    let v = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(id) = Self::blob16(&v) {
+                        out.push(IdentityId(id));
+                    }
+                }
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok(out)
+            })
+        }
+
+        pub fn query_count_revisions_with_status(
+            &self,
+            chain: &[BranchId],
+            identity_id: IdentityId,
+            status: RevisionStatus,
+        ) -> io::Result<usize> {
+            if chain.is_empty() {
+                return Ok(0);
+            }
+            let st = status.to_i64();
+            let mut total = 0usize;
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT COUNT(*) FROM revisions
+                         WHERE branch_id = ?1 AND identity_id = ?2 AND status = ?3",
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                for branch in chain {
+                    let n: i64 = stmt
+                        .query_row(
+                            params![branch.0.as_slice(), identity_id.0.as_slice(), st],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    total += n as usize;
+                }
+                Ok(())
+            })?;
+            Ok(total)
+        }
+
+        /// Load one file (all branches) plus branch tombstones into `graph` without a full hydrate.
+        pub fn hydrate_working_set(
+            &self,
+            graph: &mut InMemoryGraph,
+            branch: BranchId,
+            file_path: &str,
+        ) -> io::Result<usize> {
+            self.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT {} FROM revisions WHERE file_path = ?1
+                     OR (branch_id = ?2 AND status = 2)",
+                    Self::REV_COLS
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let iter = stmt
+                    .query_map(params![file_path, branch.0.as_slice()], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, Vec<u8>>(9)?,
+                        ))
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut revs = Vec::new();
+                for r in iter {
+                    let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(rev) =
+                        Self::map_revision_tuple(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)?
+                    {
+                        revs.push(rev);
+                    }
+                }
+                let mut ident_ids: std::collections::HashSet<IdentityId> =
+                    std::collections::HashSet::new();
+                let mut rids: Vec<NodeRevisionId> = Vec::new();
+                for rev in &revs {
+                    ident_ids.insert(rev.identity_id);
+                    rids.push(rev.revision_id);
+                }
+                for iid in &ident_ids {
+                    let kind = conn
+                        .query_row(
+                            "SELECT kind FROM identities WHERE identity_id = ?1",
+                            params![iid.0.as_slice()],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .ok()
+                        .map(NodeKind::from_i64)
+                        .unwrap_or(NodeKind::Function);
+                    graph.put_identity(NodeIdentity {
+                        identity_id: *iid,
+                        kind,
+                    });
+                }
+                for rev in revs {
+                    graph.put_revision(rev);
+                }
+                for rid in &rids {
+                    let mut estmt = conn
+                        .prepare(
+                            "SELECT edge_id, source_revision_id, target_identity_id, ty, extra
+                             FROM edges WHERE source_revision_id = ?1 ORDER BY edge_id",
+                        )
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let eiter = estmt
+                        .query_map(params![rid.0.as_slice()], |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, Vec<u8>>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, Vec<u8>>(4)?,
+                            ))
+                        })
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let mut edges = Vec::new();
+                    for er in eiter {
+                        let t = er.map_err(|e| io::Error::other(e.to_string()))?;
+                        if let Some(e) = Self::edge_from_parts(t.0, t.1, t.2, t.3, t.4)? {
+                            edges.push(e);
+                        }
+                    }
+                    drop(estmt);
+                    if !edges.is_empty() {
+                        let _ = graph.replace_edges_for_revision(*rid, edges);
+                    }
+                }
+                Ok(rids.len())
+            })
+        }
+
+        pub fn query_identity_kind(&self, id: IdentityId) -> io::Result<Option<NodeKind>> {
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT kind FROM identities WHERE identity_id = ?1")
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut rows = stmt
+                    .query(params![id.0.as_slice()])
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? else {
+                    return Ok(None);
+                };
+                let kind: i64 = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
+                Ok(Some(NodeKind::from_i64(kind)))
+            })
+        }
+
+        pub fn query_revisions_qn_contains(
+            &self,
+            chain: &[BranchId],
+            needle: &str,
+            limit: usize,
+        ) -> io::Result<Vec<NodeRevision>> {
+            if chain.is_empty() {
+                return Ok(Vec::new());
+            }
+            let pattern = Self::like_contains(needle);
+            let mut out = Vec::new();
+            self.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT {} FROM revisions
+                     WHERE branch_id = ?1 AND qualified_name LIKE ?2 ESCAPE '\\'",
+                    Self::REV_COLS
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                for branch in chain {
+                    let iter = stmt
+                        .query_map(params![branch.0.as_slice(), pattern.as_str()], |row| {
+                            Ok((
+                                row.get::<_, Vec<u8>>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, Vec<u8>>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Vec<u8>>(6)?,
+                                row.get::<_, Vec<u8>>(7)?,
+                                row.get::<_, i64>(8)?,
+                                row.get::<_, Vec<u8>>(9)?,
+                            ))
+                        })
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    for r in iter {
+                        let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                        if let Some(rev) =
+                            Self::map_revision_tuple(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)?
+                        {
+                            out.push(rev);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            crate::graph_view::sort_revisions_qn(&mut out);
+            if limit > 0 {
+                out.truncate(limit);
+            }
+            Ok(out)
+        }
+
+        pub fn query_inbound_edges(
+            &self,
+            target: IdentityId,
+            ty: Option<EdgeType>,
+        ) -> io::Result<Vec<(NodeRevision, GraphEdge)>> {
+            self.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT r.revision_id, r.identity_id, r.branch_id, r.status, r.qualified_name, r.file_path,
+                                r.body_hash, r.signature_hash, r.language, r.extra,
+                                e.edge_id, e.source_revision_id, e.target_identity_id, e.ty, e.extra
+                         FROM edges e
+                         JOIN revisions r ON r.revision_id = e.source_revision_id
+                         WHERE e.target_identity_id = ?1 AND (e.ty = ?2 OR ?3 = 1)",
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let ty_i = ty.map(|t| t.to_i64()).unwrap_or(-1);
+                let any = i64::from(ty.is_none());
+                let iter = stmt
+                    .query_map(params![target.0.as_slice(), ty_i, any], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, Vec<u8>>(9)?,
+                            row.get::<_, Vec<u8>>(10)?,
+                            row.get::<_, Vec<u8>>(11)?,
+                            row.get::<_, Vec<u8>>(12)?,
+                            row.get::<_, i64>(13)?,
+                            row.get::<_, Vec<u8>>(14)?,
+                        ))
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut out = Vec::new();
+                for r in iter {
+                    let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    let Some(rev) =
+                        Self::map_revision_tuple(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)?
+                    else {
+                        continue;
+                    };
+                    let Some(edge) = Self::edge_from_parts(t.10, t.11, t.12, t.13, t.14)? else {
+                        continue;
+                    };
+                    out.push((rev, edge));
+                }
+                crate::graph_view::sort_inbound(&mut out);
+                Ok(out)
+            })
         }
 
         fn revision_count(conn: &Connection) -> io::Result<i64> {
@@ -468,6 +1158,7 @@ mod sqlite {
 
     impl GraphStore for SqliteGraphStore {
         fn load_into(&self, graph: &mut InMemoryGraph) -> io::Result<bool> {
+            LOAD_INTO_CALLS.fetch_add(1, Ordering::SeqCst);
             self.with_conn(|conn| {
                 if Self::revision_count(conn)? > 0 {
                     // Normalized rows are the source of truth. Do not rewrite the
@@ -484,6 +1175,11 @@ mod sqlite {
 
         fn save_snapshot(&self, graph: &InMemoryGraph) -> io::Result<()> {
             self.with_conn(|conn| {
+                let existing = Self::revision_count(conn)?;
+                if graph.revision_count() == 0 && existing > 0 {
+                    // Phase 4: RAM overlay is empty at boot. Never DELETE+rewrite SQL from it.
+                    return Ok(());
+                }
                 let tx = conn
                     .unchecked_transaction()
                     .map_err(|e| io::Error::other(e.to_string()))?;
@@ -598,6 +1294,86 @@ mod sqlite {
                 }
                 Ok(())
             })
+        }
+    }
+
+    impl crate::graph_view::GraphView for SqliteGraphStore {
+        fn get_revision(&self, id: NodeRevisionId) -> Option<NodeRevision> {
+            self.query_revision(id).ok().flatten()
+        }
+
+        fn outbound_edges(&self, id: NodeRevisionId) -> Vec<GraphEdge> {
+            self.query_outbound_edges(id).unwrap_or_default()
+        }
+
+        fn primary_revision_for_identity(
+            &self,
+            branch_id: BranchId,
+            identity_id: IdentityId,
+        ) -> Option<NodeRevision> {
+            self.query_primary_revision(branch_id, identity_id)
+                .ok()
+                .flatten()
+        }
+
+        fn revision_ids_for_file(&self, branch_id: BranchId, file_path: &str) -> Vec<NodeRevisionId> {
+            self.query_revision_ids_for_file(branch_id, file_path)
+                .unwrap_or_default()
+        }
+
+        fn identity_kind(&self, id: IdentityId) -> Option<NodeKind> {
+            self.query_identity_kind(id).ok().flatten()
+        }
+
+        fn tombstone_revision_for_identity(
+            &self,
+            branch_id: BranchId,
+            identity_id: IdentityId,
+        ) -> Option<NodeRevision> {
+            self.query_tombstone_revision(branch_id, identity_id)
+                .ok()
+                .flatten()
+        }
+
+        fn revision_ids_for_body_hash(&self, body_hash: &[u8; 32]) -> Vec<NodeRevisionId> {
+            self.query_revision_ids_for_body_hash(body_hash)
+                .unwrap_or_default()
+        }
+
+        fn find_revisions_qn_contains(
+            &self,
+            chain: &[BranchId],
+            needle: &str,
+            limit: usize,
+        ) -> Vec<NodeRevision> {
+            self.query_revisions_qn_contains(chain, needle, limit)
+                .unwrap_or_default()
+        }
+
+        fn inbound_edges_to(
+            &self,
+            target: IdentityId,
+            ty: Option<EdgeType>,
+        ) -> Vec<(NodeRevision, GraphEdge)> {
+            self.query_inbound_edges(target, ty).unwrap_or_default()
+        }
+
+        fn index_counts(&self) -> crate::graph_view::GraphIndexCounts {
+            self.query_index_counts().unwrap_or_default()
+        }
+
+        fn identity_ids_on_branch(&self, branch: BranchId) -> Vec<IdentityId> {
+            self.query_identity_ids_on_branch(branch).unwrap_or_default()
+        }
+
+        fn count_revisions_with_status(
+            &self,
+            chain: &[BranchId],
+            identity_id: IdentityId,
+            status: RevisionStatus,
+        ) -> usize {
+            self.query_count_revisions_with_status(chain, identity_id, status)
+                .unwrap_or(0)
         }
     }
 }
@@ -894,11 +1670,153 @@ mod sqlite_store_tests {
     }
 
     #[test]
+    fn graph_view_sql_matches_ram_without_hydrate() {
+        use crate::graph_view::GraphView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let g = seed_graph(&[Language::Rust, Language::Go]);
+        let store = SqliteGraphStore::open(dir.path()).unwrap();
+        store.save_snapshot(&g).unwrap();
+
+        let chain = [BranchId([0u8; 16])];
+        let diffs = super::shadow_graph_view_diffs(
+            &g,
+            &store,
+            &chain,
+            "f",
+            Some(IdentityId([1; 16])),
+        );
+        assert!(diffs.is_empty(), "shadow diffs: {diffs:?}");
+
+        let rid = NodeRevisionId([1; 16]);
+        assert_eq!(
+            GraphView::get_revision(&g, rid),
+            GraphView::get_revision(&store, rid)
+        );
+        assert_eq!(
+            GraphView::outbound_edges(&g, rid),
+            GraphView::outbound_edges(&store, rid)
+        );
+        assert_eq!(
+            GraphView::primary_revision_for_identity(&g, chain[0], IdentityId([1; 16]))
+                .map(|r| r.revision_id),
+            GraphView::primary_revision_for_identity(&store, chain[0], IdentityId([1; 16]))
+                .map(|r| r.revision_id)
+        );
+        assert_eq!(
+            GraphView::revision_ids_for_file(&g, chain[0], "f1.rs"),
+            GraphView::revision_ids_for_file(&store, chain[0], "f1.rs")
+        );
+        assert_eq!(
+            GraphView::identity_kind(&g, IdentityId([1; 16])),
+            GraphView::identity_kind(&store, IdentityId([1; 16]))
+        );
+    }
+
+    #[test]
+    fn sql_primary_prefers_active_then_lowest_speculative() {
+        use crate::graph_view::GraphView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let branch = BranchId([0u8; 16]);
+        let ident = IdentityId([9; 16]);
+        let mut g = InMemoryGraph::default();
+        g.put_identity(NodeIdentity {
+            identity_id: ident,
+            kind: NodeKind::Function,
+        });
+        let mut tomb = rev(1, Language::Python);
+        tomb.identity_id = ident;
+        tomb.status = RevisionStatus::Tombstone;
+        tomb.qualified_name = "pkg.dead".into();
+        g.put_revision(tomb);
+        let mut spec_hi = rev(5, Language::Python);
+        spec_hi.identity_id = ident;
+        spec_hi.status = RevisionStatus::Speculative;
+        spec_hi.qualified_name = "pkg.spec_hi".into();
+        g.put_revision(spec_hi);
+        let mut spec_lo = rev(2, Language::Python);
+        spec_lo.identity_id = ident;
+        spec_lo.status = RevisionStatus::Speculative;
+        spec_lo.qualified_name = "pkg.spec_lo".into();
+        g.put_revision(spec_lo);
+
+        let store = SqliteGraphStore::open(dir.path()).unwrap();
+        store.save_snapshot(&g).unwrap();
+        let sql_p = GraphView::primary_revision_for_identity(&store, branch, ident).unwrap();
+        assert_eq!(sql_p.revision_id, NodeRevisionId([2; 16]));
+        assert_eq!(sql_p.status, RevisionStatus::Speculative);
+        assert_eq!(
+            GraphView::primary_revision_for_identity(&g, branch, ident)
+                .unwrap()
+                .revision_id,
+            sql_p.revision_id
+        );
+
+        let mut active = rev(4, Language::Python);
+        active.identity_id = ident;
+        active.status = RevisionStatus::Active;
+        active.qualified_name = "pkg.live".into();
+        g.put_revision(active);
+        store.save_snapshot(&g).unwrap();
+        let sql_live = GraphView::primary_revision_for_identity(&store, branch, ident).unwrap();
+        assert_eq!(sql_live.revision_id, NodeRevisionId([4; 16]));
+        assert_eq!(sql_live.status, RevisionStatus::Active);
+    }
+
+    #[test]
     fn json_export_opt_in_only() {
         std::env::remove_var("CIS_GRAPH_JSON_EXPORT");
         assert!(!graph_json_export_enabled());
         std::env::set_var("CIS_GRAPH_JSON_EXPORT", "1");
         assert!(graph_json_export_enabled());
         std::env::remove_var("CIS_GRAPH_JSON_EXPORT");
+    }
+
+    #[test]
+    fn empty_overlay_save_does_not_wipe_sql() {
+        use crate::graph_view::GraphView;
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = InMemoryGraph::default();
+        g.put_identity(NodeIdentity {
+            identity_id: IdentityId([1; 16]),
+            kind: NodeKind::Function,
+        });
+        g.put_revision(rev(1, Language::Python));
+        let store = SqliteGraphStore::open(dir.path()).unwrap();
+        store.save_snapshot(&g).unwrap();
+        assert_eq!(store.durable_revision_count().unwrap(), 1);
+        store.save_snapshot(&InMemoryGraph::default()).unwrap();
+        assert_eq!(store.durable_revision_count().unwrap(), 1);
+        assert!(GraphView::get_revision(&store, NodeRevisionId([1; 16])).is_some());
+    }
+
+    #[test]
+    fn working_set_hydrate_is_not_full_load_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = InMemoryGraph::default();
+        g.put_identity(NodeIdentity {
+            identity_id: IdentityId([1; 16]),
+            kind: NodeKind::Function,
+        });
+        let mut a = rev(1, Language::Python);
+        a.file_path = "a.py".into();
+        g.put_revision(a);
+        let mut b = rev(2, Language::Python);
+        b.file_path = "b.py".into();
+        g.put_revision(b);
+        let store = SqliteGraphStore::open(dir.path()).unwrap();
+        store.save_snapshot(&g).unwrap();
+        let before = LOAD_INTO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let mut overlay = InMemoryGraph::default();
+        let n = store
+            .hydrate_working_set(&mut overlay, BranchId([9; 16]), "a.py")
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(overlay.revision_count(), 1);
+        assert_eq!(
+            LOAD_INTO_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before
+        );
     }
 }

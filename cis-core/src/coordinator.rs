@@ -67,6 +67,10 @@ pub struct WriteCoordinator {
     fault_injector: Mutex<Arc<dyn FaultInjector>>,
     /// Serializes phase check + side effects + `update_phase` for commit_graph/commit_vector.
     commit_lock: Mutex<()>,
+    /// SQLite is source of truth; RAM is a per-file ingest overlay (not hydrated at boot).
+    sqlite_primary: bool,
+    #[cfg(feature = "body-sqlite")]
+    sql_graph: Option<Arc<crate::graph_store::SqliteGraphStore>>,
 }
 
 impl std::fmt::Debug for WriteCoordinator {
@@ -79,7 +83,15 @@ impl std::fmt::Debug for WriteCoordinator {
 
 impl WriteCoordinator {
     pub fn new(wal: Arc<dyn MutationLogStore>) -> Self {
-        Self::new_inner(wal, InMemoryGraph::default(), InMemoryVectorStore::new(), None)
+        Self::new_inner(
+            wal,
+            InMemoryGraph::default(),
+            InMemoryVectorStore::new(),
+            None,
+            false,
+            #[cfg(feature = "body-sqlite")]
+            None,
+        )
     }
 
     /// Open coordinator with optional `.cis/` snapshots + durable WAL already attached.
@@ -89,10 +101,42 @@ impl WriteCoordinator {
     ) -> Self {
         let mut graph = InMemoryGraph::default();
         let vector = InMemoryVectorStore::new();
+        let mut sqlite_primary = false;
+        #[cfg(feature = "body-sqlite")]
+        let mut sql_graph = None;
         if let Some(ref p) = persistence {
-            let _ = load_state_from_cis_dir(&p.cis_dir, &mut graph, &vector);
+            #[cfg(feature = "body-sqlite")]
+            {
+                if crate::graph_store::graph_backend_from_env()
+                    == crate::graph_store::GraphBackendKind::Sqlite
+                {
+                    match crate::graph_store::SqliteGraphStore::open(&p.cis_dir) {
+                        Ok(store) => {
+                            sqlite_primary = true;
+                            sql_graph = Some(Arc::new(store));
+                            let _ = crate::persistence::load_vector_into(&p.cis_dir, &vector);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "cis: CIS_GRAPH_BACKEND=sqlite open failed ({e}); hydrating JSON/RAM"
+                            );
+                        }
+                    }
+                }
+            }
+            if !sqlite_primary {
+                let _ = load_state_from_cis_dir(&p.cis_dir, &mut graph, &vector);
+            }
         }
-        Self::new_inner(wal, graph, vector, persistence)
+        Self::new_inner(
+            wal,
+            graph,
+            vector,
+            persistence,
+            sqlite_primary,
+            #[cfg(feature = "body-sqlite")]
+            sql_graph,
+        )
     }
 
     fn new_inner(
@@ -100,6 +144,8 @@ impl WriteCoordinator {
         graph: InMemoryGraph,
         vector: InMemoryVectorStore,
         persistence: Option<CoordinatorPersistence>,
+        sqlite_primary: bool,
+        #[cfg(feature = "body-sqlite")] sql_graph: Option<Arc<crate::graph_store::SqliteGraphStore>>,
     ) -> Self {
         Self {
             wal,
@@ -113,6 +159,9 @@ impl WriteCoordinator {
             ready: AtomicBool::new(false),
             fault_injector: Mutex::new(Arc::new(NoOpFaultInjector)),
             commit_lock: Mutex::new(()),
+            sqlite_primary,
+            #[cfg(feature = "body-sqlite")]
+            sql_graph,
         }
     }
 
@@ -179,6 +228,17 @@ impl WriteCoordinator {
         let Some(ref p) = self.persistence else {
             return report;
         };
+        if self.sqlite_primary {
+            report = crate::persistence::load_vector_into(&p.cis_dir, &self.vector);
+            #[cfg(feature = "body-sqlite")]
+            if let Some(sql) = &self.sql_graph {
+                if let Ok(n) = sql.durable_revision_count() {
+                    report.graph_loaded = n > 0;
+                    report.graph_revisions = n;
+                }
+            }
+            return report;
+        }
         let mut g = self.graph.write();
         report = load_state_from_cis_dir(&p.cis_dir, &mut *g, &self.vector);
         report
@@ -192,6 +252,29 @@ impl WriteCoordinator {
         let Some(ref p) = self.persistence else {
             return Ok(());
         };
+        if self.sqlite_primary {
+            #[cfg(feature = "body-sqlite")]
+            {
+                let Some(sql) = &self.sql_graph else {
+                    return Ok(());
+                };
+                let g = self.graph.read();
+                let mut ids: Vec<_> = g.revisions().map(|r| r.revision_id).collect();
+                if ids.is_empty() {
+                    ids.extend_from_slice(affected);
+                }
+                if ids.is_empty() {
+                    return Ok(());
+                }
+                return crate::graph_store::GraphStore::apply_delta(sql.as_ref(), &g, &ids)
+                    .map_err(|e| CoordinatorError::Persist(e.to_string()));
+            }
+            #[cfg(not(feature = "body-sqlite"))]
+            {
+                let _ = (p, affected);
+                return Ok(());
+            }
+        }
         if self.should_skip_auto_snapshot_flush() {
             return Ok(());
         }
@@ -208,6 +291,25 @@ impl WriteCoordinator {
         let Some(ref p) = self.persistence else {
             return Ok(());
         };
+        if self.sqlite_primary {
+            #[cfg(feature = "body-sqlite")]
+            {
+                let overlay_n = self.graph.read().revision_count();
+                let sql_n = self
+                    .sql_graph
+                    .as_ref()
+                    .and_then(|s| s.durable_revision_count().ok())
+                    .unwrap_or(0);
+                // Partial ingest overlay must never DELETE+rewrite the SQL graph.
+                if overlay_n == 0 || overlay_n < sql_n {
+                    return Ok(());
+                }
+            }
+            #[cfg(not(feature = "body-sqlite"))]
+            {
+                return Ok(());
+            }
+        }
         if !force && self.should_skip_auto_snapshot_flush() {
             return Ok(());
         }
@@ -347,8 +449,93 @@ impl WriteCoordinator {
         &self.graph
     }
 
+    /// True when `CIS_GRAPH_BACKEND=sqlite` and the coordinator did not hydrate RAM at open.
+    pub fn sqlite_primary(&self) -> bool {
+        self.sqlite_primary
+    }
+
+    #[cfg(feature = "body-sqlite")]
+    pub fn sql_graph(&self) -> Option<Arc<crate::graph_store::SqliteGraphStore>> {
+        self.sql_graph.clone()
+    }
+
+    /// Durable revision count (SQL when sqlite-primary, else RAM overlay).
+    pub fn durable_revision_count(&self) -> usize {
+        #[cfg(feature = "body-sqlite")]
+        if self.sqlite_primary {
+            if let Some(sql) = &self.sql_graph {
+                if let Ok(n) = sql.durable_revision_count() {
+                    return n;
+                }
+            }
+        }
+        self.graph.read().revision_count()
+    }
+
+    pub fn with_graph_view<R>(&self, f: impl FnOnce(&dyn crate::graph_view::GraphView) -> R) -> R {
+        #[cfg(feature = "body-sqlite")]
+        if self.sqlite_primary {
+            if let Some(sql) = &self.sql_graph {
+                return f(sql.as_ref());
+            }
+        }
+        let g = self.graph.read();
+        f(&*g)
+    }
+
+    /// Pull the file (+ branch tombstones) into the RAM overlay for ingest.
+    pub fn preload_working_set(
+        &self,
+        branch: cis_wal::BranchId,
+        file_path: &str,
+    ) -> Result<(), CoordinatorError> {
+        #[cfg(feature = "body-sqlite")]
+        if self.sqlite_primary {
+            let Some(sql) = &self.sql_graph else {
+                return Ok(());
+            };
+            let mut g = self.graph.write();
+            sql.hydrate_working_set(&mut g, branch, file_path)
+                .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
+        }
+        let _ = (branch, file_path);
+        Ok(())
+    }
+
+    /// Drop the RAM overlay (sqlite-primary). Queries continue to hit SQL.
+    pub fn discard_overlay(&self) {
+        if self.sqlite_primary {
+            *self.graph.write() = InMemoryGraph::default();
+        }
+    }
+
+    /// Hydrate SQL into the RAM overlay for merge (full working copy).
+    pub fn hydrate_sql_into_overlay(&self) -> Result<(), CoordinatorError> {
+        #[cfg(feature = "body-sqlite")]
+        if self.sqlite_primary {
+            let Some(sql) = &self.sql_graph else {
+                return Ok(());
+            };
+            let mut g = self.graph.write();
+            if g.revision_count() > 0 {
+                return Ok(());
+            }
+            crate::graph_store::GraphStore::load_into(sql.as_ref(), &mut g)
+                .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub fn vector(&self) -> &InMemoryVectorStore {
         &self.vector
+    }
+
+    /// Flush the RAM overlay into SQLite (per-file ingest / speculative promote).
+    pub fn flush_overlay_to_sql(&self) -> Result<(), CoordinatorError> {
+        if !self.sqlite_primary {
+            return Ok(());
+        }
+        self.flush_graph_delta(&[])
     }
 
     /// Same **`InMemoryVectorStore`** as **`vector()`**, as the trait object used by merge rollback + DLQ worker.

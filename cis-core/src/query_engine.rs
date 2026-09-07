@@ -9,8 +9,9 @@ use crate::confidence::{edge_confidence, node_confidence_from_inbound, path_conf
 use crate::deletion_absence::DeletionAbsenceStore;
 use crate::edge_target_override::EdgeTargetOverrideStore;
 use crate::graph::{
-    EdgeType, GraphEdge, InMemoryGraph, NodeKind, NodeRevision, RevisionStatus, SourceType,
+    EdgeType, GraphEdge, NodeKind, NodeRevision, RevisionStatus, SourceType,
 };
+use crate::graph_view::GraphView;
 use crate::index_model::stable_rev_id_bytes;
 use crate::ranking_policy::RankingPolicySnapshot;
 
@@ -32,7 +33,7 @@ fn revision_on_chain(chain: &[BranchId], branch_id: BranchId) -> bool {
 /// Probes each branch in the ancestry chain because hub revision ids are
 /// derived from `branch` via [`stable_rev_id_bytes`].
 pub fn file_hub_revision_for_path(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     chain: &[BranchId],
     file_path: &str,
 ) -> Option<NodeRevisionId> {
@@ -47,21 +48,21 @@ pub fn file_hub_revision_for_path(
     None
 }
 
-fn is_file_hub_revision(g: &InMemoryGraph, rid: NodeRevisionId) -> bool {
+fn is_file_hub_revision(g: &impl GraphView, rid: NodeRevisionId) -> bool {
     g.get_revision(rid)
         .and_then(|r| g.identity_kind(r.identity_id))
         == Some(NodeKind::File)
 }
 
 /// Outbound edges for context traversal, including file-hub import hop (imports not duplicated on symbols).
-pub fn outbound_context_edges<'a>(
-    g: &'a InMemoryGraph,
+pub fn outbound_context_edges(
+    g: &impl GraphView,
     chain: &[BranchId],
     source_revision: NodeRevisionId,
-) -> Vec<&'a GraphEdge> {
-    let mut out: Vec<&GraphEdge> = g
+) -> Vec<GraphEdge> {
+    let mut out: Vec<GraphEdge> = g
         .outbound_edges(source_revision)
-        .iter()
+        .into_iter()
         .filter(|e| is_context_edge(e.ty))
         .collect();
     if !is_file_hub_revision(g, source_revision) {
@@ -79,12 +80,12 @@ pub fn outbound_context_edges<'a>(
 }
 
 /// **FR-2.5 / §01.3** — `Stub` nodes are traversal boundaries (OPAQUE gate).
-pub fn is_opaque_traversal_gate(g: &InMemoryGraph, rev: &NodeRevision) -> bool {
+pub fn is_opaque_traversal_gate(g: &impl GraphView, rev: &NodeRevision) -> bool {
     g.identity_kind(rev.identity_id) == Some(NodeKind::Stub)
 }
 
 /// Follow **`RENAMED_FROM`** on a tombstone revision to the successor identity.
-pub fn rename_successor_identity(g: &InMemoryGraph, tombstone_revision: NodeRevisionId) -> Option<IdentityId> {
+pub fn rename_successor_identity(g: &impl GraphView, tombstone_revision: NodeRevisionId) -> Option<IdentityId> {
     for e in g.outbound_edges(tombstone_revision) {
         if e.ty == EdgeType::RenamedFrom {
             return Some(e.target_identity_id);
@@ -103,11 +104,11 @@ pub fn rename_successor_identity(g: &InMemoryGraph, tombstone_revision: NodeRevi
 ///
 /// Prefer [`resolve_identity_revision_with_absence`] for interactive queries so durable
 /// `deleted:` markers survive tombstone GC.
-pub fn resolve_identity_revision<'a>(
-    g: &'a InMemoryGraph,
+pub fn resolve_identity_revision(
+    g: &impl GraphView,
     chain: &[BranchId],
     identity_id: IdentityId,
-) -> Option<&'a NodeRevision> {
+) -> Option<NodeRevision> {
     resolve_identity_revision_with_absence(g, chain, identity_id, None)
 }
 
@@ -121,12 +122,12 @@ pub fn resolve_identity_revision<'a>(
 /// Live primaries (`Active`/`Speculative`) never include tombstones. Per branch, if only a
 /// tombstone remains and it applies to this query: bridge via `RENAMED_FROM` when present,
 /// otherwise treat as deleted.
-pub fn resolve_identity_revision_with_absence<'a>(
-    g: &'a InMemoryGraph,
+pub fn resolve_identity_revision_with_absence(
+    g: &impl GraphView,
     chain: &[BranchId],
     identity_id: IdentityId,
     absence: Option<&DeletionAbsenceStore>,
-) -> Option<&'a NodeRevision> {
+) -> Option<NodeRevision> {
     for &branch_id in chain {
         let honored_absent = absence
             .map(|store| {
@@ -188,23 +189,23 @@ pub fn resolve_identity_revision_with_absence<'a>(
 ///
 /// ETO overrides are resolved nearest-first across `chain` so a parent-branch override
 /// on an inherited edge is visible unless the child overrides it.
-pub fn resolve_edge_target<'a>(
-    g: &'a InMemoryGraph,
+pub fn resolve_edge_target(
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     edge: &GraphEdge,
-) -> Option<&'a NodeRevision> {
+) -> Option<NodeRevision> {
     resolve_edge_target_with_absence(g, eto, chain, edge, None)
 }
 
 /// Like [`resolve_edge_target`] with deletion absence.
-pub fn resolve_edge_target_with_absence<'a>(
-    g: &'a InMemoryGraph,
+pub fn resolve_edge_target_with_absence(
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     edge: &GraphEdge,
     absence: Option<&DeletionAbsenceStore>,
-) -> Option<&'a NodeRevision> {
+) -> Option<NodeRevision> {
     if chain.is_empty() {
         return None;
     }
@@ -224,15 +225,15 @@ fn min_source_on_path(current: SourceType, edge: &GraphEdge) -> SourceType {
 /// Walk inbound edges whose **effective** target (after ETO) is `identity_id`.
 ///
 /// Two paths:
-/// 1. [`InMemoryGraph::source_identities_targeting`] — canonical reverse index, then
+/// 1. [`GraphView::inbound_edges_to`] — canonical reverse index, then
 ///    resolve each source and filter by effective target (drops edges retargeted away).
 /// 2. [`EdgeTargetOverrideStore::overrides_targeting`] — ETO rows that retarget an edge
 ///    *to* `identity_id` from a different canonical target (not in `target_reverse`).
 ///
 /// Dedupes by `edge_id`. `edge_filter` selects edge types (e.g. `Calls` only).
 /// `visit` returns `false` to stop early (e.g. hit limit).
-pub fn for_each_inbound_edge<'a, FFilter, FVisit>(
-    g: &'a InMemoryGraph,
+pub fn for_each_inbound_edge<FFilter, FVisit>(
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     identity_id: IdentityId,
@@ -241,29 +242,30 @@ pub fn for_each_inbound_edge<'a, FFilter, FVisit>(
     mut visit: FVisit,
 ) where
     FFilter: Fn(&GraphEdge) -> bool,
-    FVisit: FnMut(&'a NodeRevision, &'a GraphEdge) -> bool,
+    FVisit: FnMut(&NodeRevision, &GraphEdge) -> bool,
 {
     let mut seen_edges: HashSet<[u8; 16]> = HashSet::new();
+    let mut seen_idents: HashSet<IdentityId> = HashSet::new();
 
-    let mut consider = |src: &'a NodeRevision, e: &'a GraphEdge| -> bool {
-        if !edge_filter(e) {
-            return true;
-        }
-        if eto.effective_target_identity_in_chain(chain, e) != identity_id {
-            return true;
-        }
-        if !seen_edges.insert(e.edge_id) {
-            return true;
-        }
-        visit(src, e)
-    };
-
-    for sid in g.source_identities_targeting(identity_id) {
+    for (src_rev, _) in g.inbound_edges_to(identity_id, None) {
+        seen_idents.insert(src_rev.identity_id);
+    }
+    for sid in seen_idents {
         let Some(src) = resolve_identity_revision_with_absence(g, chain, sid, absence) else {
             continue;
         };
-        for e in g.outbound_edges(src.revision_id) {
-            if !consider(src, e) {
+        let edges = g.outbound_edges(src.revision_id);
+        for e in &edges {
+            if !edge_filter(e) {
+                continue;
+            }
+            if eto.effective_target_identity_in_chain(chain, e) != identity_id {
+                continue;
+            }
+            if !seen_edges.insert(e.edge_id) {
+                continue;
+            }
+            if !visit(&src, e) {
                 return;
             }
         }
@@ -285,11 +287,21 @@ pub fn for_each_inbound_edge<'a, FFilter, FVisit>(
                 continue;
             }
         }
-        for e in g.outbound_edges(source_rev) {
+        let edges = g.outbound_edges(source_rev);
+        for e in &edges {
             if e.edge_id != edge_id {
                 continue;
             }
-            if !consider(src, e) {
+            if !edge_filter(e) {
+                continue;
+            }
+            if eto.effective_target_identity_in_chain(chain, e) != identity_id {
+                continue;
+            }
+            if !seen_edges.insert(e.edge_id) {
+                continue;
+            }
+            if !visit(&src, e) {
                 return;
             }
         }
@@ -297,7 +309,7 @@ pub fn for_each_inbound_edge<'a, FFilter, FVisit>(
 }
 
 fn inbound_edge_confidences(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     identity_id: IdentityId,
@@ -315,7 +327,7 @@ fn inbound_edge_confidences(
 
 /// Node confidence for MCP hits (**§01.1**).
 pub fn node_hit_confidence(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     rev: &NodeRevision,
     chain: &[BranchId],
@@ -327,7 +339,7 @@ pub fn node_hit_confidence(
 
 /// Like [`node_hit_confidence`] with deletion absence for inbound source resolution.
 pub fn node_hit_confidence_with_absence(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     rev: &NodeRevision,
     chain: &[BranchId],
@@ -349,7 +361,7 @@ pub struct ExpandContextResult {
 
 /// BFS over Calls/Imports/Uses with path-confidence pruning and OPAQUE stub gates.
 pub fn expand_context_bfs(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     policy: &RankingPolicySnapshot,
     chain: &[BranchId],
@@ -362,7 +374,7 @@ pub fn expand_context_bfs(
 
 /// Like [`expand_context_bfs`] with deletion absence.
 pub fn expand_context_bfs_with_absence(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     policy: &RankingPolicySnapshot,
     chain: &[BranchId],
@@ -390,7 +402,7 @@ pub fn expand_context_bfs_with_absence(
             continue;
         }
         let node_conf = if rid == start {
-            node_hit_confidence_with_absence(g, eto, r, chain, now_ms, half_life_ms, absence)
+            node_hit_confidence_with_absence(g, eto, &r, chain, now_ms, half_life_ms, absence)
         } else {
             path_confidence(&path_edge_confs, min_src)
         };
@@ -400,13 +412,13 @@ pub fn expand_context_bfs_with_absence(
         }
         hits.push((rid, node_conf));
 
-        if d == depth || is_opaque_traversal_gate(g, r) {
+        if d == depth || is_opaque_traversal_gate(g, &r) {
             continue;
         }
 
         for e in outbound_context_edges(g, chain, rid) {
-            let ec = edge_confidence(e, now_ms, half_life_ms);
-            let next_min = min_source_on_path(min_src, e);
+            let ec = edge_confidence(&e, now_ms, half_life_ms);
+            let next_min = min_source_on_path(min_src, &e);
             // Build next path only after prune check would need the scores —
             // allocate once into a buffer, score, then Rc-wrap if accepted.
             let mut next_buf = Vec::with_capacity(path_edge_confs.len() + 1);
@@ -417,7 +429,7 @@ pub fn expand_context_bfs_with_absence(
                 pruned += 1;
                 continue;
             }
-            let Some(next_rev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) else {
+            let Some(next_rev) = resolve_edge_target_with_absence(g, eto, chain, &e, absence) else {
                 pruned += 1;
                 continue;
             };
@@ -432,12 +444,12 @@ pub fn expand_context_bfs_with_absence(
 }
 
 /// First definition edge (Imports/Extends/Calls) respecting ETO + tombstone bridging + file-hub imports.
-pub fn resolve_definition_target<'a>(
-    g: &'a InMemoryGraph,
+pub fn resolve_definition_target(
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     source_revision: NodeRevisionId,
-) -> Option<&'a NodeRevision> {
+) -> Option<NodeRevision> {
     resolve_definition_target_with_absence(g, eto, chain, source_revision, None)
 }
 
@@ -445,30 +457,30 @@ pub fn resolve_definition_target<'a>(
 ///
 /// Priority: Calls, then Imports/Extends, then Uses (aligned with context edges so
 /// navigation and expansion do not disagree on reachable definition edges).
-pub fn resolve_definition_target_with_absence<'a>(
-    g: &'a InMemoryGraph,
+pub fn resolve_definition_target_with_absence(
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     source_revision: NodeRevisionId,
     absence: Option<&DeletionAbsenceStore>,
-) -> Option<&'a NodeRevision> {
+) -> Option<NodeRevision> {
     for e in outbound_context_edges(g, chain, source_revision) {
         if e.ty == EdgeType::Calls {
-            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) {
+            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, &e, absence) {
                 return Some(trev);
             }
         }
     }
     for e in outbound_context_edges(g, chain, source_revision) {
         if matches!(e.ty, EdgeType::Imports | EdgeType::Extends) {
-            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) {
+            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, &e, absence) {
                 return Some(trev);
             }
         }
     }
     for e in outbound_context_edges(g, chain, source_revision) {
         if e.ty == EdgeType::Uses {
-            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) {
+            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, &e, absence) {
                 return Some(trev);
             }
         }
@@ -478,7 +490,7 @@ pub fn resolve_definition_target_with_absence<'a>(
 
 /// Count outbound definition edges that fail resolution (for explain_context).
 pub fn count_unresolved_definition_edges(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     chain: &[BranchId],
     source_revision: NodeRevisionId,
@@ -496,7 +508,7 @@ pub fn count_unresolved_definition_edges(
 
 /// Count traversal neighbors pruned by path-confidence floor (expand_context semantics).
 pub fn count_pruned_expand_neighbors(
-    g: &InMemoryGraph,
+    g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
     policy: &RankingPolicySnapshot,
     chain: &[BranchId],

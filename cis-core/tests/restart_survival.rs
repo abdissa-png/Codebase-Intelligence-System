@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use cis_core::{
     apply_index_events, cis_dir, open_persisted_coordinator, save_workspace_snapshots,
-    FsChangeKind, IndexEvent, IndexEventQueue, MergeSagaOrchestrator, MemoryKv, NodeKind,
+    FsChangeKind, GraphView, IndexEvent, IndexEventQueue, MergeSagaOrchestrator, MemoryKv, NodeKind,
     WriteCoordinator,
 };
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
@@ -42,12 +42,77 @@ fn clear_cis_integration_test_env() {
     std::env::remove_var("CIS_KV_JSON_EXPORT");
 }
 
+/// Phase 4 — sqlite coordinator boot must not `load_into` / `from_snapshot`.
+#[test]
+#[cfg(feature = "body-sqlite")]
+fn sqlite_open_does_not_hydrate_graph() {
+    let _env = CIS_ENV_LOCK.lock().unwrap();
+    clear_cis_integration_test_env();
+    std::env::remove_var("CIS_WAL_MEMORY");
+    std::env::set_var("CIS_GRAPH_BACKEND", "sqlite");
+    let root = temp_repo("phase4-no-hydrate");
+    fs::write(root.join("hello.py"), "def greet():\n    return 1\n").unwrap();
+    let branch = BranchId([0u8; 16]);
+    let kv = Arc::new(MemoryKv::new());
+
+    {
+        let coord = open_persisted_coordinator(&root).expect("open");
+        let saga = MergeSagaOrchestrator::new(Arc::new(MemoryKv::new()));
+        let _ = coord.reconcile_on_startup(&saga);
+        apply_index_events(
+            &IndexEventQueue::new(),
+            coord.as_ref(),
+            Arc::clone(&kv),
+            vec![IndexEvent {
+                branch_id: branch,
+                path: "hello.py".into(),
+                kind: FsChangeKind::Modified,
+                old_path: None,
+            }],
+            |rel| fs::read_to_string(root.join(rel)),
+            None,
+            None,
+        )
+        .expect("ingest");
+        assert!(
+            coord.durable_revision_count() > 0,
+            "sql must have revisions after ingest"
+        );
+    }
+
+    let load_before = cis_core::LOAD_INTO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    let snap_before = cis_core::FROM_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    let coord = open_persisted_coordinator(&root).expect("reopen");
+    let load_after = cis_core::LOAD_INTO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    let snap_after = cis_core::FROM_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        load_after, load_before,
+        "WriteCoordinator::open must not call load_into on sqlite"
+    );
+    assert_eq!(
+        snap_after, snap_before,
+        "WriteCoordinator::open must not call from_snapshot on sqlite"
+    );
+    assert_eq!(
+        coord.graph().read().revision_count(),
+        0,
+        "RAM overlay stays empty at boot"
+    );
+    assert!(coord.durable_revision_count() > 0);
+    let found = coord.with_graph_view(|g| {
+        !g.find_revisions_qn_contains(&[branch], "greet", 8).is_empty()
+    });
+    assert!(found, "find_symbol path must see SQL without hydrate");
+    std::env::remove_var("CIS_GRAPH_BACKEND");
+}
+
 fn find_qualified_name(coord: &WriteCoordinator, needle: &str) -> bool {
-    coord
-        .graph()
-        .read()
-        .revisions()
-        .any(|r| r.qualified_name.contains(needle))
+    coord.with_graph_view(|g| !g.find_revisions_qn_contains(&[BranchId([0u8; 16])], needle, 0).is_empty())
+        || coord
+            .graph()
+            .read()
+            .revisions()
+            .any(|r| r.qualified_name.contains(needle))
 }
 
 #[test]

@@ -147,7 +147,7 @@ pub fn bootstrap_python_workspace_on_coordinator(
 ) -> Result<IngestApplyReport, CoordinatorError> {
     let root = PathBuf::from(repo_root);
     let force = std::env::var_os("CIS_FORCE_REINDEX").is_some_and(|v| v == "1");
-    let existing_revisions = coord.graph().read().revision_count();
+    let existing_revisions = coord.durable_revision_count();
     if existing_revisions > 0 && !force {
         let g = coord.graph().read();
         sync_revision_index_from_graph(&g, revision_index, kv.as_ref(), branch);

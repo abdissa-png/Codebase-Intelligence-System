@@ -349,18 +349,20 @@ fn chess_graph_sqlite_restart_query_parity() {
     std::env::remove_var("CIS_WAL_MEMORY");
 
     let edge_counts = |rt: &CisMcpRuntime| -> (usize, usize) {
-        let g = rt.coordinator().graph().read();
-        let mut calls = 0usize;
-        let mut total = 0usize;
-        for r in g.revisions() {
-            for e in g.outbound_edges(r.revision_id) {
-                total += 1;
-                if e.ty == EdgeType::Calls {
-                    calls += 1;
+        let branch = cis_wal::BranchId([0u8; 16]);
+        rt.coordinator().with_graph_view(|g| {
+            let mut calls = 0usize;
+            let mut total = 0usize;
+            for r in g.find_revisions_qn_contains(&[branch], "", 0) {
+                for e in g.outbound_edges(r.revision_id) {
+                    total += 1;
+                    if e.ty == EdgeType::Calls {
+                        calls += 1;
+                    }
                 }
             }
-        }
-        (calls, total)
+            (calls, total)
+        })
     };
 
     let (calls_before, edges_before);

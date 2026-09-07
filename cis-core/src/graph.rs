@@ -1,9 +1,13 @@
 //! In-memory asymmetric graph (**EI-1, EI-2**) + **TargetReverseIndex** (v2.6: identity-only).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 use serde::{Deserialize, Serialize};
+
+/// Incremented by [`InMemoryGraph::from_snapshot`]. Phase 4 MCP sqlite boot must not bump this.
+pub static FROM_SNAPSHOT_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -773,6 +777,7 @@ impl InMemoryGraph {
     /// + index maintenance per symbol) and made MCP startup miss Cursor's handshake
     /// timeout on multi‑thousand-symbol workspaces.
     pub fn from_snapshot(snap: GraphSnapshot) -> Result<Self, &'static str> {
+        FROM_SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
         let mut g = InMemoryGraph::default();
         let n_identities = snap.identities.len();
         let n_revisions = snap.revisions.len();

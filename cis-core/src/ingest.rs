@@ -13,6 +13,7 @@ use crate::graph::{
     EdgeType, GraphEdge, Language, NodeIdentity, NodeKind, NodeRevision, RevisionStatus,
 };
 use crate::graph_mutation::GraphMutationSet;
+use crate::graph_view::{GraphView, OverlayGraphView};
 use crate::identity_cas::IdentityProvisionalCas;
 use crate::deletion_absence::DeletionAbsenceStore;
 use crate::identity_resolution::{
@@ -200,6 +201,7 @@ pub fn apply_index_events_with_config(
         None => BodyStore::new(Arc::clone(&kv)),
     };
     coord.set_defer_snapshot_flush(true);
+    coord.discard_overlay();
 
     // Pre-parse batch so cross-file `Calls` resolve regardless of ingest order.
     let mut batch_indexes: HashMap<String, FileIndex> = HashMap::new();
@@ -255,6 +257,7 @@ pub fn apply_index_events_with_config(
                 let set = GraphMutationSet::new(vec![sentinel_rid], [0u8; 32]);
                 let mid = coord.begin_mutation(&set)?;
                 let absence_c = absence.clone();
+                coord.preload_working_set(branch, &path)?;
                 coord.commit_graph(mid, move |g| {
                     tombstone_all_file_symbols_with_absence(
                         g,
@@ -278,6 +281,7 @@ pub fn apply_index_events_with_config(
                         let set = GraphMutationSet::new(vec![sentinel_rid], [0u8; 32]);
                         let mid = coord.begin_mutation(&set)?;
                         let absence_c = absence.clone();
+                        coord.preload_working_set(branch, &old_path)?;
                         coord.commit_graph(mid, move |g| {
                             tombstone_all_file_symbols_with_absence(
                                 g,
@@ -317,9 +321,10 @@ pub fn apply_index_events_with_config(
         let mut index = index;
         let lang = indexer.language();
         let branch = ev.branch_id;
+        coord.preload_working_set(branch, &ev.path)?;
         {
             let g = coord.graph().read();
-            stabilize_disambiguators(&mut index, &ev.path, branch, &g);
+            stabilize_disambiguators(&mut index, &ev.path, branch, &*g);
         }
         batch_indexes.insert(ev.path.clone(), index.clone());
         let revs: Vec<NodeRevisionId> = index
@@ -345,6 +350,8 @@ pub fn apply_index_events_with_config(
         let bindings_out: Arc<Mutex<Vec<(IdentityId, NodeRevisionId)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let bindings_c = Arc::clone(&bindings_out);
+        #[cfg(feature = "body-sqlite")]
+        let sql_c = coord.sql_graph();
         coord.commit_graph(id, move |g| {
             let retained: HashSet<IdentityId> = index_c
                 .symbols
@@ -517,14 +524,25 @@ pub fn apply_index_events_with_config(
                 local_bindings.push((iid, rid));
             }
 
-            let edge_map = attach_import_and_call_edges(
-                &path_c,
-                branch,
-                &index_c,
-                &mod_map,
-                Some(g),
-                &batch_indexes_c,
-            );
+            let edge_map = {
+                #[cfg(feature = "body-sqlite")]
+                let committed: Option<&dyn GraphView> =
+                    sql_c.as_ref().map(|s| s.as_ref() as &dyn GraphView);
+                #[cfg(not(feature = "body-sqlite"))]
+                let committed: Option<&dyn GraphView> = None;
+                let view = OverlayGraphView {
+                    overlay: g,
+                    committed,
+                };
+                attach_import_and_call_edges(
+                    &path_c,
+                    branch,
+                    &index_c,
+                    &mod_map,
+                    Some(&view),
+                    &batch_indexes_c,
+                )
+            };
             for (stable_rid, edges) in edge_map {
                 if edges.is_empty() {
                     continue;
@@ -591,6 +609,7 @@ pub fn apply_index_events_with_config(
     }
     coord.set_defer_snapshot_flush(false);
     coord.flush_committed_snapshots()?;
+    coord.discard_overlay();
     Ok(rep)
 }
 

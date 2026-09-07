@@ -552,7 +552,7 @@ fn unique_function_leaf<'a>(index: &'a FileIndex, leaf: &str) -> Option<&'a str>
 }
 
 fn unique_function_leaf_in_graph(
-    graph: &crate::graph::InMemoryGraph,
+    graph: &dyn crate::graph_view::GraphView,
     branch: BranchId,
     file_path: &str,
     leaf: &str,
@@ -562,10 +562,10 @@ fn unique_function_leaf_in_graph(
     }
     let suffix = format!(".{leaf}");
     let mut hit: Option<IdentityId> = None;
-    for r in graph.revisions() {
-        if r.branch_id != branch || r.file_path != file_path {
+    for rid in graph.revision_ids_for_file(branch, file_path) {
+        let Some(r) = graph.get_revision(rid) else {
             continue;
-        }
+        };
         if !matches!(r.status, RevisionStatus::Active) {
             continue;
         }
@@ -591,7 +591,7 @@ pub(crate) fn resolve_member_in_module(
     owner: &str,
     member: &str,
     branch: BranchId,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     let member_key = format!("{owner}.{member}");
@@ -674,7 +674,7 @@ fn owner_revision_ikey(index: &FileIndex, stable_key: &str) -> String {
 }
 
 pub(crate) fn resolve_symbol_in_graph(
-    graph: &crate::graph::InMemoryGraph,
+    graph: &dyn crate::graph_view::GraphView,
     branch: BranchId,
     file_path: &str,
     simple_name: &str,
@@ -685,10 +685,10 @@ pub(crate) fn resolve_symbol_in_graph(
     let mut best_fn: Option<IdentityId> = None;
     let mut best_canon: Option<IdentityId> = None;
     let mut best_any: Option<IdentityId> = None;
-    for r in graph.revisions() {
-        if r.branch_id != branch || r.file_path != file_path {
+    for rid in graph.revision_ids_for_file(branch, file_path) {
+        let Some(r) = graph.get_revision(rid) else {
             continue;
-        }
+        };
         if !matches!(r.status, RevisionStatus::Active) {
             continue;
         }
@@ -715,7 +715,7 @@ pub(crate) fn resolve_symbol_in_module(
     file_path: &str,
     simple_name: &str,
     branch: BranchId,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     if let Some(g) = graph {
@@ -748,7 +748,7 @@ fn resolve_imported_ufcs_target(
     branch: BranchId,
     call: &ParsedCall,
     import_bindings: &HashMap<String, ImportBinding>,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     let CallReceiver::Attr { object, name } = &call.callee else {
@@ -791,7 +791,7 @@ fn resolve_rust_path_call(
     branch: BranchId,
     call: &ParsedCall,
     mod_map: &HashMap<String, String>,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     if !path.ends_with(".rs") {
@@ -845,7 +845,7 @@ pub(crate) fn resolve_call_target(
     index: &FileIndex,
     call: &ParsedCall,
     mod_map: &HashMap<String, String>,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     let import_bindings = build_import_bindings(&index.imports, mod_map, path);
@@ -1168,7 +1168,7 @@ pub(crate) fn resolve_type_name_to_identity(
     type_name: &str,
     index: &FileIndex,
     mod_map: &HashMap<String, String>,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     let import_bindings = build_import_bindings(&index.imports, mod_map, path);
@@ -1189,7 +1189,7 @@ pub(crate) fn attach_import_and_call_edges(
     branch: BranchId,
     index: &FileIndex,
     mod_map: &HashMap<String, String>,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> HashMap<NodeRevisionId, Vec<GraphEdge>> {
     let mut edge_map: HashMap<NodeRevisionId, Vec<GraphEdge>> = HashMap::new();
@@ -1376,7 +1376,7 @@ pub fn regen_edges_for_python_file_with_graph(
     content: &str,
     branch: BranchId,
     mod_map: &HashMap<String, String>,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
 ) -> Result<HashMap<NodeRevisionId, Vec<GraphEdge>>, &'static str> {
     regen_edges_for_file_with_graph(
         path,
@@ -1394,7 +1394,7 @@ pub fn regen_edges_for_file_with_graph(
     content: &str,
     branch: BranchId,
     mod_map: &HashMap<String, String>,
-    graph: Option<&crate::graph::InMemoryGraph>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
     indexers: &[Box<dyn crate::language_indexer::LanguageIndexer>],
 ) -> Result<HashMap<NodeRevisionId, Vec<GraphEdge>>, &'static str> {
     let indexer = crate::language_indexer::indexer_for_path(path, indexers)

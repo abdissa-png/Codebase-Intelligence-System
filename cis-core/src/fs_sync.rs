@@ -235,6 +235,11 @@ fn sync_coordinator_to_runtime(
     graph: &SharedInMemoryGraph,
     vector: &InMemoryVectorStore,
 ) {
+    if coord.sqlite_primary() {
+        // Phase 4: SQL is source of truth. Do not clone_full() a working-set overlay.
+        vector.replace_all(coord.vector().export_chunks());
+        return;
+    }
     *graph.write() = coord
         .graph()
         .read()

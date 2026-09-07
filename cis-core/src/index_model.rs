@@ -268,7 +268,7 @@ pub(crate) fn stabilize_disambiguators(
     idx: &mut FileIndex,
     path: &str,
     branch: BranchId,
-    graph: &crate::graph::InMemoryGraph,
+    graph: &dyn crate::graph_view::GraphView,
 ) {
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, s) in idx.symbols.iter().enumerate() {

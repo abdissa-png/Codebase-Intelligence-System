@@ -12,7 +12,8 @@ use crate::body_store::BodyStore;
 use crate::branch_registry::BranchRegistry;
 use crate::confirm_token::{clear_token_with_retry, write_token_with_retry};
 use crate::embedder::{api_embedder_configured, embedder_from_env, Embedder};
-use crate::graph::{EdgeType, GraphEdge, InMemoryGraph, NodeRevision, RevisionStatus, SourceSpan};
+use crate::graph::{EdgeType, GraphEdge, NodeRevision, RevisionStatus, SourceSpan};
+use crate::graph_view::GraphView;
 use crate::graph_mutation::GraphMutationSet;
 use crate::merge_control::{MergeCancelReport, MergeControl};
 use crate::merge_gate::MergeRecoveryGate;
@@ -626,7 +627,7 @@ fn resolve_target_revision(
     target: &str,
     chain: &[BranchId],
     overlay: &RevisionIndexCow,
-    g: &InMemoryGraph,
+    g: &dyn GraphView,
 ) -> Option<NodeRevisionId> {
     let t = target.trim();
     if let Some(rid) = parse_revision_hex(t) {
@@ -1017,6 +1018,12 @@ impl CisMcpRuntime {
 
     /// **Phase 7** — GC + persist referenced bodies; rebuild ANN index.
     pub fn sync_bodies_after_commit(&self, branch: BranchId) {
+        if self.coordinator.sqlite_primary() {
+            // Overlay is empty after ingest. Do not compute a keep-set from RAM
+            // (an empty set would GC every blob).
+            self.rebuild_ann_index();
+            return;
+        }
         let cis = self.cis_path();
         let keep = {
             let g = self.coordinator.graph().read();
@@ -1119,40 +1126,40 @@ impl CisMcpRuntime {
         branch: BranchId,
     ) -> Result<NodeRevision, AuthError> {
         let chain = self.query_branch_chain(branch);
-        let g = self.coordinator.graph().read();
-        if let Some(hex) = revision_id_hex {
-            if let Some(rid) = parse_revision_hex(hex) {
-                if let Some(rev) = g.get_revision(rid) {
-                    if revision_on_chain(&chain, rev.branch_id) {
-                        return Ok(rev.clone());
+        let absence = absence_for_runtime(&self.kv);
+        self.coordinator
+            .with_graph_view(|g| {
+                if let Some(hex) = revision_id_hex {
+                    if let Some(rid) = parse_revision_hex(hex) {
+                        if let Some(rev) = g.get_revision(rid) {
+                            if revision_on_chain(&chain, rev.branch_id) {
+                                return Ok(rev);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        if let Some(needle) = symbol {
-            let mut seen = HashSet::new();
-            for rev in g.revisions() {
-                if !revision_on_chain(&chain, rev.branch_id) {
-                    continue;
-                }
-                if !seen.insert(rev.identity_id) {
-                    continue;
-                }
-                if let Some(resolved) =
-                    crate::query_engine::resolve_identity_revision_with_absence(
-                        &g,
-                        &chain,
-                        rev.identity_id,
-                        Some(&absence_for_runtime(&self.kv)),
-                    )
-                {
-                    if resolved.qualified_name.contains(needle) {
-                        return Ok(resolved.clone());
+                if let Some(needle) = symbol {
+                    let mut seen = HashSet::new();
+                    for rev in g.find_revisions_qn_contains(&chain, needle, 0) {
+                        if !seen.insert(rev.identity_id) {
+                            continue;
+                        }
+                        if let Some(resolved) =
+                            crate::query_engine::resolve_identity_revision_with_absence(
+                                &g,
+                                &chain,
+                                rev.identity_id,
+                                Some(&absence),
+                            )
+                        {
+                            if resolved.qualified_name.contains(needle) {
+                                return Ok(resolved);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        Err(AuthError::InvalidInput)
+                Err(AuthError::InvalidInput)
+            })
     }
 
     /// **Phase 7** — live symbol body with BodyStore → cis blob → disk fallback.
@@ -1229,10 +1236,10 @@ impl CisMcpRuntime {
                 }
             }
         }
-        let g = self.coordinator.graph().read();
-        report.graph_loaded = g.revision_count() > 0;
-        report.graph_identities = g.identity_count();
-        drop(g);
+        let counts = self.coordinator.with_graph_view(|g| g.index_counts());
+        report.graph_loaded = counts.revisions > 0 || self.coordinator.durable_revision_count() > 0;
+        report.graph_identities = counts.identities;
+        report.graph_revisions = self.coordinator.durable_revision_count();
         // Re-hydrate from KV after snapshot load (construction may have run before kv.json).
         *self.revision_index.write().unwrap() = RevisionIndexCow::root_hydrated(
             self.active_branch(),
@@ -1242,19 +1249,12 @@ impl CisMcpRuntime {
         report
     }
 
-    /// Refresh MCP index counters from the in-memory graph (after snapshot load or ingest).
+    /// Refresh MCP index counters from the live graph (SQL COUNT when sqlite-primary).
     pub fn sync_index_status_from_graph(&self) {
-        let g = self.coordinator.graph().read();
-        let mut symbols_indexed = 0usize;
-        let mut edges_indexed = 0usize;
-        let mut files: HashSet<String> = HashSet::new();
-        for r in g.revisions().filter(|r| matches!(r.status, RevisionStatus::Active)) {
-            symbols_indexed += 1;
-            edges_indexed += g.outbound_edges(r.revision_id).len();
-            if crate::language_indexer::path_is_indexable(&r.file_path) {
-                files.insert(r.file_path.clone());
-            }
-        }
+        let counts = self.coordinator.with_graph_view(|g| g.index_counts());
+        let symbols_indexed = counts.active_revisions;
+        let edges_indexed = counts.active_outbound_edges;
+        let files_scanned = counts.indexable_files;
         let model_id = self.embedder.model_id().to_string();
         let vector = self.coordinator.vector();
         let unique_vectors = vector.embedded_body_count_for_model(&model_id);
@@ -1264,7 +1264,18 @@ impl CisMcpRuntime {
         let (embedded, stale, body_blobs_stored) = if unique_vectors == 0 && embed_chunks_registered == 0
         {
             (0, symbols_indexed, 0)
+        } else if self.coordinator.sqlite_primary() {
+            // Phase 4: do not walk every revision for embedding freshness.
+            let embedded = unique_vectors.min(symbols_indexed);
+            let stale = symbols_indexed.saturating_sub(embedded);
+            let body_blobs_stored = self
+                .body_blob_store
+                .list_hashes()
+                .map(|h| h.len())
+                .unwrap_or(0);
+            (embedded, stale, body_blobs_stored)
         } else {
+            let g = self.coordinator.graph().read();
             let mut embedded = 0usize;
             let mut stale = 0usize;
             for r in g.revisions().filter(|r| matches!(r.status, RevisionStatus::Active)) {
@@ -1280,12 +1291,11 @@ impl CisMcpRuntime {
                 .unwrap_or(0);
             (embedded, stale, body_blobs_stored)
         };
-        drop(g);
         let ann_size = self.ann_index.lock().unwrap().len();
         let mut st = self.index_status.lock().unwrap();
         st.symbols_indexed = symbols_indexed;
         st.edges_indexed = edges_indexed;
-        st.files_scanned = files.len();
+        st.files_scanned = files_scanned;
         st.embeddings_indexed = embedded;
         st.embeddings_stale = stale;
         st.embed_model_id = model_id;
@@ -1369,17 +1379,7 @@ impl CisMcpRuntime {
             &self.revision_index_arc(),
             self.active_branch(),
         )?;
-        let g = self.coordinator.graph().read();
-        let symbols_indexed = g
-            .revisions()
-            .filter(|r| matches!(r.status, RevisionStatus::Active))
-            .count();
-        let edges_indexed: usize = g
-            .revisions()
-            .filter(|r| matches!(r.status, RevisionStatus::Active))
-            .map(|r| g.outbound_edges(r.revision_id).len())
-            .sum();
-        drop(g);
+        let counts = self.coordinator.with_graph_view(|g| g.index_counts());
         {
             let mut st = self.index_status.lock().unwrap();
             st.last_index_epoch_ms = Some(now_ms());
@@ -1389,8 +1389,8 @@ impl CisMcpRuntime {
                 + rep.skipped_empty_py
                 + rep.skipped_delete_stub
                 + rep.parse_errors;
-            st.symbols_indexed = symbols_indexed;
-            st.edges_indexed = edges_indexed;
+            st.symbols_indexed = counts.active_revisions;
+            st.edges_indexed = counts.active_outbound_edges;
             st.parse_error_count = rep.parse_errors;
         }
         // Must not hold `index_status` — sync_bodies → rebuild_ann_index locks it again.
@@ -1442,6 +1442,10 @@ impl CisMcpRuntime {
             self.active_branch(),
         );
         if !std::env::var_os("CIS_SKIP_MERGE_RECOVER").is_some_and(|v| v == "1") {
+            let has_inflight = self.kv.scan_prefix("saga_state:").iter().any(|(_, v)| v.first() != Some(&6));
+            if has_inflight {
+                let _ = self.coordinator.hydrate_sql_into_overlay();
+            }
             let saga = MergeSagaOrchestrator::new(std::sync::Arc::clone(&self.kv));
             let gate = MergeRecoveryGate::new(std::sync::Arc::clone(&self.kv));
             let mut g = self.coordinator.graph().write();
@@ -1496,6 +1500,49 @@ impl CisMcpRuntime {
 
     pub fn kv(&self) -> &std::sync::Arc<MemoryKv> {
         &self.kv
+    }
+
+    /// Debug: compare SQL `GraphView` vs RAM overlay when both are populated (`CIS_GRAPH_SHADOW=1`).
+    #[allow(dead_code)]
+    fn maybe_shadow_graph(
+        &self,
+        ram: &crate::graph::InMemoryGraph,
+        chain: &[BranchId],
+        needle: &str,
+        caller_target: Option<IdentityId>,
+    ) {
+        #[cfg(feature = "body-sqlite")]
+        {
+            if !crate::graph_store::graph_shadow_enabled() {
+                return;
+            }
+            if crate::graph_store::graph_backend_from_env()
+                != crate::graph_store::GraphBackendKind::Sqlite
+            {
+                return;
+            }
+            let Some(cis) = self.coordinator.persistence_dir() else {
+                return;
+            };
+            match crate::graph_store::SqliteGraphStore::open(cis) {
+                Ok(sql) => {
+                    for d in crate::graph_store::shadow_graph_view_diffs(
+                        ram,
+                        &sql,
+                        chain,
+                        needle,
+                        caller_target,
+                    ) {
+                        eprintln!("cis: graph shadow mismatch: {d}");
+                    }
+                }
+                Err(e) => eprintln!("cis: graph shadow open failed: {e}"),
+            }
+        }
+        #[cfg(not(feature = "body-sqlite"))]
+        {
+            let _ = (ram, chain, needle, caller_target);
+        }
     }
 
     pub fn revision_index(&self) -> std::sync::Arc<RevisionIndexCow> {
@@ -1665,6 +1712,10 @@ impl CisMcpRuntime {
     }
 
     fn speculative_rids_for_paths(&self, paths: &[String], branch: BranchId) -> Vec<NodeRevisionId> {
+        for p in paths {
+            let rel = self.rel_path_from_abs(p);
+            let _ = self.coordinator.preload_working_set(branch, &rel);
+        }
         let g = self.coordinator.graph().read();
         paths
             .iter()
@@ -1715,6 +1766,7 @@ impl CisMcpRuntime {
             Ok(())
         })?;
         self.coordinator.finalize_graph_only(id)?;
+        self.coordinator.discard_overlay();
         Ok(count)
     }
 
@@ -1748,6 +1800,7 @@ impl CisMcpRuntime {
             Ok(())
         })?;
         self.coordinator.finalize_graph_only(id)?;
+        self.coordinator.discard_overlay();
         Ok(count)
     }
 
@@ -2102,11 +2155,16 @@ impl CisMcpRuntime {
         self.kv.delete(&crate::deletion_absence::fork_ts_key(branch));
         if let Some(parent) = parent {
             if !crate::deletion_absence::has_child_branches(self.kv.as_ref(), parent) {
-                let mut g = self.coordinator.graph().write();
-                n += crate::identity_resolution::finalize_soft_deletes_without_children(
-                    &mut g,
-                    self.kv.as_ref(),
-                );
+                let _ = self.coordinator.hydrate_sql_into_overlay();
+                {
+                    let mut g = self.coordinator.graph().write();
+                    n += crate::identity_resolution::finalize_soft_deletes_without_children(
+                        &mut g,
+                        self.kv.as_ref(),
+                    );
+                }
+                let _ = self.coordinator.flush_overlay_to_sql();
+                self.coordinator.discard_overlay();
             }
         }
         let mut meta = QueryMeta::default();
@@ -2140,9 +2198,10 @@ impl CisMcpRuntime {
             parse_identity_hex_local(new_target_identity_hex).ok_or(AuthError::InvalidInput)?;
 
         {
-            let g = self.coordinator.graph().read();
-            let edges = g.outbound_edges(source_rev);
-            if !edges.iter().any(|e| e.edge_id == edge_id) {
+            let known = self.coordinator.with_graph_view(|g| {
+                g.outbound_edges(source_rev).iter().any(|e| e.edge_id == edge_id)
+            });
+            if !known {
                 return Err(AuthError::InvalidInput);
             }
         }
@@ -2212,6 +2271,7 @@ impl CisMcpRuntime {
         self.reindex_paths_on_branch(&[rel_path], self.active_branch())?;
         let branch = self.active_branch();
         let path_s = rel_path.to_string();
+        self.coordinator.preload_working_set(branch, &path_s)?;
         let rids_to_speculate: Vec<NodeRevisionId> = {
             let g = self.coordinator.graph().read();
             g.revision_ids_for_file(branch, &path_s)
@@ -2234,6 +2294,8 @@ impl CisMcpRuntime {
                 }
             }
         }
+        self.coordinator.flush_overlay_to_sql()?;
+        self.coordinator.discard_overlay();
         Ok(())
     }
 
@@ -2294,8 +2356,7 @@ impl CisMcpRuntime {
             .map(|(k, _)| k)
             .collect();
         let mut actions: Vec<(IdentityId, Option<NodeRevisionId>)> = Vec::new();
-        {
-            let g = self.coordinator.graph().read();
+        self.coordinator.with_graph_view(|g| {
             for key in keys {
                 let parts: Vec<&str> = key.split(':').collect();
                 if parts.len() != 3 {
@@ -2317,12 +2378,7 @@ impl CisMcpRuntime {
                 };
                 actions.push((identity, rid));
             }
-            let identities: std::collections::HashSet<_> = g
-                .revisions()
-                .filter(|r| r.branch_id == branch)
-                .map(|r| r.identity_id)
-                .collect();
-            for identity in identities {
+            for identity in g.identity_ids_on_branch(branch) {
                 if actions.iter().any(|(id, _)| *id == identity) {
                     continue;
                 }
@@ -2335,7 +2391,7 @@ impl CisMcpRuntime {
                     }
                 }
             }
-        }
+        });
         let ri = self.revision_index.read().unwrap();
         for (identity, rid) in actions {
             match rid {
@@ -2473,45 +2529,44 @@ impl CisMcpRuntime {
             gate.is_query_blocked(branch) || merge_lock_holder(&self.kv, branch).is_some();
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
-        let g = self.coordinator.graph().read();
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let half = policy_half_life_ms(&self.policy.snapshot());
         let now = query_now_ms();
         let mut matches = Vec::new();
-        let mut seen = HashSet::new();
-        for rev in g.revisions() {
-            if !revision_on_chain(&chain, rev.branch_id) {
-                continue;
+        self.coordinator.with_graph_view(|g| {
+            let mut seen = HashSet::new();
+            let qn_limit = if prefer_file_hub { 0 } else { limit.saturating_mul(4).max(limit) };
+            for rev in g.find_revisions_qn_contains(&chain, needle, qn_limit) {
+                if !seen.insert(rev.identity_id) {
+                    continue;
+                }
+                let Some(resolved) = crate::query_engine::resolve_identity_revision_with_absence(
+                    &g,
+                    &chain,
+                    rev.identity_id,
+                    Some(&absence),
+                ) else {
+                    continue;
+                };
+                if !resolved.qualified_name.contains(needle) {
+                    continue;
+                }
+                if !prefer_file_hub && matches.len() >= limit {
+                    break;
+                }
+                let conf = crate::query_engine::node_hit_confidence_with_absence(
+                    &g,
+                    &eto,
+                    &resolved,
+                    &chain,
+                    now,
+                    half,
+                    Some(&absence),
+                );
+                matches.push(hit_from_rev(&resolved, conf));
             }
-            if !seen.insert(rev.identity_id) {
-                continue;
-            }
-            let Some(resolved) = crate::query_engine::resolve_identity_revision_with_absence(
-                &g,
-                &chain,
-                rev.identity_id,
-                Some(&absence),
-            ) else {
-                continue;
-            };
-            if !resolved.qualified_name.contains(needle) {
-                continue;
-            }
-            if !prefer_file_hub && matches.len() >= limit {
-                break;
-            }
-            let conf = crate::query_engine::node_hit_confidence_with_absence(
-                &g,
-                &eto,
-                resolved,
-                &chain,
-                now,
-                half,
-                Some(&absence),
-            );
-            matches.push(hit_from_rev(resolved, conf));
-        }
+        });
         if prefer_file_hub {
             matches.sort_by(|a, b| {
                 let rank = |h: &SymbolHit| -> (u8, usize) {
@@ -2560,41 +2615,42 @@ impl CisMcpRuntime {
         )
             .ok_or(AuthError::InvalidInput)?;
         let chain = self.query_branch_chain(branch);
-        let g = self.coordinator.graph().read();
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let half = policy_half_life_ms(&self.policy.snapshot());
         let now = query_now_ms();
         let mut matches = Vec::new();
         let mut seen = HashSet::new();
-        for (iid, _) in overlay.resolved_bindings() {
-            if !seen.insert(iid) {
-                continue;
-            }
-            let Some(resolved) = crate::query_engine::resolve_identity_revision_with_absence(
-                &g,
-                &chain,
-                iid,
-                Some(&absence),
-            ) else {
-                continue;
-            };
-            if matches.len() >= limit {
-                break;
-            }
-            if resolved.qualified_name.contains(needle) {
-                let conf = crate::query_engine::node_hit_confidence_with_absence(
+        self.coordinator.with_graph_view(|g| {
+            for (iid, _) in overlay.resolved_bindings() {
+                if !seen.insert(iid) {
+                    continue;
+                }
+                let Some(resolved) = crate::query_engine::resolve_identity_revision_with_absence(
                     &g,
-                    &eto,
-                    resolved,
                     &chain,
-                    now,
-                    half,
+                    iid,
                     Some(&absence),
-                );
-                matches.push(hit_from_rev(resolved, conf));
+                ) else {
+                    continue;
+                };
+                if matches.len() >= limit {
+                    break;
+                }
+                if resolved.qualified_name.contains(needle) {
+                    let conf = crate::query_engine::node_hit_confidence_with_absence(
+                        &g,
+                        &eto,
+                        &resolved,
+                        &chain,
+                        now,
+                        half,
+                        Some(&absence),
+                    );
+                    matches.push(hit_from_rev(&resolved, conf));
+                }
             }
-        }
+        });
         let node_count = matches.len();
         let latency_ms = t0.elapsed().as_millis() as u64;
         self.audit.record_sync(session_id, "find_symbol_at");
@@ -2657,18 +2713,19 @@ impl CisMcpRuntime {
             Some(self.cis_path().as_path()),
         )
             .ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
         let chain = self.query_branch_chain(branch);
-        let rid = resolve_target_revision(target, &chain, overlay.as_ref(), &g).ok_or(AuthError::InvalidInput)?;
-        let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
+        let rev = self.coordinator.with_graph_view(|g| {
+            let rid = resolve_target_revision(target, &chain, overlay.as_ref(), g)
+                .ok_or(AuthError::InvalidInput)?;
+            g.get_revision(rid).ok_or(AuthError::InvalidInput)
+        })?;
         let (raw, _source) = crate::symbol_body::resolve_revision_body(
             &self.body_store,
             self.body_blob_store.as_ref(),
             &self.cis_path(),
             std::path::Path::new(&self.repo_root),
-            rev,
+            &rev,
         );
-        drop(g);
         let tok = CharApproxTokenizer;
         let (text, truncated, omitted_tokens) =
             build_context_truncated(&raw, budget_tokens.max(1), &tok);
@@ -2723,35 +2780,43 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
         let rid = parse_revision_hex(revision_id_hex).ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
-        let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
-        if !revision_on_chain(&chain, rev.branch_id) {
-            return Err(AuthError::InvalidInput);
-        }
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let policy = self.policy.snapshot();
         let now = query_now_ms();
         let half = policy_half_life_ms(&policy);
-        let target = crate::query_engine::resolve_definition_target_with_absence(
-            &g,
-            &eto,
-            &chain,
-            rid,
-            Some(&absence),
-        );
-        let hit = target.map(|r| {
-            let conf = crate::query_engine::node_hit_confidence_with_absence(
+        let hit = self.coordinator.with_graph_view(|g| {
+            let rev = g.get_revision(rid)?;
+            if !revision_on_chain(&chain, rev.branch_id) {
+                return None;
+            }
+            let target = crate::query_engine::resolve_definition_target_with_absence(
                 &g,
                 &eto,
-                r,
                 &chain,
-                now,
-                half,
+                rid,
                 Some(&absence),
             );
-            hit_from_rev(r, conf)
+            target.map(|r| {
+                let conf = crate::query_engine::node_hit_confidence_with_absence(
+                    &g,
+                    &eto,
+                    &r,
+                    &chain,
+                    now,
+                    half,
+                    Some(&absence),
+                );
+                hit_from_rev(&r, conf)
+            })
         });
+        if hit.is_none() {
+            // Distinguish missing revision vs no definition: InvalidInput if revision unknown.
+            let known = self.coordinator.with_graph_view(|g| g.get_revision(rid).is_some());
+            if !known {
+                return Err(AuthError::InvalidInput);
+            }
+        }
         self.audit.record_sync(session_id, "go_to_definition");
         let mut meta = self.meta_at_commit(
             merge_in_progress,
@@ -2782,37 +2847,39 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
         let rid = parse_revision_hex(revision_id_hex).ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
-        let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
-        if !revision_on_chain(&chain, rev.branch_id) {
-            return Err(AuthError::InvalidInput);
-        }
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
         let mut hits = Vec::new();
         let mut seen_identities = HashSet::new();
-        crate::query_engine::for_each_inbound_edge(
-            &g,
-            &eto,
-            &chain,
-            rev.identity_id,
-            Some(&absence),
-            |_| true,
-            |src, e| {
-                if hits.len() >= limit {
-                    return false;
-                }
-                // One hit per source identity (matches prior MCP behavior).
-                if !seen_identities.insert(src.identity_id) {
-                    return true;
-                }
-                let conf = crate::confidence::edge_confidence(e, now, half);
-                hits.push(hit_from_rev_and_edge(src, e, conf));
-                hits.len() < limit
-            },
-        );
+        self.coordinator.with_graph_view(|g| -> Result<(), AuthError> {
+            let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
+            if !revision_on_chain(&chain, rev.branch_id) {
+                return Err(AuthError::InvalidInput);
+            }
+            crate::query_engine::for_each_inbound_edge(
+                &g,
+                &eto,
+                &chain,
+                rev.identity_id,
+                Some(&absence),
+                |_| true,
+                |src, e| {
+                    if hits.len() >= limit {
+                        return false;
+                    }
+                    // One hit per source identity (matches prior MCP behavior).
+                    if !seen_identities.insert(src.identity_id) {
+                        return true;
+                    }
+                    let conf = crate::confidence::edge_confidence(e, now, half);
+                    hits.push(hit_from_rev_and_edge(src, e, conf));
+                    hits.len() < limit
+                },
+            );
+            Ok(())
+        })?;
         let n = hits.len();
         self.audit.record_sync(session_id, "find_references");
         let mut meta = self.meta_at_commit(merge_in_progress, t0.elapsed().as_millis() as u64, n, None, false, None);
@@ -2838,7 +2905,6 @@ impl CisMcpRuntime {
         let target_id = parse_revision_hex(identity_id_hex)
             .map(|r| IdentityId(r.0))
             .ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
@@ -2846,25 +2912,27 @@ impl CisMcpRuntime {
         let chain = self.query_branch_chain(branch);
         let mut hits = Vec::new();
         let mut seen_identities = HashSet::new();
-        crate::query_engine::for_each_inbound_edge(
-            &g,
-            &eto,
-            &chain,
-            target_id,
-            Some(&absence),
-            |e| e.ty == EdgeType::Calls,
-            |src, e| {
-                if hits.len() >= limit {
-                    return false;
-                }
-                if !seen_identities.insert(src.identity_id) {
-                    return true;
-                }
-                let conf = crate::confidence::edge_confidence(e, now, half);
-                hits.push(hit_from_rev_and_edge(src, e, conf));
-                hits.len() < limit
-            },
-        );
+        self.coordinator.with_graph_view(|g| {
+            crate::query_engine::for_each_inbound_edge(
+                &g,
+                &eto,
+                &chain,
+                target_id,
+                Some(&absence),
+                |e| e.ty == EdgeType::Calls,
+                |src, e| {
+                    if hits.len() >= limit {
+                        return false;
+                    }
+                    if !seen_identities.insert(src.identity_id) {
+                        return true;
+                    }
+                    let conf = crate::confidence::edge_confidence(e, now, half);
+                    hits.push(hit_from_rev_and_edge(src, e, conf));
+                    hits.len() < limit
+                },
+            );
+        });
         let n = hits.len();
         self.audit.record_sync(session_id, "get_callers");
         let meta = self.meta_at_commit(merge_in_progress, t0.elapsed().as_millis() as u64, n, None, false, None);
@@ -2886,51 +2954,50 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
         let rid = parse_revision_hex(revision_id_hex).ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
-        let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
-        if !revision_on_chain(&chain, rev.branch_id) {
-            return Err(AuthError::InvalidInput);
-        }
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
-        let mut seen: HashSet<NodeRevisionId> = HashSet::new();
-        let mut hits = Vec::new();
-        let mut push_dep = |e: &GraphEdge| {
-            if hits.len() >= limit {
-                return;
+        let hits = self.coordinator.with_graph_view(|g| -> Result<Vec<SymbolHit>, AuthError> {
+            let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
+            if !revision_on_chain(&chain, rev.branch_id) {
+                return Err(AuthError::InvalidInput);
             }
-            if !matches!(
-                e.ty,
-                EdgeType::Imports | EdgeType::Uses | EdgeType::Calls | EdgeType::Extends
-            ) {
-                return;
-            }
-            if let Some(trev) = crate::query_engine::resolve_edge_target_with_absence(
-                &g,
-                &eto,
-                &chain,
-                e,
-                Some(&absence),
-            ) {
-                if seen.insert(trev.revision_id) {
-                    let conf = crate::query_engine::node_hit_confidence_with_absence(
-                        &g,
-                        &eto,
-                        trev,
-                        &chain,
-                        now,
-                        half,
-                        Some(&absence),
-                    );
-                    hits.push(hit_from_rev_and_edge(trev, e, conf));
+            let mut seen: HashSet<NodeRevisionId> = HashSet::new();
+            let mut hits = Vec::new();
+            for e in crate::query_engine::outbound_context_edges(&g, &chain, rid) {
+                if hits.len() >= limit {
+                    break;
+                }
+                if !matches!(
+                    e.ty,
+                    EdgeType::Imports | EdgeType::Uses | EdgeType::Calls | EdgeType::Extends
+                ) {
+                    continue;
+                }
+                if let Some(trev) = crate::query_engine::resolve_edge_target_with_absence(
+                    &g,
+                    &eto,
+                    &chain,
+                    &e,
+                    Some(&absence),
+                ) {
+                    if seen.insert(trev.revision_id) {
+                        let conf = crate::query_engine::node_hit_confidence_with_absence(
+                            &g,
+                            &eto,
+                            &trev,
+                            &chain,
+                            now,
+                            half,
+                            Some(&absence),
+                        );
+                        hits.push(hit_from_rev_and_edge(&trev, &e, conf));
+                    }
                 }
             }
-        };
-        for e in crate::query_engine::outbound_context_edges(&g, &chain, rid) {
-            push_dep(e);
-        }
+            Ok(hits)
+        })?;
         let n = hits.len();
         self.audit.record_sync(session_id, "get_dependencies");
         let mut meta = self.meta_at_commit(merge_in_progress, t0.elapsed().as_millis() as u64, n, None, false, None);
@@ -2957,43 +3024,46 @@ impl CisMcpRuntime {
             gate.is_query_blocked(branch) || merge_lock_holder(&self.kv, branch).is_some();
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
-        let g = self.coordinator.graph().read();
-        let hub = crate::query_engine::file_hub_revision_for_path(&g, &chain, path)
-            .ok_or(AuthError::InvalidInput)?;
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let now = query_now_ms();
         let half = policy_half_life_ms(&self.policy.snapshot());
-        let mut seen: HashSet<NodeRevisionId> = HashSet::new();
-        let mut hits = Vec::new();
-        for e in g.outbound_edges(hub) {
-            if hits.len() >= limit {
-                break;
-            }
-            if e.ty != EdgeType::Imports {
-                continue;
-            }
-            if let Some(trev) = crate::query_engine::resolve_edge_target_with_absence(
-                &g,
-                &eto,
-                &chain,
-                e,
-                Some(&absence),
-            ) {
-                if seen.insert(trev.revision_id) {
-                    let conf = crate::query_engine::node_hit_confidence_with_absence(
-                        &g,
-                        &eto,
-                        trev,
-                        &chain,
-                        now,
-                        half,
-                        Some(&absence),
-                    );
-                    hits.push(hit_from_rev_and_edge(trev, e, conf));
+        let hits_hub = self.coordinator.with_graph_view(|g| -> Result<(Vec<SymbolHit>, NodeRevisionId), AuthError> {
+            let hub = crate::query_engine::file_hub_revision_for_path(&g, &chain, path)
+                .ok_or(AuthError::InvalidInput)?;
+            let mut seen: HashSet<NodeRevisionId> = HashSet::new();
+            let mut hits = Vec::new();
+            for e in g.outbound_edges(hub) {
+                if hits.len() >= limit {
+                    break;
+                }
+                if e.ty != EdgeType::Imports {
+                    continue;
+                }
+                if let Some(trev) = crate::query_engine::resolve_edge_target_with_absence(
+                    &g,
+                    &eto,
+                    &chain,
+                    &e,
+                    Some(&absence),
+                ) {
+                    if seen.insert(trev.revision_id) {
+                        let conf = crate::query_engine::node_hit_confidence_with_absence(
+                            &g,
+                            &eto,
+                            &trev,
+                            &chain,
+                            now,
+                            half,
+                            Some(&absence),
+                        );
+                        hits.push(hit_from_rev_and_edge(&trev, &e, conf));
+                    }
                 }
             }
-        }
+            Ok((hits, hub))
+        })?;
+        let (hits, hub) = hits_hub;
         let n = hits.len();
         self.audit.record_sync(session_id, "file_imports");
         let mut meta = self.meta_at_commit(merge_in_progress, t0.elapsed().as_millis() as u64, n, None, false, None);
@@ -3025,36 +3095,36 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
         let start = parse_revision_hex(revision_id_hex).ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
-        let Some(start_rev) = g.get_revision(start) else {
-            return Err(AuthError::InvalidInput);
-        };
-        if !revision_on_chain(&chain, start_rev.branch_id) {
-            return Err(AuthError::InvalidInput);
-        }
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
         let policy = self.policy.snapshot();
-        let expanded = crate::query_engine::expand_context_bfs_with_absence(
-            &g,
-            &eto,
-            &policy,
-            &chain,
-            start,
-            depth,
-            query_now_ms(),
-            Some(&absence),
-        );
-        let hits: Vec<SymbolHit> = expanded
-            .hits
-            .iter()
-            .take(limit)
-            .filter_map(|(rid, conf)| g.get_revision(*rid).map(|r| hit_from_rev(r, *conf)))
-            .collect();
+        let (hits, pruned) = self.coordinator.with_graph_view(|g| -> Result<(Vec<SymbolHit>, usize), AuthError> {
+            let start_rev = g.get_revision(start).ok_or(AuthError::InvalidInput)?;
+            if !revision_on_chain(&chain, start_rev.branch_id) {
+                return Err(AuthError::InvalidInput);
+            }
+            let expanded = crate::query_engine::expand_context_bfs_with_absence(
+                &g,
+                &eto,
+                &policy,
+                &chain,
+                start,
+                depth,
+                query_now_ms(),
+                Some(&absence),
+            );
+            let hits: Vec<SymbolHit> = expanded
+                .hits
+                .iter()
+                .take(limit)
+                .filter_map(|(rid, conf)| g.get_revision(*rid).map(|r| hit_from_rev(&r, *conf)))
+                .collect();
+            Ok((hits, expanded.pruned_low_confidence_count))
+        })?;
         let n = hits.len();
         self.audit.record_sync(session_id, "expand_context");
         let mut meta = self.meta_at_commit(merge_in_progress, t0.elapsed().as_millis() as u64, n, None, false, None);
-        meta.pruned_low_confidence_count = expanded.pruned_low_confidence_count;
+        meta.pruned_low_confidence_count = pruned;
         if let Some(max_conf) = hits.iter().map(|h| h.confidence).reduce(f64::max) {
             meta.retrieval_confidence = max_conf;
         }
@@ -3087,7 +3157,6 @@ impl CisMcpRuntime {
             vector_score: f64,
         }
 
-        let g = self.coordinator.graph().read();
         let mut rows: Vec<SemanticRow> = Vec::new();
         let mut stale_count = 0usize;
         let mut embedded_count = 0usize;
@@ -3113,24 +3182,60 @@ impl CisMcpRuntime {
             Vec::new()
         };
 
-        if !ann_hits.is_empty() {
-            let wanted: HashSet<[u8; 32]> = ann_hits.iter().map(|(h, _)| *h).collect();
-            let mut seen_ids = HashSet::new();
-            for hash in &wanted {
-                for &rid in g.revision_ids_for_body_hash(hash) {
-                    let Some(hit_rev) = g.get_revision(rid) else {
-                        continue;
-                    };
-                    if !revision_on_chain(&chain, hit_rev.branch_id) {
-                        continue;
+        self.coordinator.with_graph_view(|g| {
+            if !ann_hits.is_empty() {
+                let wanted: HashSet<[u8; 32]> = ann_hits.iter().map(|(h, _)| *h).collect();
+                let mut seen_ids = HashSet::new();
+                for hash in &wanted {
+                    for rid in g.revision_ids_for_body_hash(hash) {
+                        let Some(hit_rev) = g.get_revision(rid) else {
+                            continue;
+                        };
+                        if !revision_on_chain(&chain, hit_rev.branch_id) {
+                            continue;
+                        }
+                        if !seen_ids.insert(hit_rev.identity_id) {
+                            continue;
+                        }
+                        let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
+                            &g,
+                            &chain,
+                            hit_rev.identity_id,
+                            Some(&absence),
+                        ) else {
+                            continue;
+                        };
+                        if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
+                            continue;
+                        }
+                        match vector.vector_for_body(&r.body_hash) {
+                            Some(entry) if entry.model_id == model_id => embedded_count += 1,
+                            Some(_) | None => stale_count += 1,
+                        }
+                        // Keep ANN-matched hash for scoring even if resolved revision differs.
+                        rows.push(SemanticRow {
+                            revision_id_hex: hex16(&r.revision_id.0),
+                            qualified_name: r.qualified_name.clone(),
+                            body_hash: *hash,
+                            structural_score: structural_substring_score(&needle, &r.qualified_name),
+                            vector_score: 0.0,
+                        });
                     }
-                    if !seen_ids.insert(hit_rev.identity_id) {
+                }
+            } else {
+                let mut seen_ids = HashSet::new();
+                const MAX_SCAN_ROWS: usize = 4096;
+                for r in g.find_revisions_qn_contains(&chain, "", MAX_SCAN_ROWS) {
+                    if rows.len() >= MAX_SCAN_ROWS {
+                        break;
+                    }
+                    if !seen_ids.insert(r.identity_id) {
                         continue;
                     }
                     let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
                         &g,
                         &chain,
-                        hit_rev.identity_id,
+                        r.identity_id,
                         Some(&absence),
                     ) else {
                         continue;
@@ -3142,54 +3247,16 @@ impl CisMcpRuntime {
                         Some(entry) if entry.model_id == model_id => embedded_count += 1,
                         Some(_) | None => stale_count += 1,
                     }
-                    // Keep ANN-matched hash for scoring even if resolved revision differs.
                     rows.push(SemanticRow {
                         revision_id_hex: hex16(&r.revision_id.0),
                         qualified_name: r.qualified_name.clone(),
-                        body_hash: *hash,
+                        body_hash: r.body_hash,
                         structural_score: structural_substring_score(&needle, &r.qualified_name),
                         vector_score: 0.0,
                     });
                 }
             }
-        } else {
-            let mut seen_ids = HashSet::new();
-            const MAX_SCAN_ROWS: usize = 4096;
-            for r in g.revisions() {
-                if rows.len() >= MAX_SCAN_ROWS {
-                    break;
-                }
-                if !revision_on_chain(&chain, r.branch_id) {
-                    continue;
-                }
-                if !seen_ids.insert(r.identity_id) {
-                    continue;
-                }
-                let Some(r) = crate::query_engine::resolve_identity_revision_with_absence(
-                    &g,
-                    &chain,
-                    r.identity_id,
-                    Some(&absence),
-                ) else {
-                    continue;
-                };
-                if !matches!(r.status, RevisionStatus::Active | RevisionStatus::Speculative) {
-                    continue;
-                }
-                match vector.vector_for_body(&r.body_hash) {
-                    Some(entry) if entry.model_id == model_id => embedded_count += 1,
-                    Some(_) | None => stale_count += 1,
-                }
-                rows.push(SemanticRow {
-                    revision_id_hex: hex16(&r.revision_id.0),
-                    qualified_name: r.qualified_name.clone(),
-                    body_hash: r.body_hash,
-                    structural_score: structural_substring_score(&needle, &r.qualified_name),
-                    vector_score: 0.0,
-                });
-            }
-        }
-        drop(g);
+        });
 
         let query_vec = if embedded_count > 0 {
             query_vec_early
@@ -3511,12 +3578,6 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
         let rid = parse_revision_hex(revision_id_hex).ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
-        let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
-        if !revision_on_chain(&chain, rev.branch_id) {
-            return Err(AuthError::InvalidInput);
-        }
-        let qn = rev.qualified_name.clone();
         let snap = self.policy.snapshot();
         let axis = AxisWeightBreakdown {
             structural_proximity: snap.axis_weights.structural_proximity,
@@ -3526,40 +3587,50 @@ impl CisMcpRuntime {
         };
         let hybrid_search =
             serde_json::to_value(&snap.hybrid_search).unwrap_or_else(|_| serde_json::json!({}));
-        let outbound_edges = g.outbound_edges(rid);
-        let outbound = outbound_edges.len();
-        let stale_count = g
-            .revisions()
-            .filter(|r| {
-                revision_on_chain(&chain, r.branch_id)
-                    && r.identity_id == rev.identity_id
-                    && matches!(r.status, RevisionStatus::Tombstone)
-            })
-            .count();
-        let orphaned_count = g
-            .revisions()
-            .filter(|r| {
-                revision_on_chain(&chain, r.branch_id)
-                    && r.identity_id == rev.identity_id
-                    && matches!(r.status, RevisionStatus::Orphaned)
-            })
-            .count();
         let eto = eto_for_runtime(&self.kv);
-        let pruned_low_confidence_count = crate::query_engine::count_unresolved_definition_edges(
-            &g,
-            &eto,
-            &chain,
-            rid,
-        ) + crate::query_engine::count_pruned_expand_neighbors(
-            &g,
-            &eto,
-            &snap,
-            &chain,
-            rid,
-            snap.max_hops.min(3),
-            query_now_ms(),
-        );
-        let inbound = g.source_identities_targeting(rev.identity_id).len();
+        let (qn, outbound, stale_count, orphaned_count, pruned_low_confidence_count, inbound) =
+            self.coordinator.with_graph_view(|g| -> Result<_, AuthError> {
+                let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
+                if !revision_on_chain(&chain, rev.branch_id) {
+                    return Err(AuthError::InvalidInput);
+                }
+                let outbound = g.outbound_edges(rid).len();
+                let stale_count = g.count_revisions_with_status(
+                    &chain,
+                    rev.identity_id,
+                    RevisionStatus::Tombstone,
+                );
+                let orphaned_count = g.count_revisions_with_status(
+                    &chain,
+                    rev.identity_id,
+                    RevisionStatus::Orphaned,
+                );
+                let pruned_low_confidence_count =
+                    crate::query_engine::count_unresolved_definition_edges(&g, &eto, &chain, rid)
+                        + crate::query_engine::count_pruned_expand_neighbors(
+                            &g,
+                            &eto,
+                            &snap,
+                            &chain,
+                            rid,
+                            snap.max_hops.min(3),
+                            query_now_ms(),
+                        );
+                let inbound = g
+                    .inbound_edges_to(rev.identity_id, None)
+                    .into_iter()
+                    .map(|(src, _)| src.identity_id)
+                    .collect::<HashSet<_>>()
+                    .len();
+                Ok((
+                    rev.qualified_name,
+                    outbound,
+                    stale_count,
+                    orphaned_count,
+                    pruned_low_confidence_count,
+                    inbound,
+                ))
+            })?;
         let counts = ExplainCounts {
             stale_count,
             orphaned_count,
@@ -3568,7 +3639,6 @@ impl CisMcpRuntime {
         let notes = format!(
             "axes §01.2; outbound_edges={outbound}; inbound_source_identities={inbound}; budget_tokens={budget_tokens} (char/4 tokenizer for build_context); tombstone_rows_for_identity={stale_count}; orphaned_rows_for_identity={orphaned_count}; unresolved_edge_targets={pruned_low_confidence_count}",
         );
-        drop(g);
         self.audit.record_sync(session_id, "explain_context");
         let gate = MergeRecoveryGate::new(std::sync::Arc::clone(&self.kv));
         let merge_in_progress =
@@ -3619,6 +3689,9 @@ impl CisMcpRuntime {
         let merge_id = parse_merge_id_hex(merge_id_hex).ok_or(AuthError::InvalidInput)?;
         let gate = MergeRecoveryGate::new(std::sync::Arc::clone(&self.kv));
         gate.begin_rollback(branch_id);
+        self.coordinator
+            .hydrate_sql_into_overlay()
+            .map_err(|_| AuthError::InvalidInput)?;
         let mut g = self.coordinator.graph().write();
         let rep = self
             .merge
@@ -3632,6 +3705,10 @@ impl CisMcpRuntime {
             )
             .map_err(|_| AuthError::InvalidInput)?;
         drop(g);
+        self.coordinator
+            .flush_overlay_to_sql()
+            .map_err(|_| AuthError::Persist)?;
+        self.coordinator.discard_overlay();
         let saga = MergeSagaOrchestrator::new(std::sync::Arc::clone(&self.kv));
         saga.purge_merge_saga_state(merge_id);
         crate::merge_engine::MergeContext::remove(&self.kv, merge_id);
@@ -3814,6 +3891,7 @@ impl CisMcpRuntime {
         session_id: u64,
     ) -> Result<GraphConsistencyResponse, AuthError> {
         self.require_session(session_id)?;
+        let _ = self.coordinator.hydrate_sql_into_overlay();
         let branches = self.branch_registry.list_branches();
         let branch_ids: Vec<BranchId> = branches.into_iter().map(|(_, id)| id).collect();
         let report = check_consistency(
@@ -3854,43 +3932,44 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let chain = self.query_branch_chain(branch);
         let rid = parse_revision_hex(revision_id_hex).ok_or(AuthError::InvalidInput)?;
-        let g = self.coordinator.graph().read();
-        let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
-        if !revision_on_chain(&chain, rev.branch_id) {
-            return Err(AuthError::InvalidInput);
-        }
-        let qualified_name = rev.qualified_name.clone();
-        let mut reasons = Vec::new();
         let eto = eto_for_runtime(&self.kv);
         let absence = absence_for_runtime(&self.kv);
-        let outbound = g.outbound_edges(rid);
-        let mut candidate_target_identities = 0usize;
-        for e in outbound {
-            if !matches!(e.ty, EdgeType::Imports | EdgeType::Extends | EdgeType::Calls) {
-                continue;
-            }
-            candidate_target_identities += 1;
-            if crate::query_engine::resolve_edge_target_with_absence(
-                &g,
-                &eto,
-                &chain,
-                e,
-                Some(&absence),
-            )
-            .is_none()
-            {
-                reasons.push("target_identity_without_active_revision".into());
-            }
-        }
-        if candidate_target_identities == 0 {
-            reasons.push("no_outbound_definition_edges".into());
-        }
+        let (qualified_name, mut reasons, candidate_target_identities) =
+            self.coordinator.with_graph_view(|g| -> Result<_, AuthError> {
+                let rev = g.get_revision(rid).ok_or(AuthError::InvalidInput)?;
+                if !revision_on_chain(&chain, rev.branch_id) {
+                    return Err(AuthError::InvalidInput);
+                }
+                let mut reasons = Vec::new();
+                let outbound = g.outbound_edges(rid);
+                let mut candidate_target_identities = 0usize;
+                for e in outbound {
+                    if !matches!(e.ty, EdgeType::Imports | EdgeType::Extends | EdgeType::Calls) {
+                        continue;
+                    }
+                    candidate_target_identities += 1;
+                    if crate::query_engine::resolve_edge_target_with_absence(
+                        &g,
+                        &eto,
+                        &chain,
+                        &e,
+                        Some(&absence),
+                    )
+                    .is_none()
+                    {
+                        reasons.push("target_identity_without_active_revision".into());
+                    }
+                }
+                if candidate_target_identities == 0 {
+                    reasons.push("no_outbound_definition_edges".into());
+                }
+                Ok((rev.qualified_name, reasons, candidate_target_identities))
+            })?;
         if active_ingest_mode() == "regex" {
             reasons.push("index_mode_regex_limits_call_precision".into());
         }
         reasons.sort();
         reasons.dedup();
-        drop(g);
         let gate = MergeRecoveryGate::new(std::sync::Arc::clone(&self.kv));
         let merge_in_progress = gate.is_query_blocked(branch) || merge_lock_holder(&self.kv, branch).is_some();
         let meta = self.meta_at_commit(
@@ -3944,6 +4023,9 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let saga = MergeSagaOrchestrator::new(std::sync::Arc::clone(&self.kv));
         let mut timeline = Vec::new();
+        self.coordinator
+            .hydrate_sql_into_overlay()
+            .map_err(|_| AuthError::InvalidInput)?;
 
         if continuing {
             if merge_lock_holder(&self.kv, target) != Some(merge_id) {
@@ -4159,6 +4241,10 @@ impl CisMcpRuntime {
             resumed_from_phase: None,
             compensated: false,
         });
+        self.coordinator
+            .flush_overlay_to_sql()
+            .map_err(|_| AuthError::Persist)?;
+        self.coordinator.discard_overlay();
         self.audit.record_sync(session_id, "merge_branch");
         Ok(MergeBranchResponse {
             merge_id_hex: hex16(&merge_id.0),

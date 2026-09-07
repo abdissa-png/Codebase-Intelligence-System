@@ -362,7 +362,15 @@ pub fn save_workspace_snapshots(
     kv: &MemoryKv,
 ) -> io::Result<()> {
     fs::create_dir_all(cis)?;
-    save_graph_with_backend(cis, graph)?;
+    if crate::graph_store::graph_backend_from_env() == crate::graph_store::GraphBackendKind::Sqlite {
+        // Phase 4: SQL is source of truth. Never write_normalized from an empty/partial overlay.
+        if crate::graph_store::graph_json_export_enabled() && graph.revision_count() > 0 {
+            let json = crate::graph_store::JsonGraphStore::new(cis.to_path_buf());
+            let _ = crate::graph_store::GraphStore::save_snapshot(&json, graph);
+        }
+    } else {
+        save_graph_with_backend(cis, graph)?;
+    }
     save_vector_snapshot(&vector_snapshot_path(cis), vector)?;
     save_kv_snapshot(&kv_snapshot_path(cis), kv)?;
     Ok(())
@@ -382,7 +390,15 @@ pub fn load_workspace_into(
     if !cis.is_dir() {
         return report;
     }
+    if crate::graph_store::graph_backend_from_env()
+        == crate::graph_store::GraphBackendKind::Sqlite
     {
+        let sub = crate::persistence::load_vector_into(&cis, vector);
+        report.vector_loaded = sub.vector_loaded;
+        report.vector_chunks = sub.vector_chunks;
+        report.vector_error = sub.vector_error;
+        report.graph_loaded = true;
+    } else {
         let mut g = graph.write();
         let sub = load_state_from_cis_dir(&cis, &mut *g, vector);
         report = sub;
@@ -408,7 +424,10 @@ pub fn load_workspace_into(
     if let Ok(n) = hydrate_ris_from_metadata_store(&cis, kv) {
         report.kv_entries = report.kv_entries.saturating_add(n);
     }
-    if report.graph_loaded {
+    if report.graph_loaded
+        && crate::graph_store::graph_backend_from_env()
+            != crate::graph_store::GraphBackendKind::Sqlite
+    {
         let bindings: Vec<_> = {
             let g = graph.read();
             g.revisions()

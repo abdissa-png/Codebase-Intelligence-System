@@ -6,6 +6,7 @@ use crate::body_store::BodyStore;
 use crate::coordinator::WriteCoordinator;
 use crate::embedder::Embedder;
 use crate::embedding_queue::EmbedJob;
+use crate::graph_view::GraphView;
 use crate::vector_store::InMemoryVectorStore;
 
 /// One logical pump of the embedding queue.
@@ -45,7 +46,6 @@ impl EmbeddingWorker {
         let mut pending: Vec<EmbedJob> = Vec::new();
         let mut texts: Vec<String> = Vec::new();
         let mut body_hashes: Vec<[u8; 32]> = Vec::new();
-        let graph = coord.graph().read();
 
         for job in jobs {
             let bh = job.text_digest;
@@ -64,21 +64,22 @@ impl EmbeddingWorker {
                 continue;
             };
             let snippet = String::from_utf8_lossy(&bytes);
-            let enrich = graph
-                .revisions()
-                .find(|r| r.body_hash == bh)
-                .map(|r| {
-                    format!(
-                        "{}\n{}\n{}",
-                        r.qualified_name, r.file_path, snippet
-                    )
-                })
-                .unwrap_or_else(|| snippet.into_owned());
+            let enrich = coord.with_graph_view(|g| {
+                g.revision_ids_for_body_hash(&bh)
+                    .into_iter()
+                    .find_map(|rid| g.get_revision(rid))
+                    .map(|r| {
+                        format!(
+                            "{}\n{}\n{}",
+                            r.qualified_name, r.file_path, snippet
+                        )
+                    })
+                    .unwrap_or_else(|| snippet.into_owned())
+            });
             texts.push(enrich);
             body_hashes.push(bh);
             pending.push(job);
         }
-        drop(graph);
 
         if texts.is_empty() {
             for job in pending {

@@ -39,6 +39,7 @@ mod graph_consistency;
 mod graph_delete_queue;
 mod graph_mutation;
 mod graph_store;
+mod graph_view;
 mod identity_cas;
 pub mod identity_resolution;
 mod identity_resolver;
@@ -118,9 +119,10 @@ pub use metadata_store::{metadata_backend_from_env, store_db_path, MetadataBacke
 #[cfg(feature = "body-sqlite")]
 pub use metadata_store::MetadataStore;
 pub use graph_store::{
-    graph_backend_from_env, graph_db_path, graph_json_export_enabled, migrate_graph_json_to_sqlite,
-    open_graph_store, rebuild_graph_normalized, save_graph_delta, save_graph_with_backend,
-    GraphBackendKind, GraphStore, JsonGraphStore, MigrateGraphReport,
+    graph_backend_from_env, graph_db_path, graph_json_export_enabled, graph_shadow_enabled,
+    migrate_graph_json_to_sqlite, open_graph_store, rebuild_graph_normalized, save_graph_delta,
+    save_graph_with_backend, GraphBackendKind, GraphStore, JsonGraphStore, LOAD_INTO_CALLS,
+    MigrateGraphReport,
 };
 #[cfg(feature = "body-sqlite")]
 pub use graph_store::SqliteGraphStore;
@@ -189,6 +191,8 @@ pub use graph::{
     EdgeTypeMetadata, GraphEdge, InMemoryGraph, Language, NodeIdentity, NodeKind, NodeRevision,
     ReconciliationTier, RevisionStatus, SourceSpan, SourceType,
 };
+pub use graph_view::{GraphIndexCounts, GraphView, GraphWrite, OverlayGraphView};
+pub use graph::FROM_SNAPSHOT_CALLS;
 pub use graph_consistency::{check_consistency, ConsistencyReport};
 pub use invariants::{
     assert_invariants, check_all_invariants, check_all_invariants_with_mode,
