@@ -104,6 +104,17 @@ impl InMemoryVectorStore {
         self.inner.lock().unwrap().vectors.len()
     }
 
+    /// Count embeddings for `model_id` without cloning vectors.
+    pub fn embedded_body_count_for_model(&self, model_id: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .vectors
+            .values()
+            .filter(|e| e.model_id == model_id)
+            .count()
+    }
+
     pub fn refcount_for_body(&self, body_hash: &[u8; 32]) -> usize {
         self.inner
             .lock()

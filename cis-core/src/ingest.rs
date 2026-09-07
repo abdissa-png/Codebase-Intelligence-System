@@ -192,10 +192,13 @@ pub fn apply_index_events_with_config(
 
     let rename_config = rename_config.unwrap_or_default();
     let resolver = IdentityResolver::from_policy(rename_config.rename_min_confidence);
-    let body_store = BodyStore::new(Arc::clone(&kv));
     let identity_cas = IdentityProvisionalCas::new(Arc::clone(&kv));
     let absence = DeletionAbsenceStore::new(Arc::clone(&kv));
     let cis_dir = coord.persistence_dir().map(|p| p.to_path_buf());
+    let body_store = match cis_dir.as_ref() {
+        Some(cis) => crate::body_blob::body_store_with_blobs(Arc::clone(&kv), cis),
+        None => BodyStore::new(Arc::clone(&kv)),
+    };
     coord.set_defer_snapshot_flush(true);
 
     // Pre-parse batch so cross-file `Calls` resolve regardless of ingest order.

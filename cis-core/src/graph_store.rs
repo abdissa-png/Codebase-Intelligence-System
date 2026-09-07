@@ -24,12 +24,14 @@ pub fn graph_backend_from_env() -> GraphBackendKind {
     }
 }
 
-/// When `CIS_GRAPH_BACKEND=sqlite`, still export `graph.json` unless `CIS_GRAPH_JSON_EXPORT=0`.
+/// When `CIS_GRAPH_BACKEND=sqlite`, also write `graph.json` if `CIS_GRAPH_JSON_EXPORT=1`.
+///
+/// Default is off: the JSON export is a full-graph copy and was the checkpoint tax
+/// this refactor is removing. Opt in for migration / debug dumps.
 pub fn graph_json_export_enabled() -> bool {
-    match std::env::var_os("CIS_GRAPH_JSON_EXPORT") {
-        Some(v) if v == "0" || v == "false" => false,
-        _ => true,
-    }
+    std::env::var_os("CIS_GRAPH_JSON_EXPORT").is_some_and(|v| {
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
 }
 
 pub fn graph_db_path(cis: &Path) -> PathBuf {
@@ -148,6 +150,9 @@ mod sqlite {
             extra BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_revisions_branch_file ON revisions(branch_id, file_path);
+        CREATE INDEX IF NOT EXISTS idx_revisions_branch_identity ON revisions(branch_id, identity_id);
+        CREATE INDEX IF NOT EXISTS idx_revisions_body_hash ON revisions(body_hash);
+        CREATE INDEX IF NOT EXISTS idx_revisions_branch_qn ON revisions(branch_id, qualified_name);
         CREATE TABLE IF NOT EXISTS edges (
             edge_id BLOB PRIMARY KEY,
             source_revision_id BLOB NOT NULL,
@@ -160,7 +165,7 @@ mod sqlite {
     ";
 
     pub struct SqliteGraphStore {
-        path: PathBuf,
+        conn: std::sync::Mutex<Connection>,
     }
 
     impl SqliteGraphStore {
@@ -168,43 +173,34 @@ mod sqlite {
             std::fs::create_dir_all(cis_dir)?;
             let path = graph_db_path(cis_dir);
             let conn = Connection::open(&path).map_err(|e| io::Error::other(e.to_string()))?;
+            conn.busy_timeout(std::time::Duration::from_millis(5000))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            // journal_mode=WAL returns a row; pragma_update handles that.
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(|e| io::Error::other(e.to_string()))?;
             conn.execute_batch(SCHEMA)
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            Ok(Self { path })
+            Ok(Self {
+                conn: std::sync::Mutex::new(conn),
+            })
         }
 
         fn with_conn<F, T>(&self, f: F) -> io::Result<T>
         where
             F: FnOnce(&Connection) -> io::Result<T>,
         {
-            let conn = Connection::open(&self.path).map_err(|e| io::Error::other(e.to_string()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| io::Error::other(format!("graph.db lock: {e}")))?;
             f(&conn)
         }
 
         fn revision_count(conn: &Connection) -> io::Result<i64> {
             conn.query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))
                 .map_err(|e| io::Error::other(e.to_string()))
-        }
-
-        fn edge_count(conn: &Connection) -> io::Result<i64> {
-            conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-
-        fn blob_edge_count(conn: &Connection) -> io::Result<Option<usize>> {
-            let mut stmt = conn
-                .prepare("SELECT payload FROM graph_snapshot WHERE id = 1")
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let mut rows = stmt
-                .query([])
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? else {
-                return Ok(None);
-            };
-            let payload: Vec<u8> = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
-            let snap: GraphSnapshot = serde_json::from_slice(&payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(Some(snap.edges.len()))
         }
 
         fn load_from_blob(conn: &Connection, graph: &mut InMemoryGraph) -> io::Result<bool> {
@@ -225,33 +221,10 @@ mod sqlite {
             Ok(true)
         }
 
-        fn kind_to_i64(kind: NodeKind) -> i64 {
-            match kind {
-                NodeKind::Class => 1,
-                NodeKind::Function => 2,
-                NodeKind::File => 3,
-                NodeKind::Config => 4,
-                NodeKind::Stub => 5,
-                NodeKind::Test => 6,
-            }
-        }
-
-        fn kind_from_i64(kind: i64) -> NodeKind {
-            match kind {
-                1 => NodeKind::Class,
-                2 => NodeKind::Function,
-                3 => NodeKind::File,
-                4 => NodeKind::Config,
-                5 => NodeKind::Stub,
-                6 => NodeKind::Test,
-                _ => NodeKind::Function,
-            }
-        }
-
         fn insert_identity(conn: &Connection, id: &NodeIdentity) -> io::Result<()> {
             conn.execute(
                 "INSERT OR REPLACE INTO identities (identity_id, kind) VALUES (?1, ?2)",
-                params![id.identity_id.0.as_slice(), Self::kind_to_i64(id.kind)],
+                params![id.identity_id.0.as_slice(), id.kind.to_i64()],
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(())
@@ -274,20 +247,12 @@ mod sqlite {
                     r.revision_id.0.as_slice(),
                     r.identity_id.0.as_slice(),
                     r.branch_id.0.as_slice(),
-                    match r.status {
-                        RevisionStatus::Active => 0i64,
-                        RevisionStatus::Speculative => 1,
-                        RevisionStatus::Tombstone => 2,
-                        RevisionStatus::Orphaned => 3,
-                    },
+                    r.status.to_i64(),
                     r.qualified_name,
                     r.file_path,
                     r.body_hash.as_slice(),
                     r.signature_hash.as_slice(),
-                    match r.language {
-                        Language::TypeScript => 1i64,
-                        _ => 0,
-                    },
+                    r.language.to_i64(),
                     extra_bytes,
                 ],
             )
@@ -298,12 +263,7 @@ mod sqlite {
         fn insert_edge(conn: &Connection, e: &GraphEdge) -> io::Result<()> {
             let ex = EdgeExtra {
                 resolution_target_sig: e.resolution.target_signature_hash,
-                resolution_resolver: match e.resolution.resolver {
-                    SourceType::Lsp => 1,
-                    SourceType::Ast => 2,
-                    SourceType::Textual => 3,
-                    _ => 0,
-                },
+                resolution_resolver: e.resolution.resolver.to_u8(),
                 resolution_last_validation_ms: e.resolution.last_validation_ms,
                 anchor: e.anchor,
             };
@@ -316,16 +276,7 @@ mod sqlite {
                     e.edge_id.as_slice(),
                     e.source_revision_id.0.as_slice(),
                     e.target_identity_id.0.as_slice(),
-                    match e.ty {
-                        EdgeType::Calls => 0i64,
-                        EdgeType::Imports => 1,
-                        EdgeType::Uses => 2,
-                        EdgeType::Extends => 3,
-                        EdgeType::Configures => 4,
-                        EdgeType::CoLocated => 5,
-                        EdgeType::TestOf => 6,
-                        EdgeType::RenamedFrom => 7,
-                    },
+                    e.ty.to_i64(),
                     extra_bytes,
                 ],
             )
@@ -360,7 +311,7 @@ mod sqlite {
                 ib.copy_from_slice(&id);
                 snap.identities.push(NodeIdentity {
                     identity_id: IdentityId(ib),
-                    kind: Self::kind_from_i64(kind),
+                    kind: NodeKind::from_i64(kind),
                 });
             }
 
@@ -409,20 +360,12 @@ mod sqlite {
                     revision_id: NodeRevisionId(rb),
                     identity_id: IdentityId(ib),
                     branch_id: BranchId(bb),
-                    status: match st {
-                        0 => RevisionStatus::Active,
-                        1 => RevisionStatus::Speculative,
-                        2 => RevisionStatus::Tombstone,
-                        _ => RevisionStatus::Orphaned,
-                    },
+                    status: RevisionStatus::from_i64(st),
                     qualified_name: qn,
                     file_path: fp,
                     body_hash,
                     signature_hash,
-                    language: match lang {
-                        1 => Language::TypeScript,
-                        _ => Language::Python,
-                    },
+                    language: Language::from_i64(lang),
                     parent_revision_id: ex.parent_revision_id,
                     rename_source_id: ex.rename_source_id,
                     span: ex.span,
@@ -461,26 +404,12 @@ mod sqlite {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 snap.edges.push(GraphEdge {
                     edge_id: eb,
-                    ty: match ty {
-                        0 => EdgeType::Calls,
-                        1 => EdgeType::Imports,
-                        2 => EdgeType::Uses,
-                        3 => EdgeType::Extends,
-                        4 => EdgeType::Configures,
-                        5 => EdgeType::CoLocated,
-                        6 => EdgeType::TestOf,
-                        _ => EdgeType::RenamedFrom,
-                    },
+                    ty: EdgeType::from_i64(ty),
                     source_revision_id: NodeRevisionId(sb),
                     target_identity_id: IdentityId(tb),
                     resolution: crate::graph::EdgeResolution {
                         target_signature_hash: ex.resolution_target_sig,
-                        resolver: match ex.resolution_resolver {
-                            1 => SourceType::Lsp,
-                            2 => SourceType::Ast,
-                            3 => SourceType::Textual,
-                            _ => SourceType::Compiler,
-                        },
+                        resolver: SourceType::from_u8(ex.resolution_resolver),
                         last_validation_ms: ex.resolution_last_validation_ms,
                     },
                     anchor: ex.anchor,
@@ -541,18 +470,9 @@ mod sqlite {
         fn load_into(&self, graph: &mut InMemoryGraph) -> io::Result<bool> {
             self.with_conn(|conn| {
                 if Self::revision_count(conn)? > 0 {
+                    // Normalized rows are the source of truth. Do not rewrite the
+                    // legacy JSON blob on load — that copy is the checkpoint tax.
                     Self::load_normalized(conn, graph)?;
-                    if let Ok(Some(blob_n)) = Self::blob_edge_count(conn) {
-                        let norm_n = Self::edge_count(conn)? as usize;
-                        if norm_n != blob_n {
-                            // Prefer normalized rows (source of truth after incremental deltas);
-                            // refresh the blob so a later load does not discard them.
-                            eprintln!(
-                                "cis: graph.db normalized edge count ({norm_n}) != blob ({blob_n}); refreshing blob from normalized"
-                            );
-                            Self::write_blob(conn, graph)?;
-                        }
-                    }
                     return Ok(true);
                 }
                 if Self::load_from_blob(conn, graph)? {
@@ -627,8 +547,6 @@ mod sqlite {
                         Self::insert_edge(&tx, e)?;
                     }
                 }
-                // Keep blob in sync so load_into mismatch logic cannot discard deltas.
-                Self::write_blob(&tx, graph)?;
                 tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
                 Ok(())
             })
@@ -860,4 +778,127 @@ pub fn migration_strict_body_sqlite() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "body-sqlite"))]
+mod sqlite_store_tests {
+    use super::*;
+    use crate::graph::{
+        EdgeResolution, EdgeType, GraphEdge, Language, NodeIdentity, NodeKind, NodeRevision,
+        RevisionStatus, SourceSpan, SourceType,
+    };
+    use cis_wal::{BranchId, IdentityId, NodeRevisionId};
+
+    fn rev(i: u8, lang: Language) -> NodeRevision {
+        NodeRevision {
+            revision_id: NodeRevisionId([i; 16]),
+            identity_id: IdentityId([i; 16]),
+            branch_id: BranchId([0u8; 16]),
+            status: RevisionStatus::Active,
+            qualified_name: format!("f{i}"),
+            file_path: format!("f{i}.rs"),
+            body_hash: [i; 32],
+            signature_hash: [i; 32],
+            language: lang,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        }
+    }
+
+    fn seed_graph(langs: &[Language]) -> InMemoryGraph {
+        let mut g = InMemoryGraph::default();
+        for (i, lang) in langs.iter().copied().enumerate() {
+            let b = (i + 1) as u8;
+            g.put_identity(NodeIdentity {
+                identity_id: IdentityId([b; 16]),
+                kind: NodeKind::Function,
+            });
+            let r = rev(b, lang);
+            let rid = r.revision_id;
+            g.put_revision(r);
+            let edge = GraphEdge {
+                edge_id: [b; 16],
+                ty: EdgeType::Calls,
+                source_revision_id: rid,
+                target_identity_id: IdentityId([b; 16]),
+                resolution: EdgeResolution {
+                    target_signature_hash: [b; 32],
+                    resolver: SourceType::Ast,
+                    last_validation_ms: 0,
+                },
+                anchor: SourceSpan::UNKNOWN,
+            };
+            g.replace_edges_for_revision(rid, vec![edge]).unwrap();
+        }
+        g
+    }
+
+    #[test]
+    fn sqlite_roundtrip_preserves_every_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let cis = dir.path();
+        let langs = [
+            Language::Unknown,
+            Language::Python,
+            Language::TypeScript,
+            Language::Go,
+            Language::Rust,
+            Language::Java,
+            Language::Cpp,
+            Language::JavaScript,
+            Language::CSharp,
+            Language::C,
+        ];
+        let g = seed_graph(&langs);
+        let store = SqliteGraphStore::open(cis).unwrap();
+        store.save_snapshot(&g).unwrap();
+        let mut loaded = InMemoryGraph::default();
+        assert!(store.load_into(&mut loaded).unwrap());
+        for (i, lang) in langs.iter().copied().enumerate() {
+            let rid = NodeRevisionId([(i + 1) as u8; 16]);
+            let got = loaded.get_revision(rid).expect("revision");
+            assert_eq!(got.language, lang, "language mismatch for {lang:?}");
+        }
+        assert_eq!(loaded.edge_count(), langs.len());
+    }
+
+    #[test]
+    fn apply_delta_does_not_require_blob_refresh_to_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cis = dir.path();
+        let store = SqliteGraphStore::open(cis).unwrap();
+        let mut g = seed_graph(&[Language::Rust]);
+        store.save_snapshot(&g).unwrap();
+
+        let rid = NodeRevisionId([2; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: IdentityId([2; 16]),
+            kind: NodeKind::Function,
+        });
+        g.put_revision(rev(2, Language::Go));
+        store.apply_delta(&g, &[rid]).unwrap();
+
+        let mut loaded = InMemoryGraph::default();
+        assert!(store.load_into(&mut loaded).unwrap());
+        assert_eq!(
+            loaded.get_revision(rid).unwrap().language,
+            Language::Go,
+            "delta must survive without rewriting graph_snapshot blob"
+        );
+        assert_eq!(
+            loaded.get_revision(NodeRevisionId([1; 16])).unwrap().language,
+            Language::Rust
+        );
+    }
+
+    #[test]
+    fn json_export_opt_in_only() {
+        std::env::remove_var("CIS_GRAPH_JSON_EXPORT");
+        assert!(!graph_json_export_enabled());
+        std::env::set_var("CIS_GRAPH_JSON_EXPORT", "1");
+        assert!(graph_json_export_enabled());
+        std::env::remove_var("CIS_GRAPH_JSON_EXPORT");
+    }
 }

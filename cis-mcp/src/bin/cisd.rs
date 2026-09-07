@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cis_core::{
-    cis_dir, defer_vector_snapshot_load, embedder_from_env, kv_snapshot_path, load_env_file,
+    body_store_with_blobs, cis_dir, defer_vector_snapshot_load, embedder_from_env, kv_snapshot_path, load_env_file,
     load_kv_snapshot, load_vector_into, open_persisted_coordinator, ActiveRankingPolicy, BodyStore,
     CisDaemonHandles, CisMcpRuntime, EmbeddingWorker, MemoryKv, MergeRecoveryGate,
     MergeSagaOrchestrator, PolicyFileReloader, PolicyReloadOutcome, VectorCleanupQueue,
@@ -307,7 +307,7 @@ fn spawn_background_threads(
     std::thread::Builder::new()
         .name("cis-embedding-worker".into())
         .spawn(move || {
-            let body_store = BodyStore::new(Arc::clone(&kv_embed));
+            let body_store = body_store_with_blobs(Arc::clone(&kv_embed), cis_dir(&repo_root));
             let mut fail_streak: u32 = 0;
             loop {
                 worker_hb_embed.tick("cis-embedding-worker");
@@ -436,7 +436,7 @@ fn prepare_daemon(
             }
         })
         .collect();
-    let body_store_startup = BodyStore::new(Arc::clone(&kv));
+    let body_store_startup = body_store_with_blobs(Arc::clone(&kv), &cis);
     {
         let merge_control_startup = cis_core::MergeControl::new(Arc::clone(&kv));
         let gate = cis_core::MergeRecoveryGate::new(Arc::clone(&kv));
@@ -484,7 +484,7 @@ fn prepare_daemon(
         );
     }
     let merge_control = Arc::new(cis_core::MergeControl::new(Arc::clone(&kv)));
-    let body_store = Arc::new(BodyStore::new(Arc::clone(&kv)));
+    let body_store = Arc::new(body_store_with_blobs(Arc::clone(&kv), &cis));
     let dlq = vector_dlq();
     spawn_background_threads(
         Arc::clone(&coord),

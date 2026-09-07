@@ -954,16 +954,19 @@ impl CisMcpRuntime {
             ) as Box<dyn crate::confirm_token::ConfirmTokenBackend>)
         });
         let cis = cis_dir(std::path::Path::new(&repo_root));
-        let pre_write_snapshots = PreWriteSnapshotStore::new(cis)
+        let pre_write_snapshots = PreWriteSnapshotStore::new(cis.clone())
             .unwrap_or_else(|e| {
                 eprintln!("cis-mcp: pre_write_snapshots init: {:?}; using fallback dir", e);
                 PreWriteSnapshotStore::new(std::env::temp_dir()).expect("temp pre_write_snapshots")
             });
-        let body_store = BodyStore::new(std::sync::Arc::clone(&kv));
-        let merge = MergeControl::new(std::sync::Arc::clone(&kv));
-        let embedder = embedder_from_env();
         let body_blob_store =
             crate::body_blob::open_body_blob_store(cis_dir(std::path::Path::new(&repo_root)));
+        let body_store = crate::body_blob::body_store_with_blobs(
+            std::sync::Arc::clone(&kv),
+            cis_dir(std::path::Path::new(&repo_root)),
+        );
+        let merge = MergeControl::new(std::sync::Arc::clone(&kv));
+        let embedder = embedder_from_env();
         let handles = handles.unwrap_or_else(|| {
             CisDaemonHandles::for_tests(std::path::Path::new(&repo_root))
         });
@@ -1246,13 +1249,8 @@ impl CisMcpRuntime {
         }
         let model_id = self.embedder.model_id().to_string();
         let vector = self.coordinator.vector();
-        let snap = vector.export_snapshot();
-        let unique_vectors = snap
-            .vectors
-            .iter()
-            .filter(|v| v.model_id == model_id)
-            .count();
-        let embed_chunks_registered = snap.chunks.len();
+        let unique_vectors = vector.embedded_body_count_for_model(&model_id);
+        let embed_chunks_registered = vector.len();
         // When vectors are deferred/empty, skip O(n) body-hash probes and disk walks so
         // MCP initialize is not blocked on embedding bookkeeping.
         let (embedded, stale, body_blobs_stored) = if unique_vectors == 0 && embed_chunks_registered == 0
@@ -1468,18 +1466,8 @@ impl CisMcpRuntime {
         }
         if rep.graph_loaded {
             self.sync_index_status_from_graph();
-            let keep = {
-                let g = self.coordinator.graph().read();
-                // Include tombstones so rename detection / consistency survive restart.
-                crate::body_blob::referenced_body_hashes(&g, self.active_branch(), true, true)
-            };
-            let cis = self.cis_path();
-            let _ = crate::body_blob::hydrate_bodies_from_store(
-                self.body_blob_store.as_ref(),
-                &cis,
-                &self.body_store,
-                &keep,
-            );
+            // Bodies stay on disk (`.cis/bodies` / bodies.db). `BodyStore` falls back
+            // per get(); hydrating every referenced hash here doubled RSS on warm start.
             self.rebuild_ann_index();
         }
         rep

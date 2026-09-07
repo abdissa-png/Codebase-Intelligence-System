@@ -41,36 +41,14 @@ impl RevisionIndexCow {
         })
     }
 
-    /// **Cold start:** load existing `ri:{branch}:*` bindings from KV into the root overlay.
+    /// **Cold start:** lookups read `ri:{branch}:*` from KV on demand.
+    ///
+    /// Do not preload every binding into the overlay HashMap — that copied the
+    /// whole revision index into RAM before MCP tools could run. [`Self::lookup`]
+    /// already hits KV; [`Self::collect_bindings`] scans the prefix when a full
+    /// dump is needed (RIS checkpoints).
     pub fn root_hydrated(branch_id: BranchId, kv: Arc<MemoryKv>) -> Arc<Self> {
-        let hex_branch = branch_id
-            .0
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-        let prefix = format!("ri:{}:", hex_branch);
-        let mut local = HashMap::new();
-        for (k, v) in kv.scan_prefix(&prefix) {
-            let parts: Vec<&str> = k.split(':').collect();
-            if parts.len() != 3 {
-                continue;
-            }
-            let Some(identity) = parse_hex16(parts[2]) else {
-                continue;
-            };
-            if v.len() != 16 {
-                continue;
-            }
-            let mut rev = [0u8; 16];
-            rev.copy_from_slice(&v);
-            local.insert(IdentityId(identity), NodeRevisionId(rev));
-        }
-        Arc::new(Self {
-            branch_id,
-            kv,
-            parent: None,
-            local: Mutex::new(local),
-        })
+        Self::root(branch_id, kv)
     }
 
     /// **Feature branch** overlay: inherits lookups from **`parent`** until locally rebound.
@@ -153,6 +131,28 @@ impl RevisionIndexCow {
     fn collect_bindings(this: &RevisionIndexCow, out: &mut HashMap<IdentityId, NodeRevisionId>) {
         if let Some(p) = &this.parent {
             Self::collect_bindings(p, out);
+        }
+        let hex_branch = this
+            .branch_id
+            .0
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let prefix = format!("ri:{hex_branch}:");
+        for (k, v) in this.kv.scan_prefix(&prefix) {
+            let parts: Vec<&str> = k.split(':').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let Some(identity) = parse_hex16(parts[2]) else {
+                continue;
+            };
+            if v.len() != 16 {
+                continue;
+            }
+            let mut rev = [0u8; 16];
+            rev.copy_from_slice(&v);
+            out.insert(IdentityId(identity), NodeRevisionId(rev));
         }
         for (&k, &v) in this.local.lock().unwrap().iter() {
             out.insert(k, v);
@@ -301,5 +301,20 @@ mod tests {
             loaded.lookup(IdentityId([5u8; 16])),
             Some(NodeRevisionId([6u8; 16]))
         );
+    }
+
+    #[test]
+    fn resolved_bindings_reads_kv_without_preload() {
+        let kv = Arc::new(MemoryKv::new());
+        let branch = BranchId([7u8; 16]);
+        let identity = IdentityId([5u8; 16]);
+        let rev = NodeRevisionId([6u8; 16]);
+        kv.set(
+            &crate::revision_index::revision_binding_kv_key(branch, identity),
+            rev.0.to_vec(),
+        );
+        let idx = RevisionIndexCow::root_hydrated(branch, Arc::clone(&kv));
+        assert_eq!(idx.lookup(identity), Some(rev));
+        assert_eq!(idx.resolved_bindings(), vec![(identity, rev)]);
     }
 }

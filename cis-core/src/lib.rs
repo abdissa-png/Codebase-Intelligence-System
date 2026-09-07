@@ -101,7 +101,8 @@ mod vector_backend;
 mod vector_store;
 
 pub use body_blob::{
-    bodies_dir, bodies_db_path, body_backend_from_env, body_blob_path, gc_bodies,
+    bodies_dir, bodies_db_path, body_backend_from_env, body_blob_path, body_store_with_blobs,
+    gc_bodies,
     gc_bodies_for_branch, gc_bodies_with_store, gc_body_blob_files, gc_body_blobs,
     hydrate_bodies_from_disk,
     hydrate_bodies_from_store, load_body_blob, load_body_blob_with_fallback,

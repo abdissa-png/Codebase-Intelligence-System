@@ -341,7 +341,7 @@ pub fn sync_bodies_to_store(
 ) -> io::Result<usize> {
     let mut n = 0usize;
     for h in referenced {
-        if let Some(bytes) = body_store.get(h) {
+        if let Some(bytes) = body_store.get_cached(h) {
             store.put(h, &bytes)?;
             n += 1;
         }
@@ -368,7 +368,7 @@ pub fn hydrate_bodies_from_store(
 ) -> io::Result<usize> {
     let mut n = 0usize;
     for h in referenced {
-        if body_store.has(h) {
+        if body_store.get_cached(h).is_some() {
             continue;
         }
         if let Some(bytes) = load_body_blob_with_fallback(store, cis_dir, h)? {
@@ -388,6 +388,15 @@ pub fn hydrate_bodies_from_disk(
     let cis = cis.as_ref();
     let store = open_body_blob_store(cis);
     hydrate_bodies_from_store(store.as_ref(), cis, body_store, referenced)
+}
+
+/// `BodyStore` that reads blobs from `.cis/bodies` / `bodies.db` when the KV is cold.
+pub fn body_store_with_blobs(kv: Arc<crate::kv::MemoryKv>, cis_dir: impl AsRef<Path>) -> BodyStore {
+    let store = open_body_blob_store(cis_dir.as_ref());
+    BodyStore::with_fallback(
+        kv,
+        Arc::new(move |hash| store.get(hash).ok().flatten()),
+    )
 }
 
 pub fn gc_body_blob_files(cis: impl AsRef<Path>, keep: &HashSet<[u8; 32]>) -> io::Result<usize> {

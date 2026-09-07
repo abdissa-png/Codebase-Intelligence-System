@@ -15,6 +15,32 @@ pub enum NodeKind {
     Test,
 }
 
+impl NodeKind {
+    /// Stable integer used by the SQLite graph store. Unknown values load as [`Function`].
+    pub const fn to_i64(self) -> i64 {
+        match self {
+            NodeKind::Class => 1,
+            NodeKind::Function => 2,
+            NodeKind::File => 3,
+            NodeKind::Config => 4,
+            NodeKind::Stub => 5,
+            NodeKind::Test => 6,
+        }
+    }
+
+    pub const fn from_i64(v: i64) -> Self {
+        match v {
+            1 => NodeKind::Class,
+            2 => NodeKind::Function,
+            3 => NodeKind::File,
+            4 => NodeKind::Config,
+            5 => NodeKind::Stub,
+            6 => NodeKind::Test,
+            _ => NodeKind::Function,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RevisionStatus {
     Active,
@@ -25,6 +51,26 @@ pub enum RevisionStatus {
     /// Old snapshots that pre-date this variant deserialize missing values as `Active` via serde default.
     #[serde(other)]
     Speculative,
+}
+
+impl RevisionStatus {
+    pub const fn to_i64(self) -> i64 {
+        match self {
+            RevisionStatus::Active => 0,
+            RevisionStatus::Speculative => 1,
+            RevisionStatus::Tombstone => 2,
+            RevisionStatus::Orphaned => 3,
+        }
+    }
+
+    pub const fn from_i64(v: i64) -> Self {
+        match v {
+            0 => RevisionStatus::Active,
+            1 => RevisionStatus::Speculative,
+            2 => RevisionStatus::Tombstone,
+            _ => RevisionStatus::Orphaned,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,6 +85,43 @@ pub enum Language {
     JavaScript,
     CSharp,
     C,
+}
+
+impl Language {
+    /// SQLite `revisions.language` encoding.
+    ///
+    /// `0 = Python` and `1 = TypeScript` are frozen so existing `graph.db` rows stay valid.
+    /// Older writers stored every other language as `0` (read back as Python); those rows
+    /// cannot be recovered and must be rebuilt from `graph.json` / reindex.
+    pub const fn to_i64(self) -> i64 {
+        match self {
+            Language::Python => 0,
+            Language::TypeScript => 1,
+            Language::Go => 2,
+            Language::Rust => 3,
+            Language::Java => 4,
+            Language::Cpp => 5,
+            Language::JavaScript => 6,
+            Language::CSharp => 7,
+            Language::C => 8,
+            Language::Unknown => 9,
+        }
+    }
+
+    pub const fn from_i64(v: i64) -> Self {
+        match v {
+            0 => Language::Python,
+            1 => Language::TypeScript,
+            2 => Language::Go,
+            3 => Language::Rust,
+            4 => Language::Java,
+            5 => Language::Cpp,
+            6 => Language::JavaScript,
+            7 => Language::CSharp,
+            8 => Language::C,
+            _ => Language::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,12 +190,60 @@ pub enum EdgeType {
     RenamedFrom,
 }
 
+impl EdgeType {
+    pub const fn to_i64(self) -> i64 {
+        match self {
+            EdgeType::Calls => 0,
+            EdgeType::Imports => 1,
+            EdgeType::Uses => 2,
+            EdgeType::Extends => 3,
+            EdgeType::Configures => 4,
+            EdgeType::CoLocated => 5,
+            EdgeType::TestOf => 6,
+            EdgeType::RenamedFrom => 7,
+        }
+    }
+
+    pub const fn from_i64(v: i64) -> Self {
+        match v {
+            0 => EdgeType::Calls,
+            1 => EdgeType::Imports,
+            2 => EdgeType::Uses,
+            3 => EdgeType::Extends,
+            4 => EdgeType::Configures,
+            5 => EdgeType::CoLocated,
+            6 => EdgeType::TestOf,
+            _ => EdgeType::RenamedFrom,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SourceType {
     Compiler,
     Lsp,
     Ast,
     Textual,
+}
+
+impl SourceType {
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            SourceType::Compiler => 0,
+            SourceType::Lsp => 1,
+            SourceType::Ast => 2,
+            SourceType::Textual => 3,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => SourceType::Lsp,
+            2 => SourceType::Ast,
+            3 => SourceType::Textual,
+            _ => SourceType::Compiler,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1179,5 +1310,65 @@ mod tests {
         g.remove_revision(r2);
         assert!(g.revision_ids_for_body_hash(&h1).is_empty());
         assert_eq!(g.revision_ids_for_body_hash(&h2), &[r1]);
+    }
+
+    #[test]
+    fn store_integer_codecs_roundtrip_all_variants() {
+        for kind in [
+            NodeKind::Function,
+            NodeKind::Class,
+            NodeKind::File,
+            NodeKind::Config,
+            NodeKind::Stub,
+            NodeKind::Test,
+        ] {
+            assert_eq!(NodeKind::from_i64(kind.to_i64()), kind);
+        }
+        for st in [
+            RevisionStatus::Active,
+            RevisionStatus::Speculative,
+            RevisionStatus::Tombstone,
+            RevisionStatus::Orphaned,
+        ] {
+            assert_eq!(RevisionStatus::from_i64(st.to_i64()), st);
+        }
+        for lang in [
+            Language::Unknown,
+            Language::Python,
+            Language::TypeScript,
+            Language::Go,
+            Language::Rust,
+            Language::Java,
+            Language::Cpp,
+            Language::JavaScript,
+            Language::CSharp,
+            Language::C,
+        ] {
+            assert_eq!(Language::from_i64(lang.to_i64()), lang);
+        }
+        // Frozen for existing graph.db rows written before multi-language encoding.
+        assert_eq!(Language::Python.to_i64(), 0);
+        assert_eq!(Language::TypeScript.to_i64(), 1);
+        assert_eq!(Language::from_i64(99), Language::Unknown);
+        for ty in [
+            EdgeType::Calls,
+            EdgeType::Imports,
+            EdgeType::Uses,
+            EdgeType::Extends,
+            EdgeType::Configures,
+            EdgeType::CoLocated,
+            EdgeType::TestOf,
+            EdgeType::RenamedFrom,
+        ] {
+            assert_eq!(EdgeType::from_i64(ty.to_i64()), ty);
+        }
+        for src in [
+            SourceType::Compiler,
+            SourceType::Lsp,
+            SourceType::Ast,
+            SourceType::Textual,
+        ] {
+            assert_eq!(SourceType::from_u8(src.to_u8()), src);
+        }
     }
 }
