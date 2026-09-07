@@ -64,6 +64,8 @@ mod csharp_indexer;
 mod ingest;
 mod kv;
 mod language_indexer;
+#[cfg(feature = "ts-runtime")]
+pub mod indexer_eval;
 mod lsp_pool;
 mod merge_control;
 mod merge_engine;

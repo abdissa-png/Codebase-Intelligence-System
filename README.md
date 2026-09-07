@@ -206,6 +206,12 @@ cargo test -p cis-core --features tree-sitter,body-sqlite
 # All language indexers (Rust/Go/JS/TS/Java/C/C++/C#)
 cargo test -p cis-core --features tree-sitter-all --lib '_indexer::'
 
+# Real-codebase indexer recall + **cross-file graph resolution**
+# (CIS + chess pygame; optional OSS corpora)
+cargo test -p cis-core --features tree-sitter-all --test indexer_corpus_eval -- --nocapture
+# Extra languages: ./scripts/fetch_indexer_eval_corpora.sh
+# FileIndex-only (skip ingest): CIS_INDEXER_EVAL_SKIP_GRAPH=1 …
+
 # Fast concurrency stress suite
 cargo test -p cis-core --features tree-sitter,body-sqlite --test stress_fast
 

@@ -19,10 +19,14 @@ jobs:
       - name: Clone chess fixture
         run: |
           git clone --depth 1 https://github.com/abdissa-png/A-chess-game-using-Pygame.git fixtures/chess_pygame
+      - name: Fetch indexer eval corpora
+        run: bash scripts/fetch_indexer_eval_corpora.sh
       - name: Unit tests (tree-sitter)
         run: cargo test -p cis-core --features tree-sitter --lib
       - name: Multi-language indexer tests
         run: cargo test -p cis-core --features tree-sitter-all --lib '_indexer::'
+      - name: Indexer corpus evaluation
+        run: cargo test -p cis-core --features tree-sitter-all --test indexer_corpus_eval -- --nocapture --test-threads=1
       - name: Chess cross-file calls
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_cross_file_calls
       - name: Chess SQLite exploration
@@ -50,7 +54,7 @@ jobs:
       - name: Phase 2 reconciliation tracker
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test phase2_reconciliation
       - name: Core integration tests
-        run: cargo test -p cis-core --features tree-sitter,body-sqlite --tests -- --skip chess_query_engine_eval
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --tests -- --skip chess_query_engine_eval --skip indexer_corpus_eval
 
   stress-fast:
     runs-on: ubuntu-latest

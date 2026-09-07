@@ -59,6 +59,10 @@ fn parse_call_receiver(node: Node, src: &str) -> Option<CallReceiver> {
                 name: node_text(prop, src).to_string(),
             })
         }
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|f| parse_call_receiver(f, src)),
+        "parenthesized_expression" => node.named_child(0).and_then(|c| parse_call_receiver(c, src)),
         _ => None,
     }
 }
@@ -437,7 +441,14 @@ fn visit(
                 }
             }
         }
-        _ => {}
+        _ => {
+            let count = node.named_child_count();
+            for i in 0..count {
+                if let Some(c) = node.named_child(i) {
+                    visit(c, src, path, cls, idx);
+                }
+            }
+        }
     }
 }
 
@@ -601,5 +612,31 @@ class Board {
         let fields = idx.instance_fields.get("Board").expect("Board instance_fields");
         assert_eq!(fields.get("cells").map(String::as_str), Some("ArrayList"));
         assert_eq!(fields.get("board").map(String::as_str), Some("Board"));
+    }
+
+    #[test]
+    fn indexes_function_inside_if() {
+        let src = r#"
+if (true) {
+  function hidden() { return 1; }
+}
+"#;
+        let idx = index_javascript_file("app.js", src).unwrap();
+        assert!(
+            idx.symbols.iter().any(|s| s.stable_key == "hidden" && s.kind == NodeKind::Function),
+            "function inside if should be indexed"
+        );
+    }
+
+    #[test]
+    fn indexes_chained_calls() {
+        let src = "function run(g) { g.lock().unwrap(); }\n";
+        let idx = index_javascript_file("app.js", src).unwrap();
+        assert!(idx.calls.iter().any(|c| c.callee.label() == "g.lock"));
+        assert!(
+            idx.calls.iter().any(|c| c.callee.label() == "g.lock.unwrap"),
+            "chained unwrap, got {:?}",
+            idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
+        );
     }
 }

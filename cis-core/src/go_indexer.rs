@@ -53,6 +53,10 @@ fn parse_call_receiver(node: Node, src: &str) -> Option<CallReceiver> {
                 name: node_text(field, src).to_string(),
             })
         }
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|f| parse_call_receiver(f, src)),
+        "parenthesized_expression" => node.named_child(0).and_then(|c| parse_call_receiver(c, src)),
         _ => None,
     }
 }
@@ -489,5 +493,61 @@ func main() {
         assert!(idx.calls.iter().any(|c| {
             c.caller_stable_key == "main" && c.callee.leaf_name() == "helper"
         }));
+    }
+
+    #[test]
+    fn indexes_chained_calls() {
+        let src = r#"
+package main
+func run(x T) {
+    x.Lock().Unlock()
+}
+"#;
+        let idx = index_go_file("main.go", src).unwrap();
+        assert!(idx.calls.iter().any(|c| c.callee.label() == "x.Lock"));
+        assert!(
+            idx.calls.iter().any(|c| c.callee.label() == "x.Lock.Unlock"),
+            "chained Unlock, got {:?}",
+            idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn same_package_call_becomes_edge() {
+        use std::collections::HashMap;
+
+        use cis_wal::{BranchId, IdentityId, NodeRevisionId};
+
+        use crate::call_resolve::attach_import_and_call_edges;
+        use crate::graph::EdgeType;
+        use crate::index_model::{stable_id_bytes, stable_rev_id_bytes};
+
+        let mux = index_go_file("mux.go", "package mux\nfunc NewRouter() {}\n").unwrap();
+        let route = index_go_file(
+            "route.go",
+            "package mux\nfunc Example() { NewRouter() }\n",
+        )
+        .unwrap();
+        let mut batch = HashMap::new();
+        batch.insert("mux.go".into(), mux);
+        batch.insert("route.go".into(), route.clone());
+        let branch = BranchId([0u8; 16]);
+        let edges = attach_import_and_call_edges(
+            "route.go",
+            branch,
+            &route,
+            &HashMap::new(),
+            None,
+            &batch,
+        );
+        let example_rid = NodeRevisionId(stable_rev_id_bytes(branch, "route.go", "Example"));
+        let want = IdentityId(stable_id_bytes("id", "mux.go", "NewRouter"));
+        let calls = edges.get(&example_rid).expect("Example call edges");
+        assert!(
+            calls
+                .iter()
+                .any(|e| e.ty == EdgeType::Calls && e.target_identity_id == want),
+            "route.go Example should Call mux.go NewRouter"
+        );
     }
 }

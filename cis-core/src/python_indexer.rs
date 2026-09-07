@@ -240,9 +240,6 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
         .map_err(|_| "tree_sitter_language")?;
     let tree = parser.parse(content, None).ok_or("tree_sitter_parse")?;
     let root = tree.root_node();
-    if root.has_error() {
-        return Err("tree_sitter_error");
-    }
 
     let mut idx = FileIndex::default();
     idx.symbols.push(ParsedSymbol {
@@ -269,6 +266,10 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
                     name,
                 })
             }
+            "call" => node
+                .child_by_field_name("function")
+                .and_then(|f| parse_call_receiver(f, src)),
+            "parenthesized_expression" => node.named_child(0).and_then(|c| parse_call_receiver(c, src)),
             _ => None,
         }
     }
@@ -676,7 +677,13 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
                     i += 1;
                 }
             }
-            _ => {}
+            _ => {
+                let mut i = 0usize;
+                while let Some(c) = node.named_child(i) {
+                    visit(c, src, path, cls, idx);
+                    i += 1;
+                }
+            }
         }
     }
 
@@ -760,5 +767,26 @@ mod tests {
             foos.iter().map(|s| s.identity_key()).collect();
         assert_eq!(keys.len(), 3);
         assert!(foos.iter().all(|s| s.qualified_name == "m.py::foo"));
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn indexes_def_inside_if() {
+        let src = "if True:\n    def hidden():\n        return 1\n";
+        let idx = index_python_file("m.py", src).unwrap();
+        assert!(idx.symbols.iter().any(|s| s.stable_key == "hidden" && s.kind == NodeKind::Function));
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn indexes_chained_calls() {
+        let src = "def run(g):\n    g.lock().unwrap()\n";
+        let idx = index_python_file("m.py", src).unwrap();
+        assert!(idx.calls.iter().any(|c| c.callee.label() == "g.lock"));
+        assert!(
+            idx.calls.iter().any(|c| c.callee.label() == "g.lock.unwrap"),
+            "chained unwrap, got {:?}",
+            idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
+        );
     }
 }

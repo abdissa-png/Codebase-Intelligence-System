@@ -64,6 +64,34 @@ fn parse_call_receiver(node: Node, src: &str) -> Option<CallReceiver> {
                         .map(|n| CallReceiver::Bare(node_text(n, src).to_string()))
                 })
         }
+        "qualified_name" => {
+            let name = node
+                .child_by_field_name("name")
+                .or_else(|| {
+                    let c = node.named_child_count();
+                    if c > 0 {
+                        node.named_child(c - 1)
+                    } else {
+                        None
+                    }
+                })?;
+            let name_s = node_text(name, src).to_string();
+            if let Some(scope) = node.named_child(0) {
+                if scope.id() != name.id() {
+                    if let Some(obj) = parse_call_receiver(scope, src) {
+                        return Some(CallReceiver::Attr {
+                            object: Box::new(obj),
+                            name: name_s,
+                        });
+                    }
+                }
+            }
+            Some(CallReceiver::Bare(name_s))
+        }
+        "invocation_expression" => node
+            .child_by_field_name("function")
+            .and_then(|f| parse_call_receiver(f, src)),
+        "parenthesized_expression" => node.named_child(0).and_then(|c| parse_call_receiver(c, src)),
         _ => None,
     }
 }

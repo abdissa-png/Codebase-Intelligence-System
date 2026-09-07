@@ -59,3 +59,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "=3.13"
+
+[[test]]
+name = "indexer_corpus_eval"
+path = "tests/indexer_corpus_eval.rs"
+required-features = ["tree-sitter"]

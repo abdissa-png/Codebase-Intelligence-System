@@ -56,6 +56,7 @@ fn parse_call_receiver(node: Node, src: &str) -> Option<CallReceiver> {
         "identifier" | "field_identifier" | "type_identifier" => {
             Some(CallReceiver::Bare(node_text(node, src).to_string()))
         }
+        "self" => Some(CallReceiver::Bare("self".to_string())),
         "field_expression" => {
             let value = node.child_by_field_name("value")?;
             let field = node.child_by_field_name("field")?;
@@ -80,8 +81,47 @@ fn parse_call_receiver(node: Node, src: &str) -> Option<CallReceiver> {
             }
             Some(CallReceiver::Bare(name_s))
         }
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|f| parse_call_receiver(f, src)),
+        "parenthesized_expression" => node.named_child(0).and_then(|c| parse_call_receiver(c, src)),
         _ => None,
     }
+}
+
+fn rust_wrapper_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Box"
+            | "Arc"
+            | "Rc"
+            | "Weak"
+            | "Option"
+            | "Result"
+            | "Mutex"
+            | "RwLock"
+            | "Ref"
+            | "RefMut"
+            | "Cell"
+            | "RefCell"
+            | "Pin"
+            | "Cow"
+            | "ManuallyDrop"
+    )
+}
+
+fn first_type_argument(args: Node, src: &str) -> Option<String> {
+    let count = args.named_child_count();
+    for i in 0..count {
+        let Some(c) = args.named_child(i) else { continue };
+        if matches!(c.kind(), "lifetime" | "type_binding") {
+            continue;
+        }
+        if let Some(n) = simple_type_name(c, src) {
+            return Some(n);
+        }
+    }
+    None
 }
 
 fn simple_type_name(node: Node, src: &str) -> Option<String> {
@@ -96,13 +136,27 @@ fn simple_type_name(node: Node, src: &str) -> Option<String> {
                 .filter(|s| !s.is_empty())
         }
         "generic_type" => {
+            let outer = node
+                .child_by_field_name("type")
+                .and_then(|n| simple_type_name(n, src));
+            if let Some(ref o) = outer {
+                if rust_wrapper_type(o) {
+                    if let Some(args) = node.child_by_field_name("type_arguments") {
+                        if let Some(inner) = first_type_argument(args, src) {
+                            return Some(inner);
+                        }
+                    }
+                }
+            }
+            outer
+        }
+        "reference_type" | "pointer_type" => {
             node.child_by_field_name("type")
                 .and_then(|n| simple_type_name(n, src))
         }
-        "reference_type" => {
-            node.child_by_field_name("type")
-                .and_then(|n| simple_type_name(n, src))
-        }
+        "dynamic_type" | "abstract_type" => node
+            .child_by_field_name("trait")
+            .and_then(|n| simple_type_name(n, src)),
         _ => None,
     }
 }
@@ -137,6 +191,109 @@ fn visit_type_annotations(node: Node, src: &str, owner: &str, uses: &mut Vec<Par
         if let Some(c) = node.named_child(i) {
             visit_type_annotations(c, src, owner, uses);
         }
+    }
+}
+
+fn bind_rust_locals(node: Node, src: &str, fn_key: &str, class_key: Option<&str>, idx: &mut FileIndex) {
+    if node.kind() == "let_declaration" {
+        if let Some(ident) = node
+            .child_by_field_name("pattern")
+            .and_then(|pat| ident_from_pattern(pat, src))
+        {
+            let ty = node
+                .child_by_field_name("type")
+                .and_then(|t| simple_type_name(t, src))
+                .or_else(|| {
+                    node.child_by_field_name("value")
+                        .and_then(|v| infer_rust_ctor_type(v, src))
+                        .filter(|t| t != "self" && t != "Self" && t != "this")
+                })
+                .or_else(|| {
+                    node.child_by_field_name("value")
+                        .and_then(|v| type_from_self_field_chain(v, src, class_key, idx))
+                });
+            if let Some(ty) = ty {
+                idx.function_locals
+                    .entry(fn_key.to_string())
+                    .or_default()
+                    .insert(ident, ty);
+            }
+        }
+    }
+    let count = node.named_child_count();
+    for i in 0..count {
+        if let Some(c) = node.named_child(i) {
+            bind_rust_locals(c, src, fn_key, class_key, idx);
+        }
+    }
+}
+
+fn type_from_self_field_chain(
+    node: Node,
+    src: &str,
+    class_key: Option<&str>,
+    idx: &FileIndex,
+) -> Option<String> {
+    let class_key = class_key?;
+    let recv = parse_call_receiver(node, src)?;
+    field_type_from_self_chain(&recv, class_key, idx)
+}
+
+fn field_type_from_self_chain(
+    recv: &CallReceiver,
+    class_key: &str,
+    idx: &FileIndex,
+) -> Option<String> {
+    match recv {
+        CallReceiver::Attr { object, name } => match object.as_ref() {
+            CallReceiver::Bare(n) if n == "self" || n == "this" => idx
+                .instance_fields
+                .get(class_key)
+                .and_then(|fields| fields.get(name))
+                .cloned(),
+            inner @ CallReceiver::Attr { .. } => {
+                field_type_from_self_chain(inner, class_key, idx)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn infer_rust_ctor_type(node: Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "call_expression" => {
+            let recv = node
+                .child_by_field_name("function")
+                .and_then(|f| parse_call_receiver(f, src))?;
+            let root = recv.root_bare_name()?;
+            if rust_wrapper_type(root) {
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let n = args.named_child_count();
+                    for i in 0..n {
+                        if let Some(c) = args.named_child(i) {
+                            if let Some(inner) = infer_rust_ctor_type(c, src) {
+                                return Some(inner);
+                            }
+                        }
+                    }
+                }
+            }
+            if root.chars().next().is_some_and(|c| c.is_uppercase()) {
+                Some(root.to_string())
+            } else {
+                None
+            }
+        }
+        "struct_expression" => node
+            .child_by_field_name("name")
+            .and_then(|n| parse_call_receiver(n, src))
+            .and_then(|r| r.root_bare_name().map(|s| s.to_string()))
+            .filter(|s| s.chars().next().is_some_and(|c| c.is_uppercase())),
+        "reference_expression" | "unary_expression" | "try_expression" => {
+            node.named_child(0).and_then(|c| infer_rust_ctor_type(c, src))
+        }
+        _ => None,
     }
 }
 
@@ -189,14 +346,21 @@ fn visit_calls(node: Node, src: &str, caller: &str, calls: &mut Vec<ParsedCall>,
 
 fn extract_use_declarations(root: Node, src: &str) -> Vec<ParsedImport> {
     let mut imports = Vec::new();
-    let count = root.named_child_count();
+    walk_use_declarations(root, src, &mut imports);
+    imports
+}
+
+fn walk_use_declarations(node: Node, src: &str, imports: &mut Vec<ParsedImport>) {
+    if node.kind() == "use_declaration" {
+        extract_use_tree(node, src, imports);
+        return;
+    }
+    let count = node.named_child_count();
     for i in 0..count {
-        let Some(child) = root.named_child(i) else { continue };
-        if child.kind() == "use_declaration" {
-            extract_use_tree(child, src, &mut imports);
+        if let Some(c) = node.named_child(i) {
+            walk_use_declarations(c, src, imports);
         }
     }
-    imports
 }
 
 fn extract_use_tree(node: Node, src: &str, imports: &mut Vec<ParsedImport>) {
@@ -290,6 +454,116 @@ fn collect_use_names(node: Node, src: &str, names: &mut Vec<String>) {
     }
 }
 
+fn ident_from_pattern(node: Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => {
+            let t = node_text(node, src);
+            if t.is_empty() || t == "_" || t == "self" {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        "mut_pattern" | "ref_pattern" | "reference_pattern" | "pointer_pattern"
+        | "captured_pattern" => {
+            let count = node.named_child_count();
+            for i in 0..count {
+                if let Some(c) = node.named_child(i) {
+                    if let Some(id) = ident_from_pattern(c, src) {
+                        return Some(id);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn bind_rust_params(params: Node, src: &str, fn_key: &str, idx: &mut FileIndex) {
+    let count = params.named_child_count();
+    for i in 0..count {
+        let Some(p) = params.named_child(i) else { continue };
+        if p.kind() != "parameter" {
+            continue;
+        }
+        let Some(ty) = p
+            .child_by_field_name("type")
+            .and_then(|t| simple_type_name(t, src))
+        else {
+            continue;
+        };
+        let Some(pat) = p.child_by_field_name("pattern") else {
+            continue;
+        };
+        let Some(ident) = ident_from_pattern(pat, src) else {
+            continue;
+        };
+        idx.function_locals
+            .entry(fn_key.to_string())
+            .or_default()
+            .insert(ident, ty);
+    }
+}
+
+fn record_struct_fields(body: Node, src: &str, type_name: &str, idx: &mut FileIndex) {
+    let count = body.named_child_count();
+    for i in 0..count {
+        let Some(f) = body.named_child(i) else { continue };
+        if f.kind() != "field_declaration" {
+            continue;
+        }
+        let Some(name) = f.child_by_field_name("name") else { continue };
+        let Some(ty) = f
+            .child_by_field_name("type")
+            .and_then(|t| simple_type_name(t, src))
+        else {
+            continue;
+        };
+        let field = node_text(name, src);
+        if field.is_empty() {
+            continue;
+        }
+        idx.instance_fields
+            .entry(type_name.to_string())
+            .or_default()
+            .insert(field.to_string(), ty);
+    }
+}
+
+fn visit_rust_instance_fields(node: Node, src: &str, class_key: &str, idx: &mut FileIndex) {
+    if node.kind() == "assignment_expression" {
+        if let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ) {
+            if left.kind() == "field_expression" {
+                if let Some(val) = left.child_by_field_name("value") {
+                    let val_txt = node_text(val, src);
+                    if val.kind() == "self" || val_txt == "self" {
+                        if let Some(field) = left.child_by_field_name("field") {
+                            if let Some(ty) = infer_rust_ctor_type(right, src) {
+                                if ty != "self" && ty != "Self" {
+                                    idx.instance_fields
+                                        .entry(class_key.to_string())
+                                        .or_default()
+                                        .insert(node_text(field, src).to_string(), ty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let count = node.named_child_count();
+    for i in 0..count {
+        if let Some(c) = node.named_child(i) {
+            visit_rust_instance_fields(c, src, class_key, idx);
+        }
+    }
+}
+
 fn visit(node: Node, src: &str, path: &str, scope: &mut Vec<String>, idx: &mut FileIndex) {
     match node.kind() {
         "source_file" | "block" | "declaration_list" => {
@@ -320,12 +594,22 @@ fn visit(node: Node, src: &str, path: &str, scope: &mut Vec<String>, idx: &mut F
             });
             if let Some(params) = node.child_by_field_name("parameters") {
                 visit_type_annotations(params, src, &stable, &mut idx.uses);
+                bind_rust_params(params, src, &stable, idx);
             }
             if let Some(ret) = node.child_by_field_name("return_type") {
                 record_type_use(&mut idx.uses, &stable, ret, src);
             }
             if let Some(body) = node.child_by_field_name("body") {
                 visit_calls(body, src, &stable, &mut idx.calls, &mut idx.uses);
+                let class_key = if scope.is_empty() {
+                    None
+                } else {
+                    Some(scope.join("."))
+                };
+                bind_rust_locals(body, src, &stable, class_key.as_deref(), idx);
+                if let Some(ref cls) = class_key {
+                    visit_rust_instance_fields(body, src, cls, idx);
+                }
             }
         }
         "struct_item" => {
@@ -347,6 +631,7 @@ fn visit(node: Node, src: &str, path: &str, scope: &mut Vec<String>, idx: &mut F
             });
             if let Some(body) = node.child_by_field_name("body") {
                 visit_type_annotations(body, src, &stable, &mut idx.uses);
+                record_struct_fields(body, src, &stable, idx);
             }
         }
         "enum_item" => {
@@ -407,16 +692,35 @@ fn visit(node: Node, src: &str, path: &str, scope: &mut Vec<String>, idx: &mut F
             scope.pop();
         }
         "impl_item" => {
-            let impl_type = node.child_by_field_name("type")
-                .map(|n| node_text(n, src).to_string())
-                .unwrap_or_default();
-            let type_name = impl_type.split('<').next().unwrap_or(&impl_type).trim().to_string();
+            let type_name = node
+                .child_by_field_name("type")
+                .and_then(|n| simple_type_name(n, src))
+                .unwrap_or_else(|| {
+                    let impl_type = node
+                        .child_by_field_name("type")
+                        .map(|n| node_text(n, src).to_string())
+                        .unwrap_or_default();
+                    impl_type
+                        .split('<')
+                        .next()
+                        .unwrap_or(&impl_type)
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(&impl_type)
+                        .trim()
+                        .to_string()
+                });
             if type_name.is_empty() { return; }
+            let class_key = if scope.is_empty() {
+                type_name.clone()
+            } else {
+                format!("{}.{}", scope.join("."), type_name)
+            };
 
             if let Some(trait_node) = node.child_by_field_name("trait") {
                 if let Some(trait_name) = simple_type_name(trait_node, src) {
                     idx.extends.push(ParsedExtends {
-                        class_stable_key: type_name.clone(),
+                        class_stable_key: class_key.clone(),
                         base_name: trait_name,
                         span: span_from_tree_sitter_node(trait_node),
                     });
@@ -623,6 +927,143 @@ fn helper() {}
         ));
         assert!(idx.calls.iter().any(|c| c.callee.label() == "board.get_cell"));
         assert!(idx.calls.iter().any(|c| c.callee.label() == "helper"));
+        assert_eq!(
+            idx.function_locals.get("main").and_then(|m| m.get("board")).map(String::as_str),
+            Some("Board")
+        );
+    }
+
+    #[test]
+    fn indexes_chained_calls() {
+        let src = r#"
+fn run(g: Graph) {
+    g.lock().unwrap();
+}
+"#;
+        let idx = index_rust_file("main.rs", src).unwrap();
+        assert!(
+            idx.calls.iter().any(|c| c.callee.label() == "g.lock"),
+            "inner lock call"
+        );
+        assert!(
+            idx.calls.iter().any(|c| c.callee.label() == "g.lock.unwrap"),
+            "chained unwrap should keep the receiver chain, got {:?}",
+            idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            idx.function_locals.get("run").and_then(|m| m.get("g")).map(String::as_str),
+            Some("Graph")
+        );
+    }
+
+    #[test]
+    fn binds_typed_params_struct_fields_and_self_assigns() {
+        let src = r#"
+pub struct Store {
+    graph: InMemoryGraph,
+}
+impl Store {
+    pub fn save(&self, graph: &InMemoryGraph) {
+        graph.to_snapshot();
+    }
+    pub fn set(&mut self) {
+        self.graph = InMemoryGraph::new();
+    }
+}
+fn save_graph_snapshot(graph: &InMemoryGraph) {
+    graph.to_snapshot();
+}
+fn wrap(g: Arc<InMemoryGraph>, board: Option<&Board>) {}
+"#;
+        let idx = index_rust_file("persist.rs", src).unwrap();
+        assert_eq!(
+            idx.function_locals
+                .get("save_graph_snapshot")
+                .and_then(|m| m.get("graph"))
+                .map(String::as_str),
+            Some("InMemoryGraph"),
+            "typed parameters must populate function_locals"
+        );
+        assert_eq!(
+            idx.function_locals
+                .get("Store.save")
+                .and_then(|m| m.get("graph"))
+                .map(String::as_str),
+            Some("InMemoryGraph")
+        );
+        assert_eq!(
+            idx.instance_fields
+                .get("Store")
+                .and_then(|m| m.get("graph"))
+                .map(String::as_str),
+            Some("InMemoryGraph"),
+            "struct fields and/or self.field = Type::new()"
+        );
+        assert_eq!(
+            idx.function_locals
+                .get("wrap")
+                .and_then(|m| m.get("g"))
+                .map(String::as_str),
+            Some("InMemoryGraph"),
+            "Arc<T> should unwrap to T"
+        );
+        assert_eq!(
+            idx.function_locals
+                .get("wrap")
+                .and_then(|m| m.get("board"))
+                .map(String::as_str),
+            Some("Board"),
+            "Option<&T> should unwrap to T"
+        );
+    }
+
+    #[test]
+    fn binds_self_field_after_lock_unwrap() {
+        let src = r#"
+pub struct Backend {
+    ann: Mutex<FlatAnnIndex>,
+}
+impl Backend {
+    fn rebuild(&self) {
+        let mut ann = self.ann.lock().unwrap();
+        ann.upsert();
+    }
+}
+"#;
+        let idx = index_rust_file("vec.rs", src).unwrap();
+        assert_eq!(
+            idx.instance_fields
+                .get("Backend")
+                .and_then(|m| m.get("ann"))
+                .map(String::as_str),
+            Some("FlatAnnIndex")
+        );
+        assert_eq!(
+            idx.function_locals
+                .get("Backend.rebuild")
+                .and_then(|m| m.get("ann"))
+                .map(String::as_str),
+            Some("FlatAnnIndex"),
+            "let x = self.field.lock().unwrap() should keep the field type"
+        );
+    }
+
+    #[test]
+    fn unwraps_arc_new_constructor_arg() {
+        let src = r#"
+fn t() {
+    let leases = Arc::new(PathLeaseManager::new());
+    leases.acquire();
+}
+"#;
+        let idx = index_rust_file("p.rs", src).unwrap();
+        assert_eq!(
+            idx.function_locals
+                .get("t")
+                .and_then(|m| m.get("leases"))
+                .map(String::as_str),
+            Some("PathLeaseManager")
+        );
     }
 
     #[test]

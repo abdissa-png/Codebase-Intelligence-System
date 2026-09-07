@@ -13,18 +13,221 @@ use crate::index_model::{
     FileIndex, ImportBinding, ImportStyle, ParsedCall, ParsedImport,
 };
 
+const MODULE_EXTS: &[&str] = &[
+    ".ts", ".tsx", ".py", ".rs", ".go", ".js", ".jsx", ".java", ".cs", ".c",
+    ".h", ".cpp", ".cxx", ".cc", ".hpp", ".hxx", ".hh",
+];
+
 fn path_matches_stripped_module(path: &str, stripped: &str) -> bool {
-    const EXTS: &[&str] = &[
-        ".ts", ".tsx", ".py", ".rs", ".go", ".js", ".jsx", ".java", ".cs", ".c",
-        ".h", ".cpp", ".cxx", ".cc", ".hpp", ".hxx", ".hh",
-    ];
-    for ext in EXTS {
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        return false;
+    }
+    if let Some(stem) = stem_if_filename(stripped) {
+        if path == stripped || path.ends_with(&format!("/{stripped}")) {
+            return true;
+        }
+        for ext in MODULE_EXTS {
+            let file = format!("{stem}{ext}");
+            if path == file || path.ends_with(&format!("/{file}")) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for ext in MODULE_EXTS {
         let file = format!("{stripped}{ext}");
         if path == file || path.ends_with(&format!("/{file}")) {
             return true;
         }
     }
     false
+}
+
+fn stem_if_filename(name: &str) -> Option<&str> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    MODULE_EXTS
+        .iter()
+        .find(|ext| base.ends_with(*ext))
+        .map(|ext| &base[..base.len() - ext.len()])
+}
+
+fn path_dir(path: &str) -> &str {
+    path.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
+}
+
+/// Go / Python / Java / C# / C(++) treat same-directory files as one package (or link set).
+/// Rust modules in one folder are still distinct crates/modules — do not guess.
+fn allows_same_dir_resolution(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next().unwrap_or(""),
+        "go" | "py" | "java" | "cs" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh"
+    )
+}
+
+fn is_stdlib_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Object"
+            | "Exception"
+            | "RuntimeException"
+            | "Throwable"
+            | "Error"
+            | "String"
+            | "Integer"
+            | "Boolean"
+            | "Long"
+            | "Double"
+            | "Float"
+            | "List"
+            | "Map"
+            | "Set"
+            | "Optional"
+            | "Iterable"
+            | "Iterator"
+            | "Collection"
+            | "Comparable"
+            | "Serializable"
+            | "Cloneable"
+            | "Runnable"
+            | "Override"
+            | "Deprecated"
+            | "IDisposable"
+            | "IEnumerable"
+            | "IEnumerator"
+            | "IList"
+            | "IDictionary"
+            | "Attribute"
+            | "Enum"
+            | "Delegate"
+            | "EventArgs"
+            | "Task"
+            | "Action"
+            | "Func"
+            | "object"
+            | "string"
+            | "error"
+            | "any"
+            | "interface"
+            | "type"
+    )
+}
+
+fn symbol_name_matches(stable_key: &str, name: &str) -> bool {
+    let leaf = name.rsplit('.').next().unwrap_or(name);
+    stable_key == name
+        || stable_key == leaf
+        || stable_key.ends_with(&format!(".{leaf}"))
+        || stable_key.ends_with(&format!(".{name}"))
+}
+
+fn file_has_callable(index: &FileIndex, name: &str) -> bool {
+    index.symbols.iter().any(|s| {
+        matches!(s.kind, NodeKind::Function | NodeKind::Class) && symbol_name_matches(&s.stable_key, name)
+    })
+}
+
+fn unique_paths_in_dir(
+    batch: &HashMap<String, FileIndex>,
+    from_path: &str,
+    pred: impl Fn(&FileIndex) -> bool,
+) -> Option<String> {
+    let dir = path_dir(from_path);
+    let mut hits: Vec<&String> = batch
+        .iter()
+        .filter(|(p, idx)| path_dir(p) == dir && pred(idx))
+        .map(|(p, _)| p)
+        .collect();
+    hits.sort();
+    hits.dedup();
+    if hits.len() == 1 {
+        Some(hits[0].clone())
+    } else {
+        None
+    }
+}
+
+fn unique_callable_in_dir(
+    batch: &HashMap<String, FileIndex>,
+    from_path: &str,
+    name: &str,
+) -> Option<String> {
+    unique_paths_in_dir(batch, from_path, |idx| file_has_callable(idx, name))
+}
+
+fn unique_class_in_scope(
+    batch: &HashMap<String, FileIndex>,
+    from_path: &str,
+    name: &str,
+) -> Option<String> {
+    if is_stdlib_type_name(name) {
+        return None;
+    }
+    let is_class = |idx: &FileIndex| {
+        idx.symbols.iter().any(|s| {
+            s.kind == NodeKind::Class && symbol_name_matches(&s.stable_key, name)
+        })
+    };
+    if let Some(p) = unique_paths_in_dir(batch, from_path, is_class) {
+        return Some(p);
+    }
+    let mut all: Vec<&String> = batch
+        .iter()
+        .filter(|(_, idx)| is_class(idx))
+        .map(|(p, _)| p)
+        .collect();
+    all.sort();
+    all.dedup();
+    if all.len() == 1 {
+        Some(all[0].clone())
+    } else {
+        None
+    }
+}
+
+fn resolve_relative_or_include(
+    module: &str,
+    from_path: &str,
+    mod_map: &HashMap<String, String>,
+) -> Option<String> {
+    let raw = module
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
+    if raw.is_empty() {
+        return None;
+    }
+    let dir = path_dir(from_path);
+    let joined = if dir.is_empty() {
+        raw.to_string()
+    } else {
+        format!("{dir}/{raw}")
+    };
+    for v in mod_map.values() {
+        if v == &joined || v.as_str() == raw {
+            return Some(v.clone());
+        }
+    }
+    let base = raw.rsplit('/').next().unwrap_or(raw);
+    let mut hits: Vec<&String> = mod_map
+        .values()
+        .filter(|v| path_matches_stripped_module(v, base) || v.ends_with(&format!("/{base}")))
+        .collect();
+    hits.sort();
+    hits.dedup();
+    if hits.len() == 1 {
+        return Some(hits[0].clone());
+    }
+    if hits.len() > 1 {
+        let same_dir: Vec<&String> = hits
+            .iter()
+            .copied()
+            .filter(|v| path_dir(v) == dir)
+            .collect();
+        if same_dir.len() == 1 {
+            return Some(same_dir[0].clone());
+        }
+    }
+    None
 }
 
 /// Strip Rust path prefixes (`crate.` / `self.` / leading `super.`) so imports like
@@ -71,6 +274,14 @@ fn lookup_module_candidates(candidate: &str, mod_map: &HashMap<String, String>) 
 
 /// Resolve an import module string to a repo-relative file path via `mod_map`.
 fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+    resolve_module_path_at(module, None, mod_map)
+}
+
+fn resolve_module_path_at(
+    module: &str,
+    from_path: Option<&str>,
+    mod_map: &HashMap<String, String>,
+) -> Option<String> {
     // Normalize Rust `::` separators to `.` (indexers may emit either).
     let normalized = module.trim().replace("::", ".");
     if let Some(p) = lookup_module_candidates(&normalized, mod_map) {
@@ -91,16 +302,30 @@ fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Optio
             return Some(p);
         }
     }
+    if let Some(from) = from_path {
+        if let Some(p) = resolve_relative_or_include(module, from, mod_map) {
+            return Some(p);
+        }
+    }
     None
 }
 
 pub(crate) fn build_import_bindings(
     imports: &[ParsedImport],
     mod_map: &HashMap<String, String>,
+    from_path: &str,
 ) -> HashMap<String, ImportBinding> {
     let mut out = HashMap::new();
     for imp in imports {
-        let Some(tp) = resolve_module_path(&imp.module, mod_map) else {
+        let tp = resolve_module_path_at(&imp.module, Some(from_path), mod_map).or_else(|| {
+            if imp.style == ImportStyle::Names && imp.names.len() == 1 {
+                let fq = format!("{}.{}", imp.module, imp.names[0]);
+                lookup_module_candidates(&fq, mod_map)
+            } else {
+                None
+            }
+        });
+        let Some(tp) = tp else {
             continue;
         };
         match imp.style {
@@ -140,8 +365,30 @@ pub(crate) fn caller_enclosing_class(caller_stable_key: &str) -> Option<&str> {
 
 pub(crate) fn class_symbol_in_file(index: &FileIndex, type_name: &str) -> bool {
     index.symbols.iter().any(|s| {
-        s.kind == NodeKind::Class && (s.stable_key == type_name || s.stable_key.ends_with(&format!(".{type_name}")))
+        s.kind == NodeKind::Class
+            && (s.stable_key == type_name || s.stable_key.ends_with(&format!(".{type_name}")))
     })
+}
+
+fn identity_key_for_class(index: &FileIndex, class_key: &str) -> Option<String> {
+    index
+        .symbols
+        .iter()
+        .find(|s| s.kind == NodeKind::Class && s.stable_key == class_key)
+        .or_else(|| {
+            index.symbols.iter().find(|s| {
+                s.kind == NodeKind::Class
+                    && s.stable_key.ends_with(&format!(".{class_key}"))
+            })
+        })
+        .or_else(|| {
+            index
+                .symbols
+                .iter()
+                .find(|s| s.stable_key == class_key && s.disambiguator.is_empty())
+        })
+        .or_else(|| index.symbols.iter().find(|s| s.stable_key == class_key))
+        .map(|s| s.identity_key())
 }
 
 pub(crate) fn resolve_type_location(
@@ -169,10 +416,13 @@ pub(crate) fn infer_type_of_receiver(
     import_bindings: &HashMap<String, ImportBinding>,
 ) -> Option<(String, String)> {
     match receiver {
-        CallReceiver::Bare(name) if name == "self" || name == "this" => Some((
-            path.to_string(),
-            caller_class.to_string(),
-        )),
+        CallReceiver::Bare(name) if name == "self" || name == "this" => {
+            if caller_class.is_empty() {
+                None
+            } else {
+                Some((path.to_string(), caller_class.to_string()))
+            }
+        }
         CallReceiver::Bare(name) => {
             if let Some(type_name) = index
                 .function_locals
@@ -219,16 +469,53 @@ pub(crate) fn infer_type_of_receiver(
 
 pub(crate) fn resolve_call_same_file(path: &str, index: &FileIndex, call: &ParsedCall) -> Option<IdentityId> {
     match &call.callee {
-        CallReceiver::Bare(name) => resolve_symbol_in_file_index(path, name, index),
-        CallReceiver::Attr { object, name } => {
-            if let CallReceiver::Bare(owner) = object.as_ref() {
-                if let Some(id) = resolve_member_in_file_index(path, owner, name, index) {
-                    return Some(id);
+        CallReceiver::Bare(name) => {
+            if let Some(id) = resolve_symbol_in_file_index_exact(path, name, index) {
+                return Some(id);
+            }
+            // Rust: `foo()` is never `Self::foo` — methods need `self.` / `Type::`.
+            // Java/Python/C#: unqualified `foo()` inside a class can be a same-type method.
+            if !path.ends_with(".rs") {
+                if let Some(cls) = caller_enclosing_class(&call.caller_stable_key) {
+                    if let Some(id) = resolve_member_in_file_index(path, cls, name, index) {
+                        return Some(id);
+                    }
                 }
             }
-            resolve_symbol_in_file_index(path, name, index)
+            None
+        }
+        CallReceiver::Attr { object, name } => {
+            if let CallReceiver::Bare(owner) = object.as_ref() {
+                resolve_member_in_file_index(path, owner, name, index)
+            } else {
+                None
+            }
         }
     }
+}
+
+fn resolve_symbol_in_file_index_exact(path: &str, simple_name: &str, index: &FileIndex) -> Option<IdentityId> {
+    let exact = format!("{path}::{simple_name}");
+    let mut best_fn_empty: Option<IdentityId> = None;
+    let mut best_fn: Option<IdentityId> = None;
+    let mut best_empty: Option<IdentityId> = None;
+    let mut best_any: Option<IdentityId> = None;
+    for sym in &index.symbols {
+        if !(sym.qualified_name == exact || sym.stable_key == simple_name) {
+            continue;
+        }
+        let id = IdentityId(stable_id_bytes("id", path, &sym.identity_key()));
+        if sym.kind == NodeKind::Function && sym.disambiguator.is_empty() {
+            best_fn_empty.get_or_insert(id);
+        } else if sym.kind == NodeKind::Function {
+            best_fn.get_or_insert(id);
+        } else if sym.disambiguator.is_empty() {
+            best_empty.get_or_insert(id);
+        } else {
+            best_any.get_or_insert(id);
+        }
+    }
+    best_fn_empty.or(best_fn).or(best_empty).or(best_any)
 }
 
 pub(crate) fn resolve_member_in_file_index(
@@ -241,6 +528,64 @@ pub(crate) fn resolve_member_in_file_index(
     resolve_symbol_in_file_index(path, &member_key, index)
 }
 
+/// Unique Function whose name leaf is `leaf` (`Type.leaf` or bare `leaf`).
+/// Ambiguous leaves (`new`/`get` in a file with several impls) return None.
+fn unique_function_leaf<'a>(index: &'a FileIndex, leaf: &str) -> Option<&'a str> {
+    if leaf.is_empty() {
+        return None;
+    }
+    let suffix = format!(".{leaf}");
+    let mut hit: Option<&str> = None;
+    for s in &index.symbols {
+        if s.kind != NodeKind::Function {
+            continue;
+        }
+        if s.stable_key == leaf || s.stable_key.ends_with(&suffix) {
+            match hit {
+                Some(prev) if prev != s.stable_key => return None,
+                Some(_) => {}
+                None => hit = Some(s.stable_key.as_str()),
+            }
+        }
+    }
+    hit
+}
+
+fn unique_function_leaf_in_graph(
+    graph: &crate::graph::InMemoryGraph,
+    branch: BranchId,
+    file_path: &str,
+    leaf: &str,
+) -> Option<IdentityId> {
+    if leaf.is_empty() {
+        return None;
+    }
+    let suffix = format!(".{leaf}");
+    let mut hit: Option<IdentityId> = None;
+    for r in graph.revisions() {
+        if r.branch_id != branch || r.file_path != file_path {
+            continue;
+        }
+        if !matches!(r.status, RevisionStatus::Active) {
+            continue;
+        }
+        if graph.identity_kind(r.identity_id) != Some(NodeKind::Function) {
+            continue;
+        }
+        let q = r.qualified_name.as_str();
+        let key = q.rsplit("::").next().unwrap_or(q);
+        if key != leaf && !key.ends_with(&suffix) {
+            continue;
+        }
+        match hit {
+            Some(prev) if prev != r.identity_id => return None,
+            Some(_) => {}
+            None => hit = Some(r.identity_id),
+        }
+    }
+    hit
+}
+
 pub(crate) fn resolve_member_in_module(
     file_path: &str,
     owner: &str,
@@ -250,7 +595,18 @@ pub(crate) fn resolve_member_in_module(
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     let member_key = format!("{owner}.{member}");
-    resolve_symbol_in_module(file_path, &member_key, branch, graph, batch_indexes)
+    if let Some(id) = resolve_symbol_in_module(file_path, &member_key, branch, graph, batch_indexes)
+    {
+        return Some(id);
+    }
+    if let Some(idx) = batch_indexes.get(file_path) {
+        if let Some(key) = unique_function_leaf(idx, member) {
+            if let Some(id) = resolve_symbol_in_file_index(file_path, key, idx) {
+                return Some(id);
+            }
+        }
+    }
+    graph.and_then(|g| unique_function_leaf_in_graph(g, branch, file_path, member))
 }
 
 pub(crate) fn resolve_symbol_in_file_index(path: &str, simple_name: &str, index: &FileIndex) -> Option<IdentityId> {
@@ -307,22 +663,6 @@ fn identity_key_for_owner(index: &FileIndex, stable_key: &str) -> Option<String>
                 .find(|s| s.stable_key == stable_key && s.disambiguator.is_empty())
         })
         .or_else(|| index.symbols.iter().find(|s| s.stable_key == stable_key))
-        .map(|s| s.identity_key())
-}
-
-/// Prefer a Class symbol when resolving extends / class owners.
-fn identity_key_for_class(index: &FileIndex, class_key: &str) -> Option<String> {
-    index
-        .symbols
-        .iter()
-        .find(|s| s.kind == NodeKind::Class && s.stable_key == class_key)
-        .or_else(|| {
-            index
-                .symbols
-                .iter()
-                .find(|s| s.stable_key == class_key && s.disambiguator.is_empty())
-        })
-        .or_else(|| index.symbols.iter().find(|s| s.stable_key == class_key))
         .map(|s| s.identity_key())
 }
 
@@ -396,6 +736,109 @@ pub(crate) fn callee_in_import_scope(imp: &ParsedImport, callee_simple: &str) ->
     }
 }
 
+fn looks_like_type_owner(name: &str) -> bool {
+    !matches!(name, "self" | "this" | "Self" | "crate" | "super")
+        && name.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// `Type::method` forwarding (UFCS): prefer the imported type's method over a
+/// same-file wrapper that happens to share `Type.method` (trait impl → inherent).
+fn resolve_imported_ufcs_target(
+    path: &str,
+    branch: BranchId,
+    call: &ParsedCall,
+    import_bindings: &HashMap<String, ImportBinding>,
+    graph: Option<&crate::graph::InMemoryGraph>,
+    batch_indexes: &HashMap<String, FileIndex>,
+) -> Option<IdentityId> {
+    let CallReceiver::Attr { object, name } = &call.callee else {
+        return None;
+    };
+    let CallReceiver::Bare(owner) = object.as_ref() else {
+        return None;
+    };
+    if !looks_like_type_owner(owner) {
+        return None;
+    }
+    let binding = import_bindings.get(owner)?;
+    if binding.file_path == path {
+        return None;
+    }
+    resolve_member_in_module(
+        &binding.file_path,
+        &binding.remote_name,
+        name,
+        branch,
+        graph,
+        batch_indexes,
+    )
+}
+
+fn flatten_receiver<'a>(recv: &'a CallReceiver) -> Vec<&'a str> {
+    match recv {
+        CallReceiver::Bare(n) => vec![n.as_str()],
+        CallReceiver::Attr { object, name } => {
+            let mut segs = flatten_receiver(object);
+            segs.push(name.as_str());
+            segs
+        }
+    }
+}
+
+/// `crate::mod::Type::method` / `mod::func` — not `Board::new` (that's a type UFCS).
+fn resolve_rust_path_call(
+    path: &str,
+    branch: BranchId,
+    call: &ParsedCall,
+    mod_map: &HashMap<String, String>,
+    graph: Option<&crate::graph::InMemoryGraph>,
+    batch_indexes: &HashMap<String, FileIndex>,
+) -> Option<IdentityId> {
+    if !path.ends_with(".rs") {
+        return None;
+    }
+    if !matches!(call.callee, CallReceiver::Attr { .. }) {
+        return None;
+    }
+    let mut rest = flatten_receiver(&call.callee);
+    while matches!(rest.first().copied(), Some("crate" | "self" | "super")) {
+        rest.remove(0);
+    }
+    if rest.len() < 2 {
+        return None;
+    }
+    let method = *rest.last()?;
+    if rest.len() >= 3 {
+        let owner = rest[rest.len() - 2];
+        let module = rest[..rest.len() - 2].join(".");
+        if let Some(fp) = resolve_module_path_at(&module, Some(path), mod_map) {
+            if let Some(id) = resolve_member_in_module(
+                &fp,
+                owner,
+                method,
+                branch,
+                graph,
+                batch_indexes,
+            ) {
+                return Some(id);
+            }
+        }
+    }
+    let module_owner = rest[rest.len() - 2];
+    if rest.len() == 2 && looks_like_type_owner(module_owner) {
+        return None;
+    }
+    let module = rest[..rest.len() - 1].join(".");
+    let fp = resolve_module_path_at(&module, Some(path), mod_map)?;
+    if let Some(id) = resolve_symbol_in_module(&fp, method, branch, graph, batch_indexes) {
+        return Some(id);
+    }
+    batch_indexes.get(&fp).and_then(|idx| {
+        unique_function_leaf(idx, method)
+            .and_then(|key| resolve_symbol_in_file_index(&fp, key, idx))
+    })
+}
+
 pub(crate) fn resolve_call_target(
     path: &str,
     branch: BranchId,
@@ -405,7 +848,18 @@ pub(crate) fn resolve_call_target(
     graph: Option<&crate::graph::InMemoryGraph>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
-    let import_bindings = build_import_bindings(&index.imports, mod_map);
+    let import_bindings = build_import_bindings(&index.imports, mod_map, path);
+
+    if let Some(id) = resolve_imported_ufcs_target(
+        path,
+        branch,
+        call,
+        &import_bindings,
+        graph,
+        batch_indexes,
+    ) {
+        return Some(id);
+    }
 
     if let Some(id) = resolve_call_same_file(path, index, call) {
         return Some(id);
@@ -428,7 +882,8 @@ pub(crate) fn resolve_call_target(
                 if !callee_in_import_scope(imp, name) {
                     continue;
                 }
-                let Some(target_path) = resolve_module_path(&imp.module, mod_map) else {
+                let Some(target_path) = resolve_module_path_at(&imp.module, Some(path), mod_map)
+                else {
                     continue;
                 };
                 if target_path == path {
@@ -444,28 +899,48 @@ pub(crate) fn resolve_call_target(
                     return Some(id);
                 }
             }
-        }
-        CallReceiver::Attr { object, name } => {
-            if let Some(caller_class) = caller_enclosing_class(&call.caller_stable_key) {
-                if let Some((owner_file, owner_sym)) = infer_type_of_receiver(
-                    object,
-                    &call.caller_stable_key,
-                    caller_class,
-                    path,
-                    index,
-                    &import_bindings,
-                ) {
-                    if let Some(id) = resolve_member_in_module(
-                        &owner_file,
-                        &owner_sym,
-                        name,
-                        branch,
-                        graph,
-                        batch_indexes,
-                    ) {
-                        return Some(id);
+            if allows_same_dir_resolution(path) {
+                if let Some(fp) = unique_callable_in_dir(batch_indexes, path, name) {
+                    if fp != path {
+                        if let Some(id) =
+                            resolve_symbol_in_module(&fp, name, branch, graph, batch_indexes)
+                        {
+                            return Some(id);
+                        }
                     }
                 }
+            }
+        }
+        CallReceiver::Attr { object, name } => {
+            let caller_class = caller_enclosing_class(&call.caller_stable_key).unwrap_or("");
+            if let Some((owner_file, owner_sym)) = infer_type_of_receiver(
+                object,
+                &call.caller_stable_key,
+                caller_class,
+                path,
+                index,
+                &import_bindings,
+            ) {
+                if let Some(id) = resolve_member_in_module(
+                    &owner_file,
+                    &owner_sym,
+                    name,
+                    branch,
+                    graph,
+                    batch_indexes,
+                ) {
+                    return Some(id);
+                }
+            }
+            if let Some(id) = resolve_rust_path_call(
+                path,
+                branch,
+                call,
+                mod_map,
+                graph,
+                batch_indexes,
+            ) {
+                return Some(id);
             }
             if let Some(base) = object.root_bare_name() {
                 if let Some(binding) = import_bindings.get(base) {
@@ -490,13 +965,41 @@ pub(crate) fn resolve_call_target(
                 ) {
                     return Some(id);
                 }
+                if allows_same_dir_resolution(path) {
+                    if let Some(fp) = unique_class_in_scope(batch_indexes, path, base) {
+                        if let Some(id) = resolve_member_in_module(
+                            &fp,
+                            base,
+                            name,
+                            branch,
+                            graph,
+                            batch_indexes,
+                        ) {
+                            return Some(id);
+                        }
+                    }
+                    if let Some(fp) = unique_callable_in_dir(batch_indexes, path, name) {
+                        if fp != path {
+                            if let Some(id) = resolve_symbol_in_module(
+                                &fp,
+                                name,
+                                branch,
+                                graph,
+                                batch_indexes,
+                            ) {
+                                return Some(id);
+                            }
+                        }
+                    }
+                }
             }
             let leaf = name.as_str();
             for imp in &index.imports {
                 if !callee_in_import_scope(imp, leaf) {
                     continue;
                 }
-                let Some(target_path) = resolve_module_path(&imp.module, mod_map) else {
+                let Some(target_path) = resolve_module_path_at(&imp.module, Some(path), mod_map)
+                else {
                     continue;
                 };
                 if target_path == path {
@@ -668,9 +1171,17 @@ pub(crate) fn resolve_type_name_to_identity(
     graph: Option<&crate::graph::InMemoryGraph>,
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
-    let import_bindings = build_import_bindings(&index.imports, mod_map);
+    let import_bindings = build_import_bindings(&index.imports, mod_map, path);
     let (owner_file, simple) = resolve_type_location(type_name, path, index, &import_bindings);
-    resolve_symbol_in_module(&owner_file, &simple, branch, graph, batch_indexes)
+    if let Some(id) = resolve_symbol_in_module(&owner_file, &simple, branch, graph, batch_indexes) {
+        return Some(id);
+    }
+    if allows_same_dir_resolution(path) || owner_file == path {
+        if let Some(fp) = unique_class_in_scope(batch_indexes, path, type_name) {
+            return resolve_symbol_in_module(&fp, type_name, branch, graph, batch_indexes);
+        }
+    }
+    None
 }
 
 pub(crate) fn attach_import_and_call_edges(
@@ -685,7 +1196,14 @@ pub(crate) fn attach_import_and_call_edges(
     let file_hub_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, "$file"));
     let file_scope = file_hub_scope_start(index);
     for imp in &index.imports {
-        let Some(tp) = resolve_module_path(&imp.module, mod_map) else {
+        let Some(tp) = resolve_module_path_at(&imp.module, Some(path), mod_map).or_else(|| {
+            if imp.style == ImportStyle::Names && imp.names.len() == 1 {
+                let fq = format!("{}.{}", imp.module, imp.names[0]);
+                lookup_module_candidates(&fq, mod_map)
+            } else {
+                None
+            }
+        }) else {
             continue;
         };
         if tp == path {
@@ -977,7 +1495,7 @@ mod tests {
             names: vec!["run".to_string()],
             span: span(),
         }];
-        let bindings = build_import_bindings(&imports, &mod_map);
+        let bindings = build_import_bindings(&imports, &mod_map, "main.py");
         assert_eq!(bindings.get("run").unwrap().file_path, "lib/helpers.py");
         assert_eq!(bindings.get("run").unwrap().remote_name, "run");
     }
@@ -1426,6 +1944,518 @@ mod tests {
         assert!(
             !edges.contains_key(&orphan),
             "must not emit edges for non-symbol owner revisions"
+        );
+    }
+
+    #[test]
+    fn resolve_call_target_same_package_go() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "mux.go";
+        let callee_path = "route.go";
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "NewRouter".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::NewRouter"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut caller_idx = FileIndex::default();
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "Example".to_string(),
+            callee: CallReceiver::bare("NewRouter"),
+            span: span(),
+        });
+        let mut batch = HashMap::new();
+        batch.insert(caller_path.to_string(), caller_idx.clone());
+        batch.insert(callee_path.to_string(), callee_idx);
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &HashMap::new(),
+            None,
+            &batch,
+        )
+        .expect("same-package Go call should resolve without an import");
+        assert_eq!(
+            target,
+            IdentityId(stable_id_bytes("id", callee_path, "NewRouter"))
+        );
+    }
+
+    #[test]
+    fn resolve_call_target_does_not_guess_rust_same_dir() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "src/a.rs";
+        let sibling = "src/b.rs";
+        let mut sibling_idx = FileIndex::default();
+        sibling_idx.symbols.push(ParsedSymbol {
+            stable_key: "helper".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{sibling}::helper"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut caller_idx = FileIndex::default();
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "run".to_string(),
+            callee: CallReceiver::bare("helper"),
+            span: span(),
+        });
+        let mut batch = HashMap::new();
+        batch.insert(sibling.to_string(), sibling_idx);
+        assert!(
+            resolve_call_target(
+                caller_path,
+                branch,
+                &caller_idx,
+                &caller_idx.calls[0],
+                &HashMap::new(),
+                None,
+                &batch,
+            )
+            .is_none(),
+            "Rust sibling files are separate modules"
+        );
+    }
+
+    #[test]
+    fn resolve_local_typed_receiver_without_enclosing_class() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "main.rs";
+        let callee_path = "graph.rs";
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "InMemoryGraph".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::InMemoryGraph"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "InMemoryGraph.to_snapshot".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::InMemoryGraph.to_snapshot"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut caller_idx = FileIndex::default();
+        caller_idx.imports.push(ParsedImport {
+            module: "crate.graph".to_string(),
+            style: ImportStyle::Names,
+            names: vec!["InMemoryGraph".to_string()],
+            span: span(),
+        });
+        caller_idx
+            .function_locals
+            .entry("boot".into())
+            .or_default()
+            .insert("g".into(), "InMemoryGraph".into());
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "boot".to_string(),
+            callee: CallReceiver::Attr {
+                object: Box::new(CallReceiver::bare("g")),
+                name: "to_snapshot".to_string(),
+            },
+            span: span(),
+        });
+        let mut mod_map = HashMap::new();
+        mod_map.insert("crate.graph".into(), callee_path.to_string());
+        mod_map.insert("graph".into(), callee_path.to_string());
+        let mut batch = HashMap::new();
+        batch.insert(callee_path.to_string(), callee_idx);
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &mod_map,
+            None,
+            &batch,
+        )
+        .expect("g.to_snapshot should follow function_locals + import");
+        assert_eq!(
+            target,
+            IdentityId(stable_id_bytes("id", callee_path, "InMemoryGraph.to_snapshot"))
+        );
+    }
+
+    #[test]
+    fn resolve_extends_unique_class_same_package() {
+        let branch = BranchId([0u8; 16]);
+        let child_path = "pkg/Dog.java";
+        let parent_path = "pkg/Animal.java";
+        let mut parent = FileIndex::default();
+        parent.symbols.push(ParsedSymbol {
+            stable_key: "Animal".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{parent_path}::Animal"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        let mut child = FileIndex::default();
+        child.symbols.push(ParsedSymbol {
+            stable_key: "Dog".to_string(),
+            disambiguator: String::new(),
+            qualified_name: format!("{child_path}::Dog"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        child.extends.push(crate::index_model::ParsedExtends {
+            class_stable_key: "Dog".to_string(),
+            base_name: "Animal".to_string(),
+            span: span(),
+        });
+        let mut batch = HashMap::new();
+        batch.insert(parent_path.to_string(), parent);
+        batch.insert(child_path.to_string(), child.clone());
+        let id = resolve_type_name_to_identity(
+            child_path,
+            branch,
+            "Animal",
+            &child,
+            &HashMap::new(),
+            None,
+            &batch,
+        )
+        .expect("same-package extends");
+        assert_eq!(id, IdentityId(stable_id_bytes("id", parent_path, "Animal")));
+    }
+
+    #[test]
+    fn resolve_c_include_header_to_sibling_source() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert("zutil".into(), "zutil.c".into());
+        mod_map.insert("deflate".into(), "deflate.c".into());
+        assert_eq!(
+            resolve_module_path_at("zutil.h", Some("deflate.c"), &mod_map),
+            Some("zutil.c".to_string())
+        );
+        assert_eq!(
+            resolve_module_path_at("\"zutil.h\"", Some("deflate.c"), &mod_map),
+            Some("zutil.c".to_string())
+        );
+    }
+
+    #[test]
+    fn java_fqcn_import_binds_to_file() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert(
+            "com.google.gson.Gson".into(),
+            "src/com/google/gson/Gson.java".into(),
+        );
+        let imports = vec![ParsedImport {
+            module: "com.google.gson".into(),
+            style: ImportStyle::Names,
+            names: vec!["Gson".into()],
+            span: span(),
+        }];
+        let bindings = build_import_bindings(&imports, &mod_map, "src/Main.java");
+        assert_eq!(
+            bindings.get("Gson").unwrap().file_path,
+            "src/com/google/gson/Gson.java"
+        );
+    }
+
+    #[test]
+    fn resolve_module_receiver_unique_method_leaf() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "persistence.rs";
+        let callee_path = "graph.rs";
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "InMemoryGraph".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::InMemoryGraph"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "InMemoryGraph.to_snapshot".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::InMemoryGraph.to_snapshot"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut caller_idx = FileIndex::default();
+        caller_idx.imports.push(ParsedImport {
+            module: "crate.graph".into(),
+            style: ImportStyle::ModuleOnly,
+            names: vec![],
+            span: span(),
+        });
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "save_graph_snapshot".into(),
+            callee: CallReceiver::Attr {
+                object: Box::new(CallReceiver::bare("graph")),
+                name: "to_snapshot".into(),
+            },
+            span: span(),
+        });
+        let mut mod_map = HashMap::new();
+        mod_map.insert("crate.graph".into(), callee_path.to_string());
+        mod_map.insert("graph".into(), callee_path.to_string());
+        let mut batch = HashMap::new();
+        batch.insert(callee_path.to_string(), callee_idx);
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &mod_map,
+            None,
+            &batch,
+        )
+        .expect("unique to_snapshot on imported module should resolve");
+        assert_eq!(
+            target,
+            IdentityId(stable_id_bytes(
+                "id",
+                callee_path,
+                "InMemoryGraph.to_snapshot"
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_ufcs_prefers_imported_type_over_same_file_wrapper() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "wal_backend.rs";
+        let callee_path = "log.rs";
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "MutationLog".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::MutationLog"),
+            kind: NodeKind::Class,
+            span: span(),
+        });
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "MutationLog.update_phase".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::MutationLog.update_phase"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut caller_idx = FileIndex::default();
+        caller_idx.symbols.push(ParsedSymbol {
+            stable_key: "MutationLog.update_phase".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{caller_path}::MutationLog.update_phase"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        caller_idx.imports.push(ParsedImport {
+            module: "crate.log".into(),
+            style: ImportStyle::Names,
+            names: vec!["MutationLog".into()],
+            span: span(),
+        });
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "MutationLog.update_phase".into(),
+            callee: CallReceiver::Attr {
+                object: Box::new(CallReceiver::bare("MutationLog")),
+                name: "update_phase".into(),
+            },
+            span: span(),
+        });
+        let mut mod_map = HashMap::new();
+        mod_map.insert("crate.log".into(), callee_path.to_string());
+        mod_map.insert("log".into(), callee_path.to_string());
+        let mut batch = HashMap::new();
+        batch.insert(caller_path.to_string(), caller_idx.clone());
+        batch.insert(callee_path.to_string(), callee_idx);
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &mod_map,
+            None,
+            &batch,
+        )
+        .expect("UFCS should follow the imported inherent impl");
+        assert_eq!(
+            target,
+            IdentityId(stable_id_bytes(
+                "id",
+                callee_path,
+                "MutationLog.update_phase"
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_bare_does_not_steal_method_of_another_type() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "mcp.rs";
+        let callee_path = "security.rs";
+        let mut caller_idx = FileIndex::default();
+        caller_idx.symbols.push(ParsedSymbol {
+            stable_key: "CisMcpRuntime.verify_audit_chain".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{caller_path}::CisMcpRuntime.verify_audit_chain"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        caller_idx.imports.push(ParsedImport {
+            module: "crate.security".into(),
+            style: ImportStyle::Names,
+            names: vec!["verify_audit_chain".into()],
+            span: span(),
+        });
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "CisMcpRuntime.system_status".into(),
+            callee: CallReceiver::bare("verify_audit_chain"),
+            span: span(),
+        });
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "verify_audit_chain".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::verify_audit_chain"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut mod_map = HashMap::new();
+        mod_map.insert("crate.security".into(), callee_path.to_string());
+        mod_map.insert("security".into(), callee_path.to_string());
+        let mut batch = HashMap::new();
+        batch.insert(caller_path.to_string(), caller_idx.clone());
+        batch.insert(callee_path.to_string(), callee_idx);
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &mod_map,
+            None,
+            &batch,
+        )
+        .expect("imported free fn, not the method with the same leaf");
+        assert_eq!(
+            target,
+            IdentityId(stable_id_bytes("id", callee_path, "verify_audit_chain"))
+        );
+    }
+
+    #[test]
+    fn resolve_crate_path_associated_function() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "mcp.rs";
+        let callee_path = "confirm_token.rs";
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "FaultInjectingConfirmBackend.new".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::FaultInjectingConfirmBackend.new"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut caller_idx = FileIndex::default();
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "CisMcpRuntime.new_dev_with_options".into(),
+            callee: CallReceiver::Attr {
+                object: Box::new(CallReceiver::Attr {
+                    object: Box::new(CallReceiver::Attr {
+                        object: Box::new(CallReceiver::bare("crate")),
+                        name: "confirm_token".into(),
+                    }),
+                    name: "FaultInjectingConfirmBackend".into(),
+                }),
+                name: "new".into(),
+            },
+            span: span(),
+        });
+        let mut mod_map = HashMap::new();
+        mod_map.insert("confirm_token".into(), callee_path.to_string());
+        mod_map.insert("crate.confirm_token".into(), callee_path.to_string());
+        let mut batch = HashMap::new();
+        batch.insert(callee_path.to_string(), callee_idx);
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &mod_map,
+            None,
+            &batch,
+        )
+        .expect("crate::mod::Type::new");
+        assert_eq!(
+            target,
+            IdentityId(stable_id_bytes(
+                "id",
+                callee_path,
+                "FaultInjectingConfirmBackend.new"
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_attr_does_not_steal_same_file_leaf() {
+        let branch = BranchId([0u8; 16]);
+        let caller_path = "graph_store.rs";
+        let callee_path = "graph.rs";
+        let mut caller_idx = FileIndex::default();
+        caller_idx.symbols.push(ParsedSymbol {
+            stable_key: "SqliteGraphStore.revision_count".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{caller_path}::SqliteGraphStore.revision_count"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        caller_idx
+            .function_locals
+            .entry("migrate_graph_json_to_sqlite".into())
+            .or_default()
+            .insert("graph".into(), "InMemoryGraph".into());
+        caller_idx.imports.push(ParsedImport {
+            module: "crate.graph".into(),
+            style: ImportStyle::Names,
+            names: vec!["InMemoryGraph".into()],
+            span: span(),
+        });
+        caller_idx.calls.push(ParsedCall {
+            caller_stable_key: "migrate_graph_json_to_sqlite".into(),
+            callee: CallReceiver::Attr {
+                object: Box::new(CallReceiver::bare("graph")),
+                name: "revision_count".into(),
+            },
+            span: span(),
+        });
+        let mut callee_idx = FileIndex::default();
+        callee_idx.symbols.push(ParsedSymbol {
+            stable_key: "InMemoryGraph.revision_count".into(),
+            disambiguator: String::new(),
+            qualified_name: format!("{callee_path}::InMemoryGraph.revision_count"),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut mod_map = HashMap::new();
+        mod_map.insert("crate.graph".into(), callee_path.to_string());
+        mod_map.insert("graph".into(), callee_path.to_string());
+        let mut batch = HashMap::new();
+        batch.insert(callee_path.to_string(), callee_idx);
+        let target = resolve_call_target(
+            caller_path,
+            branch,
+            &caller_idx,
+            &caller_idx.calls[0],
+            &mod_map,
+            None,
+            &batch,
+        )
+        .expect("typed graph.revision_count, not the local helper");
+        assert_eq!(
+            target,
+            IdentityId(stable_id_bytes(
+                "id",
+                callee_path,
+                "InMemoryGraph.revision_count"
+            ))
         );
     }
 }

@@ -55,10 +55,36 @@ fn parse_call_receiver(node: Node, src: &str) -> Option<CallReceiver> {
                 name: node_text(field, src).to_string(),
             })
         }
+        "method_invocation" => {
+            let name = node.child_by_field_name("name")?;
+            let name_s = node_text(name, src).to_string();
+            if let Some(obj) = node.child_by_field_name("object") {
+                if let Some(obj_r) = parse_call_receiver(obj, src) {
+                    return Some(CallReceiver::Attr {
+                        object: Box::new(obj_r),
+                        name: name_s,
+                    });
+                }
+            }
+            Some(CallReceiver::Bare(name_s))
+        }
         "scoped_identifier" => {
             let name = node.child_by_field_name("name")?;
-            Some(CallReceiver::Bare(node_text(name, src).to_string()))
+            let name_s = node_text(name, src).to_string();
+            if let Some(scope) = node
+                .child_by_field_name("scope")
+                .or_else(|| node.named_child(0))
+            {
+                if let Some(obj) = parse_call_receiver(scope, src) {
+                    return Some(CallReceiver::Attr {
+                        object: Box::new(obj),
+                        name: name_s,
+                    });
+                }
+            }
+            Some(CallReceiver::Bare(name_s))
         }
+        "parenthesized_expression" => node.named_child(0).and_then(|c| parse_call_receiver(c, src)),
         _ => None,
     }
 }
@@ -625,6 +651,30 @@ public class Board {
                     )
             }),
             "expected this.cells.get call site in getCell"
+        );
+    }
+
+    #[test]
+    fn indexes_qualified_and_chained_calls() {
+        let src = r#"
+class Run {
+    void go(Foo foo) {
+        Collections.emptyList();
+        foo.lock().unwrap();
+    }
+}
+"#;
+        let idx = index_java_file("Run.java", src).unwrap();
+        assert!(
+            idx.calls.iter().any(|c| c.callee.label() == "Collections.emptyList"
+                || matches!(&c.callee, CallReceiver::Attr { name, .. } if name == "emptyList")),
+            "qualified Collections.emptyList, got {:?}",
+            idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
+        );
+        assert!(
+            idx.calls.iter().any(|c| c.callee.label().contains("unwrap")),
+            "chained unwrap, got {:?}",
+            idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
         );
     }
 }

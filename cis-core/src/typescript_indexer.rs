@@ -198,6 +198,12 @@ fn index_typescript_file_tree_sitter(
                     name: node_text(prop, src).to_string(),
                 })
             }
+            "call_expression" => node
+                .child_by_field_name("function")
+                .and_then(|f| parse_call_receiver(f, src)),
+            "parenthesized_expression" => {
+                node.named_child(0).and_then(|c| parse_call_receiver(c, src))
+            }
             _ => None,
         }
     }
