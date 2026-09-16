@@ -28,6 +28,10 @@ pub(crate) fn next_lexical_prefix(prefix: &str) -> String {
 }
 
 /// Prefixes persisted across restart (**ADR 0001**).
+///
+/// **`eto:` is intentionally absent.** Edge-target overrides are process-local
+/// (Phase 6 product decision). Making them durable would change query results
+/// after restart; [`crate::edge_target_override`] documents this.
 pub const DURABLE_KV_PREFIXES: &[&str] = &[
     "ri:",
     "ris:",

@@ -554,6 +554,40 @@ fn sqlite_wal_and_vectors_survive_restart() {
 }
 
 #[test]
+#[cfg(feature = "body-sqlite")]
+fn eto_does_not_survive_restart() {
+    let _env = CIS_ENV_LOCK.lock().unwrap();
+    use cis_core::EdgeTargetOverrideStore;
+    clear_cis_integration_test_env();
+    std::env::remove_var("CIS_WAL_MEMORY");
+    std::env::set_var("CIS_KV_BACKEND", "sqlite");
+    let root = temp_repo("eto-ephemeral");
+    let branch = BranchId([0u8; 16]);
+    let source = NodeRevisionId([1u8; 16]);
+    let edge = [2u8; 16];
+    let target = IdentityId([3u8; 16]);
+
+    {
+        let rt = cis_core::CisMcpRuntime::new_dev(&root.to_string_lossy());
+        let eto = EdgeTargetOverrideStore::new(std::sync::Arc::clone(rt.kv()));
+        eto.set_override(branch, source, edge, target);
+        assert_eq!(eto.get_override(branch, source, edge), Some(target));
+        rt.save_workspace(0).expect("persist");
+    }
+
+    {
+        std::env::set_var("CIS_KV_BACKEND", "sqlite");
+        let rt = cis_core::CisMcpRuntime::new_dev(&root.to_string_lossy());
+        let eto = EdgeTargetOverrideStore::new(std::sync::Arc::clone(rt.kv()));
+        assert!(
+            eto.get_override(branch, source, edge).is_none(),
+            "ETO must remain process-local; sqlite KV must not persist eto: keys"
+        );
+    }
+    std::env::remove_var("CIS_KV_BACKEND");
+}
+
+#[test]
 fn body_gc_drops_orphan_hashes() {
     let _env = CIS_ENV_LOCK.lock().unwrap();
     use cis_core::{

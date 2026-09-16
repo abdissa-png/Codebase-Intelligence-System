@@ -171,7 +171,7 @@ impl GraphStore for JsonGraphStore {
 #[cfg(feature = "body-sqlite")]
 mod sqlite {
     use super::*;
-    use rusqlite::{params, Connection};
+    use rusqlite::{params, Connection, OptionalExtension};
 
     use crate::graph::{EdgeType, Language, NodeKind, RevisionStatus, SourceSpan, SourceType};
 
@@ -228,6 +228,27 @@ mod sqlite {
         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_identity_id);
     ";
 
+    const FTS_SCHEMA: &str = "
+        CREATE VIRTUAL TABLE IF NOT EXISTS revisions_fts USING fts5(
+            qualified_name,
+            content='revisions',
+            content_rowid='rowid',
+            tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS revisions_fts_ai AFTER INSERT ON revisions BEGIN
+            INSERT INTO revisions_fts(rowid, qualified_name) VALUES (new.rowid, new.qualified_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS revisions_fts_ad AFTER DELETE ON revisions BEGIN
+            INSERT INTO revisions_fts(revisions_fts, rowid, qualified_name)
+                VALUES('delete', old.rowid, old.qualified_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS revisions_fts_au AFTER UPDATE ON revisions BEGIN
+            INSERT INTO revisions_fts(revisions_fts, rowid, qualified_name)
+                VALUES('delete', old.rowid, old.qualified_name);
+            INSERT INTO revisions_fts(rowid, qualified_name) VALUES (new.rowid, new.qualified_name);
+        END;
+    ";
+
     pub struct SqliteGraphStore {
         conn: std::sync::Mutex<Connection>,
     }
@@ -246,9 +267,28 @@ mod sqlite {
                 .map_err(|e| io::Error::other(e.to_string()))?;
             conn.execute_batch(SCHEMA)
                 .map_err(|e| io::Error::other(e.to_string()))?;
+            Self::ensure_fts(&conn);
             Ok(Self {
                 conn: std::sync::Mutex::new(conn),
             })
+        }
+
+        fn ensure_fts(conn: &Connection) {
+            if conn.execute_batch(FTS_SCHEMA).is_err() {
+                return;
+            }
+            let rev_n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))
+                .unwrap_or(0);
+            let fts_n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM revisions_fts", [], |r| r.get(0))
+                .unwrap_or(0);
+            if rev_n > 0 && fts_n == 0 {
+                let _ = conn.execute(
+                    "INSERT INTO revisions_fts(revisions_fts) VALUES('rebuild')",
+                    [],
+                );
+            }
         }
 
         fn with_conn<F, T>(&self, f: F) -> io::Result<T>
@@ -380,6 +420,22 @@ mod sqlite {
                 .replace('%', "\\%")
                 .replace('_', "\\_");
             format!("%{escaped}%")
+        }
+
+        fn fts_phrase(needle: &str) -> String {
+            format!("\"{}\"", needle.replace('"', "\"\""))
+        }
+
+        fn fts_ready(conn: &Connection) -> bool {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'revisions_fts'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
         }
 
         /// Indexed PK lookup — does not hydrate the graph.
@@ -787,10 +843,40 @@ mod sqlite {
             }
             let pattern = Self::like_contains(needle);
             let mut out = Vec::new();
+            if needle.chars().count() >= 3 {
+                match self.query_revisions_qn_fts(chain, needle) {
+                    Ok(rows) => out = rows,
+                    Err(_) => self.with_conn(|conn| {
+                        Self::query_revisions_qn_like(conn, chain, &pattern, &mut out)
+                    })?,
+                }
+            } else {
+                self.with_conn(|conn| {
+                    Self::query_revisions_qn_like(conn, chain, &pattern, &mut out)
+                })?;
+            }
+            crate::graph_view::sort_revisions_qn(&mut out);
+            if limit > 0 {
+                out.truncate(limit);
+            }
+            Ok(out)
+        }
+
+        fn query_revisions_qn_fts(
+            &self,
+            chain: &[BranchId],
+            needle: &str,
+        ) -> io::Result<Vec<NodeRevision>> {
+            let phrase = Self::fts_phrase(needle);
+            let mut out = Vec::new();
             self.with_conn(|conn| {
+                if !Self::fts_ready(conn) {
+                    return Err(io::Error::other("revisions_fts missing"));
+                }
                 let sql = format!(
                     "SELECT {} FROM revisions
-                     WHERE branch_id = ?1 AND qualified_name LIKE ?2 ESCAPE '\\'",
+                     WHERE branch_id = ?1
+                       AND rowid IN (SELECT rowid FROM revisions_fts WHERE revisions_fts MATCH ?2)",
                     Self::REV_COLS
                 );
                 let mut stmt = conn
@@ -798,7 +884,7 @@ mod sqlite {
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 for branch in chain {
                     let iter = stmt
-                        .query_map(params![branch.0.as_slice(), pattern.as_str()], |row| {
+                        .query_map(params![branch.0.as_slice(), phrase.as_str()], |row| {
                             Ok((
                                 row.get::<_, Vec<u8>>(0)?,
                                 row.get::<_, Vec<u8>>(1)?,
@@ -824,11 +910,50 @@ mod sqlite {
                 }
                 Ok(())
             })?;
-            crate::graph_view::sort_revisions_qn(&mut out);
-            if limit > 0 {
-                out.truncate(limit);
-            }
             Ok(out)
+        }
+
+        fn query_revisions_qn_like(
+            conn: &Connection,
+            chain: &[BranchId],
+            pattern: &str,
+            out: &mut Vec<NodeRevision>,
+        ) -> io::Result<()> {
+            let sql = format!(
+                "SELECT {} FROM revisions
+                 WHERE branch_id = ?1 AND qualified_name LIKE ?2 ESCAPE '\\'",
+                Self::REV_COLS
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            for branch in chain {
+                let iter = stmt
+                    .query_map(params![branch.0.as_slice(), pattern], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, Vec<u8>>(9)?,
+                        ))
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                for r in iter {
+                    let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(rev) =
+                        Self::map_revision_tuple(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)?
+                    {
+                        out.push(rev);
+                    }
+                }
+            }
+            Ok(())
         }
 
         pub fn query_inbound_edges(
@@ -1818,5 +1943,43 @@ mod sqlite_store_tests {
             LOAD_INTO_CALLS.load(std::sync::atomic::Ordering::SeqCst),
             before
         );
+    }
+
+    #[test]
+    fn fts_substring_matches_ram_contains() {
+        use crate::graph_view::GraphView;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = InMemoryGraph::default();
+        g.put_identity(NodeIdentity {
+            identity_id: IdentityId([1; 16]),
+            kind: NodeKind::Function,
+        });
+        let mut r = rev(1, Language::Python);
+        r.qualified_name = "pkg.alpha_helper".into();
+        g.put_revision(r);
+        g.put_identity(NodeIdentity {
+            identity_id: IdentityId([2; 16]),
+            kind: NodeKind::Function,
+        });
+        let mut r2 = rev(2, Language::Python);
+        r2.qualified_name = "pkg.other".into();
+        g.put_revision(r2);
+
+        let store = SqliteGraphStore::open(dir.path()).unwrap();
+        store.save_snapshot(&g).unwrap();
+        let chain = [BranchId([0u8; 16])];
+        let needle = "lph";
+        let ram: Vec<_> = GraphView::find_revisions_qn_contains(&g, &chain, needle, 0)
+            .into_iter()
+            .map(|x| x.revision_id)
+            .collect();
+        let sql: Vec<_> = GraphView::find_revisions_qn_contains(&store, &chain, needle, 0)
+            .into_iter()
+            .map(|x| x.revision_id)
+            .collect();
+        assert_eq!(ram, sql, "FTS substring hits must match RAM contains");
+        assert_eq!(ram.len(), 1);
+        assert_eq!(ram[0], NodeRevisionId([1; 16]));
     }
 }

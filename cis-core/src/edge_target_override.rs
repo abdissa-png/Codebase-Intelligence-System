@@ -1,4 +1,8 @@
 //! **EdgeTargetOverride** KV (`eto:{branch}:{source_rev}:{edge_id}`) — **§01.7.1a**.
+//!
+//! Overrides are **process-local**: `eto:` is not a durable KV prefix. A restart
+//! drops them even when `CIS_KV_BACKEND=sqlite`. Queries inherit parent-branch
+//! overrides in-process via ancestry walk; they are not copied on fork.
 
 use std::sync::Arc;
 
