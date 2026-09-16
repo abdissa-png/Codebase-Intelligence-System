@@ -102,6 +102,10 @@ mod vector_cleanup_queue;
 mod vector_cleanup_worker;
 mod vector_backend;
 mod vector_store;
+#[cfg(feature = "body-sqlite")]
+mod sqlite_wal;
+#[cfg(feature = "body-sqlite")]
+mod sqlite_vector;
 
 pub use body_blob::{
     bodies_dir, bodies_db_path, body_backend_from_env, body_blob_path, body_store_with_blobs,
@@ -283,10 +287,17 @@ pub use pre_write_snapshot::PreWriteSnapshotStore;
 pub use persistence::{
     cis_dir, defer_vector_snapshot_load, graph_snapshot_path, kv_snapshot_path, load_kv_snapshot,
     load_state_from_cis_dir, load_vector_into, load_workspace_into, open_persisted_coordinator,
-    open_workspace_kv,
+    open_workspace_kv, open_workspace_wal,
     save_graph_snapshot, save_kv_snapshot,
     save_vector_snapshot, save_workspace_snapshots, snapshot_persist_enabled,
     vector_snapshot_path, wal_path, PersistenceLoadReport, VectorSnapshot,
+};
+#[cfg(feature = "body-sqlite")]
+pub use sqlite_wal::{wal_backend_from_env, wal_db_path, wal_json_export_enabled, SqliteMutationLog, WalBackendKind};
+#[cfg(feature = "body-sqlite")]
+pub use sqlite_vector::{
+    vector_backend_from_env, vector_json_export_enabled, vectors_db_path, SqliteVectorStore,
+    VectorBackendKind,
 };
 pub use policy_watcher::{
     ActiveRankingPolicy, PolicyBootstrapError, PolicyFileReloader, PolicyReloadOutcome,

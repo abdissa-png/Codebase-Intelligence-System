@@ -40,6 +40,12 @@ fn clear_cis_integration_test_env() {
     std::env::remove_var("CIS_GRAPH_BACKEND");
     std::env::remove_var("CIS_KV_BACKEND");
     std::env::remove_var("CIS_KV_JSON_EXPORT");
+    std::env::remove_var("CIS_WAL_BACKEND");
+    std::env::remove_var("CIS_WAL_JSON_EXPORT");
+    std::env::remove_var("CIS_VECTOR_BACKEND");
+    std::env::remove_var("CIS_VECTOR_JSON_EXPORT");
+    std::env::remove_var("CIS_DEFER_VECTOR_LOAD");
+    std::env::remove_var("CIS_GRAPH_JSON_EXPORT");
 }
 
 /// Phase 4 — sqlite coordinator boot must not `load_into` / `from_snapshot`.
@@ -461,6 +467,90 @@ fn sqlite_backends_survive_restart() {
     std::env::remove_var("CIS_BODY_BACKEND");
     std::env::remove_var("CIS_METADATA_BACKEND");
     std::env::remove_var("CIS_KV_BACKEND");
+}
+
+#[test]
+#[cfg(feature = "body-sqlite")]
+fn sqlite_wal_and_vectors_survive_restart() {
+    let _env = CIS_ENV_LOCK.lock().unwrap();
+    clear_cis_integration_test_env();
+    std::env::remove_var("CIS_WAL_MEMORY");
+    std::env::set_var("CIS_GRAPH_BACKEND", "sqlite");
+    std::env::set_var("CIS_WAL_BACKEND", "sqlite");
+    std::env::set_var("CIS_VECTOR_BACKEND", "sqlite");
+    let root = temp_repo("sqlite-wal-vec");
+    fs::write(root.join("persist.py"), "def persistMe():\n    return 1\n").unwrap();
+    let chunk = [9u8; 32];
+    let body = [8u8; 32];
+    let wal_records;
+
+    {
+        let rt = cis_core::CisMcpRuntime::new_dev(&root.to_string_lossy());
+        rt.reindex_python_paths(&["persist.py"]).expect("ingest");
+        rt.vector_store().register(chunk, body);
+        rt.vector_store()
+            .set_embedding(body, vec![0.25, 0.75], "phase5");
+        rt.save_workspace(0).expect("persist");
+        wal_records = rt.wal().record_count();
+        assert!(wal_records > 0, "ingest must append WAL records");
+        let cis = cis_core::cis_dir(&root);
+        assert!(
+            cis_core::wal_db_path(&cis).is_file(),
+            "wal.db should exist with CIS_WAL_BACKEND=sqlite"
+        );
+        assert!(
+            cis_core::vectors_db_path(&cis).is_file(),
+            "vectors.db should exist with CIS_VECTOR_BACKEND=sqlite"
+        );
+        assert!(
+            !cis.join("wal.json").exists(),
+            "sqlite WAL must not rewrite wal.json by default"
+        );
+        assert!(
+            !cis.join("vector.json").exists(),
+            "sqlite vectors must not rewrite vector.json by default"
+        );
+    }
+
+    {
+        std::env::set_var("CIS_GRAPH_BACKEND", "sqlite");
+        std::env::set_var("CIS_WAL_BACKEND", "sqlite");
+        std::env::set_var("CIS_VECTOR_BACKEND", "sqlite");
+        let rt = cis_core::CisMcpRuntime::new_dev(&root.to_string_lossy());
+        assert_eq!(
+            rt.wal().record_count(),
+            wal_records,
+            "WAL records must survive in wal.db without wal.json"
+        );
+        let rep = rt.load_persisted_workspace();
+        assert!(rep.graph_loaded, "graph must load after sqlite restart");
+        assert!(
+            rt.vector_store().has_chunk(&chunk),
+            "vector chunk must survive in vectors.db"
+        );
+        assert_eq!(
+            rt.vector_store()
+                .vector_for_body(&body)
+                .expect("embedding")
+                .vec,
+            vec![0.25, 0.75]
+        );
+        let hits = rt
+            .find_symbol(0, "persistMe", None, 8, false)
+            .expect("find_symbol");
+        assert!(
+            hits.matches
+                .iter()
+                .any(|m| m.qualified_name.contains("persistMe")),
+            "symbol must survive sqlite wal+vector restart"
+        );
+        let cis = cis_core::cis_dir(&root);
+        assert!(!cis.join("wal.json").exists());
+        assert!(!cis.join("vector.json").exists());
+    }
+    std::env::remove_var("CIS_GRAPH_BACKEND");
+    std::env::remove_var("CIS_WAL_BACKEND");
+    std::env::remove_var("CIS_VECTOR_BACKEND");
 }
 
 #[test]

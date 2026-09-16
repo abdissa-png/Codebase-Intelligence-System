@@ -820,30 +820,12 @@ impl CisMcpRuntime {
         let _ = std::fs::create_dir_all(&cis);
         let kv = std::sync::Arc::new(crate::persistence::open_workspace_kv(&cis));
         kv.set_fault_injector(std::sync::Arc::clone(&injector));
-        let wal: std::sync::Arc<dyn MutationLogStore> = {
-            if std::env::var_os("CIS_WAL_MEMORY").is_some_and(|v| v == "1") {
-                std::sync::Arc::new(cis_wal::MutationLog::new())
-            } else {
-                let wp = crate::persistence::wal_path(&cis);
-                if wp.exists() {
-                    match cis_wal::DurableMutationLog::open(&wp) {
-                        Ok(d) => std::sync::Arc::new(d),
-                        Err(e) => {
-                            // Fail closed: do not silently empty WAL history.
-                            panic!(
-                                "cis: corrupt or unreadable WAL at {}: {e} — refusing to start with empty log",
-                                wp.display()
-                            );
-                        }
-                    }
-                } else {
-                    match cis_wal::DurableMutationLog::open(&wp) {
-                        Ok(d) => std::sync::Arc::new(d),
-                        Err(_) => std::sync::Arc::new(cis_wal::MutationLog::new()),
-                    }
-                }
-            }
-        };
+        let wal = crate::persistence::open_workspace_wal(&cis).unwrap_or_else(|e| {
+            panic!(
+                "cis: corrupt or unreadable WAL under {}: {e} — refusing to start with empty log",
+                cis.display()
+            );
+        });
         let coordinator = std::sync::Arc::new(WriteCoordinator::open(
             wal,
             Some(CoordinatorPersistence { cis_dir: cis }),
@@ -2245,6 +2227,11 @@ impl CisMcpRuntime {
                 eprintln!("cis-mcp: save_workspace: {:?}", e);
                 AuthError::InvalidInput
             })?;
+        drop(g);
+        if let Err(e) = self.coordinator.wal().flush_persistent() {
+            eprintln!("cis-mcp: save_workspace WAL flush: {e}");
+            return Err(AuthError::InvalidInput);
+        }
         let stale_confirm_sidecars_removed = self.sweep_stale_confirm_sidecars();
         self.audit.record_sync(session_id, "save_workspace");
         Ok(SaveWorkspaceResponse {

@@ -16,8 +16,7 @@ use crate::graph::{InMemoryGraph, RevisionStatus};
 use crate::shared_graph::SharedInMemoryGraph;
 use crate::graph_mutation::GraphMutationSet;
 use crate::persistence::{
-    graph_snapshot_path, load_state_from_cis_dir, save_vector_snapshot,
-    vector_snapshot_path, PersistenceLoadReport,
+    load_state_from_cis_dir, save_vector_snapshot, vector_snapshot_path, PersistenceLoadReport,
 };
 use crate::reconciliation::RecoveryReport;
 use crate::saga::MergeSagaOrchestrator;
@@ -105,6 +104,7 @@ impl WriteCoordinator {
         #[cfg(feature = "body-sqlite")]
         let mut sql_graph = None;
         if let Some(ref p) = persistence {
+            let _ = crate::persistence::attach_vector_store(&p.cis_dir, &vector);
             #[cfg(feature = "body-sqlite")]
             {
                 if crate::graph_store::graph_backend_from_env()
@@ -114,7 +114,6 @@ impl WriteCoordinator {
                         Ok(store) => {
                             sqlite_primary = true;
                             sql_graph = Some(Arc::new(store));
-                            let _ = crate::persistence::load_vector_into(&p.cis_dir, &vector);
                         }
                         Err(e) => {
                             eprintln!(
@@ -241,6 +240,11 @@ impl WriteCoordinator {
         }
         let mut g = self.graph.write();
         report = load_state_from_cis_dir(&p.cis_dir, &mut *g, &self.vector);
+        drop(g);
+        let vrep = crate::persistence::attach_vector_store(&p.cis_dir, &self.vector);
+        report.vector_loaded = vrep.vector_loaded;
+        report.vector_chunks = vrep.vector_chunks;
+        report.vector_error = vrep.vector_error;
         report
     }
 
@@ -322,6 +326,20 @@ impl WriteCoordinator {
         let Some(ref p) = self.persistence else {
             return Ok(());
         };
+        #[cfg(feature = "body-sqlite")]
+        if crate::sqlite_vector::vector_backend_from_env()
+            == crate::sqlite_vector::VectorBackendKind::Sqlite
+        {
+            self.vector.checkpoint_persist();
+            if crate::sqlite_vector::vector_json_export_enabled() {
+                if !force && self.should_skip_auto_snapshot_flush() {
+                    return Ok(());
+                }
+                save_vector_snapshot(&vector_snapshot_path(&p.cis_dir), &self.vector)
+                    .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
+            }
+            return Ok(());
+        }
         if !force && self.should_skip_auto_snapshot_flush() {
             return Ok(());
         }
@@ -793,6 +811,7 @@ mod tests {
     use crate::graph::{
         Language, NodeIdentity, NodeKind, NodeRevision, RevisionStatus,
     };
+    use crate::persistence::graph_snapshot_path;
     use crate::saga::MergeSagaOrchestrator;
     use cis_wal::{BranchId, IdentityId};
 

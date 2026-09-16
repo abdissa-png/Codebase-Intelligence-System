@@ -22,8 +22,12 @@ fn usage() {
     eprintln!("  CIS_METADATA_BACKEND=json|sqlite (default: json)");
     eprintln!("  CIS_KV_BACKEND=json|sqlite     (default: json)");
     eprintln!("  CIS_GRAPH_BACKEND=json|sqlite  (default: json)");
+    eprintln!("  CIS_WAL_BACKEND=json|sqlite    (default: json)");
+    eprintln!("  CIS_VECTOR_BACKEND=json|sqlite (default: json)");
     eprintln!("  CIS_GRAPH_SHADOW=1             debug: compare SQL GraphView vs RAM overlay");
     eprintln!("  CIS_GRAPH_JSON_EXPORT=1        also write graph.json when backend is sqlite");
+    eprintln!("  CIS_WAL_JSON_EXPORT=1          also write wal.json when backend is sqlite");
+    eprintln!("  CIS_VECTOR_JSON_EXPORT=1       also write vector.json when backend is sqlite");
     eprintln!("  CIS_MIGRATION_STRICT=1         fail if sqlite feature/backend missing");
 }
 

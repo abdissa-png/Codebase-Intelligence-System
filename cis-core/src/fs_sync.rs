@@ -342,6 +342,9 @@ pub fn reindex_paths_on_coordinator(
     sync_revision_index_from_graph(&g, revision_index, kv.as_ref(), branch);
     drop(g);
     if reindex_persist_snapshots_enabled() {
+        if let Err(e) = coord.wal().flush_persistent() {
+            return Err(CoordinatorError::Persist(e.to_string()));
+        }
         let g = coord.graph().read();
         save_workspace_snapshots(&cis_dir(&root), &g, coord.vector(), kv.as_ref())
             .map_err(|e| CoordinatorError::Persist(e.to_string()))?;

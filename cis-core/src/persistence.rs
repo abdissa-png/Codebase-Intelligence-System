@@ -279,6 +279,7 @@ pub fn load_state_from_cis_dir(
     graph: &mut InMemoryGraph,
     vector: &InMemoryVectorStore,
 ) -> PersistenceLoadReport {
+    let _ = vector;
     let mut report = PersistenceLoadReport::default();
     let t_graph = std::time::Instant::now();
     match crate::graph_store::load_graph_with_backend(cis, graph) {
@@ -314,30 +315,35 @@ pub fn load_state_from_cis_dir(
             t_graph.elapsed().as_secs_f64()
         );
     }
-    let vpath = vector_snapshot_path(cis);
-    if vpath.exists() && !defer_vector_snapshot_load() {
-        let t_vec = std::time::Instant::now();
-        match load_vector_snapshot(&vpath) {
-            Ok(snap) => {
-                report.vector_loaded = true;
-                report.vector_chunks = snap.chunk_count();
-                snap.restore_into(vector);
-                eprintln!(
-                    "cisd: loaded vector snapshot ({} chunks) in {:.1}s",
-                    report.vector_chunks,
-                    t_vec.elapsed().as_secs_f64()
-                );
-            }
-            Err(e) => report.vector_error = Some(e.to_string()),
-        }
-    } else if vpath.exists() {
-        eprintln!("cisd: deferring vector.json load (CIS_DEFER_VECTOR_LOAD)");
-    }
     report
 }
 
-/// Load only `vector.json` into an existing vector store (after deferred startup).
+/// Load vectors from the active backend (`vectors.db` or `vector.json`).
 pub fn load_vector_into(cis: &Path, vector: &InMemoryVectorStore) -> PersistenceLoadReport {
+    #[cfg(feature = "body-sqlite")]
+    {
+        if crate::sqlite_vector::vector_backend_from_env()
+            == crate::sqlite_vector::VectorBackendKind::Sqlite
+        {
+            match crate::sqlite_vector::SqliteVectorStore::open(cis) {
+                Ok(sql) => {
+                    let mut report = PersistenceLoadReport::default();
+                    match sql.load_into(vector) {
+                        Ok(n) => {
+                            report.vector_loaded = n > 0 || sql.vector_count() > 0;
+                            report.vector_chunks = n;
+                        }
+                        Err(e) => report.vector_error = Some(e.to_string()),
+                    }
+                    vector.set_persist(std::sync::Arc::new(sql));
+                    return report;
+                }
+                Err(e) => eprintln!(
+                    "cis: CIS_VECTOR_BACKEND=sqlite load failed ({e}); trying vector.json"
+                ),
+            }
+        }
+    }
     let mut report = PersistenceLoadReport::default();
     let vpath = vector_snapshot_path(cis);
     if !vpath.exists() {
@@ -371,7 +377,29 @@ pub fn save_workspace_snapshots(
     } else {
         save_graph_with_backend(cis, graph)?;
     }
-    save_vector_snapshot(&vector_snapshot_path(cis), vector)?;
+    if vector_sqlite_enabled() {
+        #[cfg(feature = "body-sqlite")]
+        {
+            if let Err(e) = crate::sqlite_vector::SqliteVectorStore::open(cis)
+                .and_then(|sql| sql.checkpoint())
+            {
+                eprintln!("cis: sqlite vector checkpoint failed ({e})");
+            }
+            if crate::sqlite_vector::vector_json_export_enabled() && vector.len() > 0 {
+                save_vector_snapshot(&vector_snapshot_path(cis), vector)?;
+            }
+        }
+    } else {
+        save_vector_snapshot(&vector_snapshot_path(cis), vector)?;
+    }
+    if wal_sqlite_enabled() {
+        #[cfg(feature = "body-sqlite")]
+        {
+            if let Err(e) = crate::sqlite_wal::SqliteMutationLog::checkpoint_file(cis) {
+                eprintln!("cis: sqlite WAL checkpoint failed ({e})");
+            }
+        }
+    }
     save_kv_snapshot(&kv_snapshot_path(cis), kv)?;
     Ok(())
 }
@@ -393,16 +421,16 @@ pub fn load_workspace_into(
     if crate::graph_store::graph_backend_from_env()
         == crate::graph_store::GraphBackendKind::Sqlite
     {
-        let sub = crate::persistence::load_vector_into(&cis, vector);
-        report.vector_loaded = sub.vector_loaded;
-        report.vector_chunks = sub.vector_chunks;
-        report.vector_error = sub.vector_error;
         report.graph_loaded = true;
     } else {
         let mut g = graph.write();
         let sub = load_state_from_cis_dir(&cis, &mut *g, vector);
         report = sub;
     }
+    let vsub = attach_vector_store(&cis, vector);
+    report.vector_loaded = vsub.vector_loaded;
+    report.vector_chunks = vsub.vector_chunks;
+    report.vector_error = vsub.vector_error;
     if kv.is_sqlite_backed() {
         let n = kv.durable_row_count();
         if n > 0 {
@@ -470,6 +498,150 @@ fn hydrate_ris_from_metadata_store(cis: &Path, kv: &MemoryKv) -> io::Result<usiz
     Ok(0)
 }
 
+/// Open the workspace mutation log: SQLite when `CIS_WAL_BACKEND=sqlite`, else `wal.json`.
+///
+/// `CIS_WAL_MEMORY=1` returns an in-memory log (tests). Empty `wal.db` imports `wal.json` once.
+pub fn open_workspace_wal(cis: &Path) -> io::Result<Arc<dyn MutationLogStore>> {
+    if std::env::var_os("CIS_WAL_MEMORY").is_some_and(|v| v == "1") {
+        return Ok(Arc::new(MutationLog::new()));
+    }
+    #[cfg(feature = "body-sqlite")]
+    {
+        if crate::sqlite_wal::wal_backend_from_env() == crate::sqlite_wal::WalBackendKind::Sqlite {
+            return crate::sqlite_wal::SqliteMutationLog::open(cis)
+                .map(|w| Arc::new(w) as Arc<dyn MutationLogStore>);
+        }
+    }
+    #[cfg(not(feature = "body-sqlite"))]
+    {
+        if std::env::var_os("CIS_WAL_BACKEND")
+            .is_some_and(|v| v == "sqlite" || v == "sqlite3")
+        {
+            eprintln!(
+                "cis: CIS_WAL_BACKEND=sqlite requires --features body-sqlite; using wal.json"
+            );
+        }
+    }
+    let path = wal_path(cis);
+    DurableMutationLog::open(&path).map(|w| Arc::new(w) as Arc<dyn MutationLogStore>)
+}
+
+/// Attach SQLite vector persistence (write-through) and/or load `vector.json`.
+pub fn attach_vector_store(cis: &Path, vector: &InMemoryVectorStore) -> PersistenceLoadReport {
+    #[cfg(feature = "body-sqlite")]
+    {
+        if crate::sqlite_vector::vector_backend_from_env()
+            == crate::sqlite_vector::VectorBackendKind::Sqlite
+        {
+            match crate::sqlite_vector::SqliteVectorStore::open(cis) {
+                Ok(sql) => {
+                    if sql.is_empty() {
+                        let vpath = vector_snapshot_path(cis);
+                        if vpath.is_file() {
+                            match load_vector_snapshot(&vpath) {
+                                Ok(snap) => {
+                                    if let Err(e) = import_vector_snapshot_sql(&sql, &snap) {
+                                        eprintln!(
+                                            "cis: vector.json import into sqlite failed ({e})"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "cis: vector.json import into sqlite failed ({e})"
+                                ),
+                            }
+                        }
+                    }
+                    let mut report = PersistenceLoadReport::default();
+                    if !defer_vector_snapshot_load() {
+                        match sql.load_into(vector) {
+                            Ok(n) => {
+                                report.vector_loaded = n > 0 || sql.vector_count() > 0;
+                                report.vector_chunks = n;
+                            }
+                            Err(e) => report.vector_error = Some(e.to_string()),
+                        }
+                    }
+                    vector.set_persist(std::sync::Arc::new(sql));
+                    return report;
+                }
+                Err(e) => eprintln!(
+                    "cis: CIS_VECTOR_BACKEND=sqlite open failed ({e}); using vector.json"
+                ),
+            }
+        }
+    }
+    #[cfg(not(feature = "body-sqlite"))]
+    {
+        if std::env::var_os("CIS_VECTOR_BACKEND")
+            .is_some_and(|v| v == "sqlite" || v == "sqlite3")
+        {
+            eprintln!(
+                "cis: CIS_VECTOR_BACKEND=sqlite requires --features body-sqlite; using vector.json"
+            );
+        }
+    }
+    if defer_vector_snapshot_load() {
+        let vpath = vector_snapshot_path(cis);
+        if vpath.exists() {
+            eprintln!("cisd: deferring vector.json load (CIS_DEFER_VECTOR_LOAD)");
+        }
+        return PersistenceLoadReport::default();
+    }
+    load_vector_into(cis, vector)
+}
+
+#[cfg(feature = "body-sqlite")]
+fn import_vector_snapshot_sql(
+    sql: &crate::sqlite_vector::SqliteVectorStore,
+    snap: &VectorSnapshot,
+) -> io::Result<()> {
+    match snap {
+        VectorSnapshot::V2(s) => sql.import_snapshot(s),
+        VectorSnapshot::V1 { chunks, .. } => {
+            let s = crate::vector_store::VectorStoreSnapshot {
+                version: VECTOR_STORE_SNAPSHOT_VERSION,
+                chunks: chunks
+                    .iter()
+                    .map(|(c, _)| crate::vector_store::VectorChunkRecord {
+                        chunk_id: *c,
+                        body_hash: *c,
+                    })
+                    .collect(),
+                vectors: chunks
+                    .iter()
+                    .map(|(c, e)| crate::vector_store::VectorBodyRecord {
+                        body_hash: *c,
+                        embedding: e.clone(),
+                        model_id: "legacy".into(),
+                    })
+                    .collect(),
+            };
+            sql.import_snapshot(&s)
+        }
+    }
+}
+
+fn vector_sqlite_enabled() -> bool {
+    #[cfg(feature = "body-sqlite")]
+    {
+        return crate::sqlite_vector::vector_backend_from_env()
+            == crate::sqlite_vector::VectorBackendKind::Sqlite;
+    }
+    #[cfg(not(feature = "body-sqlite"))]
+    false
+}
+
+fn wal_sqlite_enabled() -> bool {
+    #[cfg(feature = "body-sqlite")]
+    {
+        return crate::sqlite_wal::wal_backend_from_env()
+            == crate::sqlite_wal::WalBackendKind::Sqlite;
+    }
+    #[cfg(not(feature = "body-sqlite"))]
+    false
+}
+
 /// Open durable WAL + snapshot-backed **`WriteCoordinator`** for a repository root.
 pub fn open_persisted_coordinator(
     repo_root: impl AsRef<Path>,
@@ -477,16 +649,8 @@ pub fn open_persisted_coordinator(
     let cis = cis_dir(&repo_root);
     std::fs::create_dir_all(&cis)?;
     let t0 = std::time::Instant::now();
-    let wal: Arc<dyn MutationLogStore> = if std::env::var_os("CIS_WAL_MEMORY")
-        .is_some_and(|v| v == "1")
-    {
-        Arc::new(MutationLog::new())
-    } else {
-        let path = wal_path(&cis);
-        let w = DurableMutationLog::open(&path)?;
-        eprintln!("cisd: wal open in {:.1}s", t0.elapsed().as_secs_f64());
-        Arc::new(w)
-    };
+    let wal = open_workspace_wal(&cis)?;
+    eprintln!("cisd: wal open in {:.1}s", t0.elapsed().as_secs_f64());
     let t1 = std::time::Instant::now();
     let coord = Arc::new(WriteCoordinator::open(
         wal,
@@ -692,5 +856,32 @@ mod tests {
         assert!(imported.is_sqlite_backed());
         assert_eq!(imported.get("ri:aa:01"), Some(vec![7]));
         assert!(imported.get("eto:skip").is_none());
+    }
+
+    #[cfg(feature = "body-sqlite")]
+    #[test]
+    fn sqlite_vector_snapshots_skip_json_unless_exported() {
+        std::env::remove_var("CIS_VECTOR_JSON_EXPORT");
+        std::env::set_var("CIS_VECTOR_BACKEND", "sqlite");
+        let dir = tempfile::tempdir().unwrap();
+        let vector = InMemoryVectorStore::new();
+        let sql = crate::sqlite_vector::SqliteVectorStore::open(dir.path()).unwrap();
+        vector.set_persist(std::sync::Arc::new(sql));
+        vector.register([1u8; 32], [2u8; 32]);
+        vector.set_embedding([2u8; 32], vec![0.5], "m");
+        let graph = InMemoryGraph::default();
+        let kv = MemoryKv::new();
+        save_workspace_snapshots(dir.path(), &graph, &vector, &kv).unwrap();
+        assert!(
+            !vector_snapshot_path(dir.path()).exists(),
+            "sqlite vectors must not rewrite vector.json by default"
+        );
+        assert!(crate::sqlite_vector::vectors_db_path(dir.path()).is_file());
+
+        std::env::set_var("CIS_VECTOR_JSON_EXPORT", "1");
+        save_workspace_snapshots(dir.path(), &graph, &vector, &kv).unwrap();
+        std::env::remove_var("CIS_VECTOR_JSON_EXPORT");
+        std::env::remove_var("CIS_VECTOR_BACKEND");
+        assert!(vector_snapshot_path(dir.path()).is_file());
     }
 }

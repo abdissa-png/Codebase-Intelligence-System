@@ -35,9 +35,41 @@ struct VectorStoreInner {
     refcount: HashMap<[u8; 32], usize>,
 }
 
-#[derive(Clone, Default, Debug)]
+/// Optional write-through persistence (SQLite). Invoked after RAM mutation.
+pub trait VectorPersistHook: Send + Sync {
+    fn on_register(&self, chunk_id: [u8; 32], body_hash: [u8; 32]);
+    fn on_set_embedding(&self, body_hash: [u8; 32], embedding: &[f32], model_id: &str);
+    fn on_delete_chunks(&self, ids: &[[u8; 32]]);
+    fn checkpoint(&self) {}
+}
+
 pub struct InMemoryVectorStore {
     inner: Arc<Mutex<VectorStoreInner>>,
+    persist: Arc<Mutex<Option<Arc<dyn VectorPersistHook>>>>,
+}
+
+impl Default for InMemoryVectorStore {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VectorStoreInner::default())),
+            persist: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl Clone for InMemoryVectorStore {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            persist: Arc::clone(&self.persist),
+        }
+    }
+}
+
+impl std::fmt::Debug for InMemoryVectorStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryVectorStore").finish_non_exhaustive()
+    }
 }
 
 impl InMemoryVectorStore {
@@ -45,30 +77,55 @@ impl InMemoryVectorStore {
         Self::default()
     }
 
+    /// Attach a write-through persist hook (shared across clones).
+    pub fn set_persist(&self, hook: Arc<dyn VectorPersistHook>) {
+        *self.persist.lock().unwrap() = Some(hook);
+    }
+
+    fn persist_hook(&self) -> Option<Arc<dyn VectorPersistHook>> {
+        self.persist.lock().unwrap().clone()
+    }
+
+    /// Checkpoint the persist backend (SQLite WAL `PASSIVE`, no-op for JSON).
+    pub fn checkpoint_persist(&self) {
+        if let Some(p) = self.persist_hook() {
+            p.checkpoint();
+        }
+    }
+
     /// Register a chunk referencing a body; embedding may be pending until worker fills it.
     pub fn register(&self, chunk_id: [u8; 32], body_hash: [u8; 32]) {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(prev) = g.chunk_to_body.insert(chunk_id, body_hash) {
-            if let Some(rc) = g.refcount.get_mut(&prev) {
-                *rc = rc.saturating_sub(1);
-                if *rc == 0 {
-                    g.refcount.remove(&prev);
-                    g.vectors.remove(&prev);
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(prev) = g.chunk_to_body.insert(chunk_id, body_hash) {
+                if let Some(rc) = g.refcount.get_mut(&prev) {
+                    *rc = rc.saturating_sub(1);
+                    if *rc == 0 {
+                        g.refcount.remove(&prev);
+                        g.vectors.remove(&prev);
+                    }
                 }
             }
+            *g.refcount.entry(body_hash).or_insert(0) += 1;
         }
-        *g.refcount.entry(body_hash).or_insert(0) += 1;
+        if let Some(p) = self.persist_hook() {
+            p.on_register(chunk_id, body_hash);
+        }
     }
 
     /// Store (or replace) the embedding for a content hash.
     pub fn set_embedding(&self, body_hash: [u8; 32], embedding: Vec<f32>, model_id: impl Into<String>) {
+        let model_id = model_id.into();
         self.inner.lock().unwrap().vectors.insert(
             body_hash,
             VectorEntry {
-                vec: embedding,
-                model_id: model_id.into(),
+                vec: embedding.clone(),
+                model_id: model_id.clone(),
             },
         );
+        if let Some(p) = self.persist_hook() {
+            p.on_set_embedding(body_hash, &embedding, &model_id);
+        }
     }
 
     /// Lookup embedding by content hash.
@@ -254,18 +311,23 @@ impl VectorChunkStore for InMemoryVectorStore {
     }
 
     fn delete_chunks(&self, ids: &[[u8; 32]]) -> Result<(), VectorDeleteError> {
-        let mut g = self.inner.lock().unwrap();
-        for cid in ids {
-            let Some(body_hash) = g.chunk_to_body.remove(cid) else {
-                continue;
-            };
-            if let Some(rc) = g.refcount.get_mut(&body_hash) {
-                *rc = rc.saturating_sub(1);
-                if *rc == 0 {
-                    g.refcount.remove(&body_hash);
-                    g.vectors.remove(&body_hash);
+        {
+            let mut g = self.inner.lock().unwrap();
+            for cid in ids {
+                let Some(body_hash) = g.chunk_to_body.remove(cid) else {
+                    continue;
+                };
+                if let Some(rc) = g.refcount.get_mut(&body_hash) {
+                    *rc = rc.saturating_sub(1);
+                    if *rc == 0 {
+                        g.refcount.remove(&body_hash);
+                        g.vectors.remove(&body_hash);
+                    }
                 }
             }
+        }
+        if let Some(p) = self.persist_hook() {
+            p.on_delete_chunks(ids);
         }
         Ok(())
     }
