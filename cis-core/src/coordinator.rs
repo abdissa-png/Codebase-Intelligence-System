@@ -558,23 +558,6 @@ impl WriteCoordinator {
         }
     }
 
-    /// Hydrate SQL into the RAM overlay for merge (full working copy).
-    pub fn hydrate_sql_into_overlay(&self) -> Result<(), CoordinatorError> {
-        #[cfg(feature = "body-sqlite")]
-        if self.sqlite_primary {
-            let Some(sql) = &self.sql_graph else {
-                return Ok(());
-            };
-            let mut g = self.graph.write();
-            if g.revision_count() > 0 {
-                return Ok(());
-            }
-            crate::graph_store::GraphStore::load_into(sql.as_ref(), &mut g)
-                .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
-        }
-        Ok(())
-    }
-
     pub fn vector(&self) -> &InMemoryVectorStore {
         &self.vector
     }

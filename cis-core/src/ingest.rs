@@ -307,12 +307,16 @@ pub fn apply_index_events_with_config(
                 continue;
             }
         };
-        let index = match indexer.index_file(&ev.path, &content) {
-            Ok(i) => i,
-            Err(_) => {
-                rep.parse_errors += 1;
-                continue;
-            }
+        // Reuse the closed-world pre-parse so ingest does not tree-sitter twice per file.
+        let index = match batch_indexes.get(&ev.path).cloned() {
+            Some(idx) => idx,
+            None => match indexer.index_file(&ev.path, &content) {
+                Ok(i) => i,
+                Err(_) => {
+                    rep.parse_errors += 1;
+                    continue;
+                }
+            },
         };
         if index.symbols.is_empty() {
             rep.skipped_empty_py += 1;

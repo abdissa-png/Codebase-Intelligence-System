@@ -26,6 +26,15 @@ fn indexer_corpus_recall_on_real_codebases() {
     std::env::set_var("CIS_SKIP_WORKSPACE_LOAD", "1");
     std::env::set_var("CIS_WAL_MEMORY", "1");
     std::env::set_var("CIS_REINDEX_PERSIST", "0");
+    struct RestoreEvalEnv;
+    impl Drop for RestoreEvalEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("CIS_SKIP_WORKSPACE_LOAD");
+            std::env::remove_var("CIS_WAL_MEMORY");
+            std::env::remove_var("CIS_REINDEX_PERSIST");
+        }
+    }
+    let _restore = RestoreEvalEnv;
 
     let cfg = EvalConfig::default();
     let report = run_builtin_suite(&cfg);

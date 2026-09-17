@@ -29,7 +29,7 @@ fs-notify = ["dep:notify"]
 # Phase 6 — external HTTP embedding API (OpenAI-compatible `/v1/embeddings`).
 api-embeddings = ["dep:minreq"]
 # Phase 7 — optional SQLite body blob backend (default: files under `.cis/bodies/`).
-body-sqlite = ["dep:rusqlite"]
+body-sqlite = ["dep:rusqlite", "dep:sqlite-vec"]
 # Test-only alias (dev-dependencies cannot enable optional deps directly in all cases).
 test-body-sqlite = ["body-sqlite"]
 
@@ -55,6 +55,7 @@ tree-sitter-c-sharp = { version = "=0.23.1", optional = true }
 notify = { version = "6", optional = true }
 minreq = { version = "=2.7.0", optional = true, features = ["https-rustls"] }
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
+sqlite-vec = { version = "=0.1.6", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
@@ -64,3 +65,8 @@ tempfile = "=3.13"
 name = "indexer_corpus_eval"
 path = "tests/indexer_corpus_eval.rs"
 required-features = ["tree-sitter"]
+
+[[test]]
+name = "store_matrix"
+path = "tests/store_matrix.rs"
+required-features = ["body-sqlite"]

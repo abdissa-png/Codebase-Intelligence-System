@@ -1,15 +1,19 @@
-//! SQLite-backed vector persistence (`CIS_VECTOR_BACKEND=sqlite`) in `.cis/vectors.db`.
+//! SQLite-backed vector persistence (`CIS_VECTOR_BACKEND=sqlite`) in `.cis/vectors.db`
+//! or unified `.cis/cis.db`.
 //!
 //! Chunks and embeddings are upserted incrementally. [`InMemoryVectorStore`] stays
-//! the query/ANN working set; `vector.json` is not rewritten unless JSON export is on.
+//! the query working set when loaded; ANN search can run on the durable `vec0` index
+//! (sqlite-vec) so `CIS_DEFER_VECTOR_LOAD` still has nearest-neighbor hits.
+//! `vector.json` is not rewritten unless JSON export is on.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::embedder::cosine_similarity;
 use crate::vector_store::{
     InMemoryVectorStore, VectorBodyRecord, VectorChunkRecord, VectorPersistHook,
     VectorStoreSnapshot, VECTOR_STORE_SNAPSHOT_VERSION,
@@ -27,6 +31,11 @@ const SCHEMA: &str = "
         body_hash BLOB NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_chunks_body ON chunks(body_hash);
+    CREATE INDEX IF NOT EXISTS idx_vectors_model_dim ON vectors(model_id, dim);
+    CREATE TABLE IF NOT EXISTS vec_rowids (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        body_hash BLOB NOT NULL UNIQUE
+    );
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +60,16 @@ pub fn vector_json_export_enabled() -> bool {
 }
 
 pub fn vectors_db_path(cis_dir: impl AsRef<Path>) -> PathBuf {
-    cis_dir.as_ref().join("vectors.db")
+    crate::sqlite_paths::sqlite_file(cis_dir.as_ref(), "vectors.db")
+}
+
+fn register_sqlite_vec() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
 }
 
 fn configure_conn(conn: &Connection) -> io::Result<()> {
@@ -63,6 +81,164 @@ fn configure_conn(conn: &Connection) -> io::Result<()> {
     conn.execute_batch(SCHEMA)
         .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(())
+}
+
+fn vec0_sql(dim: usize) -> String {
+    format!("CREATE VIRTUAL TABLE IF NOT EXISTS vec_ann USING vec0(embedding float[{dim}])")
+}
+
+fn ensure_vec0(conn: &Connection, dim: usize) -> rusqlite::Result<bool> {
+    if dim == 0 {
+        return Ok(false);
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_ann'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let want = format!("float[{dim}]");
+    if let Some(sql) = &existing {
+        if sql.contains(&want) {
+            return Ok(true);
+        }
+        conn.execute_batch("DROP TABLE IF EXISTS vec_ann; DELETE FROM vec_rowids;")?;
+    }
+    conn.execute_batch(&vec0_sql(dim))?;
+    Ok(true)
+}
+
+fn majority_vector_dim(conn: &Connection) -> Option<usize> {
+    conn.query_row(
+        "SELECT dim FROM vectors GROUP BY dim ORDER BY COUNT(*) DESC LIMIT 1",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
+    .and_then(|d| (d > 0).then_some(d as usize))
+}
+
+fn backfill_vec_ann(conn: &Connection) -> rusqlite::Result<Option<usize>> {
+    let Some(dim) = majority_vector_dim(conn) else {
+        return Ok(None);
+    };
+    if !ensure_vec0(conn, dim)? {
+        return Ok(None);
+    }
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_ann", [], |r| r.get(0))
+        .unwrap_or(0);
+    if n > 0 {
+        return Ok(Some(dim));
+    }
+    let mut stmt = conn.prepare("SELECT body_hash, embedding FROM vectors WHERE dim = ?1")?;
+    let rows = stmt.query_map(params![dim as i64], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    for row in rows {
+        let (hash, blob) = row?;
+        upsert_ann_row(conn, &hash, &blob)?;
+    }
+    Ok(Some(dim))
+}
+
+fn upsert_ann_row(conn: &Connection, body_hash: &[u8], embedding: &[u8]) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO vec_rowids (body_hash) VALUES (?1)
+         ON CONFLICT(body_hash) DO NOTHING",
+        params![body_hash],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM vec_rowids WHERE body_hash = ?1",
+        params![body_hash],
+        |r| r.get(0),
+    )?;
+    let _ = conn.execute("DELETE FROM vec_ann WHERE rowid = ?1", params![id]);
+    conn.execute(
+        "INSERT INTO vec_ann(rowid, embedding) VALUES (?1, ?2)",
+        params![id, embedding],
+    )?;
+    Ok(())
+}
+
+fn delete_ann_row(conn: &Connection, body_hash: &[u8]) {
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM vec_rowids WHERE body_hash = ?1",
+            params![body_hash],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    if let Some(id) = id {
+        let _ = conn.execute("DELETE FROM vec_ann WHERE rowid = ?1", params![id]);
+        let _ = conn.execute("DELETE FROM vec_rowids WHERE id = ?1", params![id]);
+    }
+}
+
+fn search_vec0(
+    conn: &Connection,
+    query: &[f32],
+    k: usize,
+) -> rusqlite::Result<Vec<([u8; 32], f64)>> {
+    let blob = f32s_to_le(query);
+    let mut stmt = conn.prepare(
+        "SELECT r.body_hash, a.distance
+         FROM vec_ann a
+         JOIN vec_rowids r ON r.id = a.rowid
+         WHERE a.embedding MATCH ?1 AND k = ?2",
+    )?;
+    let iter = stmt.query_map(params![blob, k as i64], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in iter {
+        let (h, dist) = row?;
+        let Some(hash) = blob32_opt(&h) else {
+            continue;
+        };
+        // sqlite-vec reports L2 distance; invert so callers get a higher-is-better score
+        // compatible with FlatAnnIndex cosine.
+        let score = if dist.is_finite() {
+            1.0 / (1.0 + dist)
+        } else {
+            0.0
+        };
+        out.push((hash, score));
+    }
+    Ok(out)
+}
+
+fn search_brute(
+    conn: &Connection,
+    query: &[f32],
+    k: usize,
+) -> rusqlite::Result<Vec<([u8; 32], f64)>> {
+    let dim = query.len() as i64;
+    let mut stmt =
+        conn.prepare("SELECT body_hash, embedding FROM vectors WHERE dim = ?1")?;
+    let iter = stmt.query_map(params![dim], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut scored = Vec::new();
+    for row in iter {
+        let (h, raw) = row?;
+        let Some(hash) = blob32_opt(&h) else {
+            continue;
+        };
+        let Ok(vec) = le_to_f32s(&raw) else {
+            continue;
+        };
+        scored.push((hash, cosine_similarity(query, &vec)));
+    }
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    Ok(scored)
+}
+
+fn blob32_opt(v: &[u8]) -> Option<[u8; 32]> {
+    blob32(v).ok()
 }
 
 fn f32s_to_le(v: &[f32]) -> Vec<u8> {
@@ -97,6 +273,8 @@ fn blob32(v: &[u8]) -> io::Result<[u8; 32]> {
 pub struct SqliteVectorStore {
     conn: Arc<Mutex<Connection>>,
     sql_writes: Arc<AtomicU64>,
+    /// Dimension of the `vec0` table, if created.
+    ann_dim: Arc<Mutex<Option<usize>>>,
 }
 
 impl std::fmt::Debug for SqliteVectorStore {
@@ -107,14 +285,17 @@ impl std::fmt::Debug for SqliteVectorStore {
 
 impl SqliteVectorStore {
     pub fn open(cis_dir: impl AsRef<Path>) -> io::Result<Self> {
+        register_sqlite_vec();
         let cis = cis_dir.as_ref();
         std::fs::create_dir_all(cis)?;
         let conn = Connection::open(vectors_db_path(cis))
             .map_err(|e| io::Error::other(e.to_string()))?;
         configure_conn(&conn)?;
+        let ann_dim = backfill_vec_ann(&conn).unwrap_or(None);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             sql_writes: Arc::new(AtomicU64::new(0)),
+            ann_dim: Arc::new(Mutex::new(ann_dim)),
         })
     }
 
@@ -156,6 +337,11 @@ impl SqliteVectorStore {
         tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
         self.sql_writes
             .fetch_add((snap.chunks.len() + snap.vectors.len()) as u64, Ordering::Relaxed);
+        let dim = backfill_vec_ann(&conn).unwrap_or(None);
+        drop(conn);
+        if let Some(dim) = dim {
+            *self.ann_dim.lock().unwrap() = Some(dim);
+        }
         Ok(())
     }
 
@@ -221,6 +407,37 @@ impl SqliteVectorStore {
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
             .map_err(|e| io::Error::other(e.to_string()))
     }
+
+    /// Nearest neighbors from sqlite-vec (`vec0`), falling back to a dim-filtered scan.
+    pub fn search_topk(&self, query: &[f32], k: usize) -> Vec<([u8; 32], f64)> {
+        if query.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().expect("sqlite vector lock");
+        let dim = *self.ann_dim.lock().unwrap();
+        if dim == Some(query.len()) {
+            if let Ok(hits) = search_vec0(&conn, query, k) {
+                if !hits.is_empty() {
+                    return hits;
+                }
+            }
+        }
+        search_brute(&conn, query, k).unwrap_or_default()
+    }
+
+    fn sync_ann(&self, conn: &Connection, body_hash: &[u8; 32], embedding: &[f32]) {
+        let dim = embedding.len();
+        let mut guard = self.ann_dim.lock().unwrap();
+        if guard.is_none() {
+            if ensure_vec0(conn, dim).unwrap_or(false) {
+                *guard = Some(dim);
+            }
+        }
+        if *guard == Some(dim) {
+            let blob = f32s_to_le(embedding);
+            let _ = upsert_ann_row(conn, body_hash.as_slice(), &blob);
+        }
+    }
 }
 
 fn upsert_chunk(conn: &Connection, chunk_id: &[u8; 32], body_hash: &[u8; 32]) -> rusqlite::Result<()> {
@@ -277,6 +494,7 @@ impl VectorPersistHook for SqliteVectorStore {
             eprintln!("cis: sqlite vector embed failed: {e}");
             return;
         }
+        self.sync_ann(&conn, &body_hash, embedding);
         self.sql_writes.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -311,10 +529,15 @@ impl VectorPersistHook for SqliteVectorStore {
                         "DELETE FROM vectors WHERE body_hash = ?1",
                         params![bh.as_slice()],
                     );
+                    delete_ann_row(&conn, &bh);
                     self.sql_writes.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+    }
+
+    fn search_topk(&self, query: &[f32], k: usize) -> Option<Vec<([u8; 32], f64)>> {
+        Some(SqliteVectorStore::search_topk(self, query, k))
     }
 }
 
@@ -377,5 +600,35 @@ mod tests {
             writes >= 16 && writes < 100,
             "8 register + 8 embed should be O(n) row writes, got {writes}"
         );
+    }
+
+    #[test]
+    fn sqlite_vec_extension_reports_version() {
+        register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        let v: String = conn.query_row("SELECT vec_version()", [], |r| r.get(0)).unwrap();
+        assert!(v.starts_with('v'), "vec_version={v}");
+    }
+
+    #[test]
+    fn sqlite_vec_search_ranks_nearest_without_ram_load() {
+        let cis = temp_cis();
+        let near = [3u8; 32];
+        let far = [4u8; 32];
+        {
+            let sql = SqliteVectorStore::open(&cis).unwrap();
+            let ram = InMemoryVectorStore::new();
+            ram.set_persist(Arc::new(sql.clone()));
+            ram.register([1u8; 32], near);
+            ram.register([2u8; 32], far);
+            ram.set_embedding(near, vec![1.0, 0.0], "m");
+            ram.set_embedding(far, vec![0.0, 1.0], "m");
+            let hits = sql.search_topk(&[0.9, 0.1], 2);
+            assert!(!hits.is_empty(), "expected ANN or brute hits");
+            assert_eq!(hits[0].0, near);
+        }
+        let sql = SqliteVectorStore::open(&cis).unwrap();
+        let hits = sql.search_topk(&[0.9, 0.1], 1);
+        assert_eq!(hits[0].0, near, "reopen must search durable index without load_into");
     }
 }

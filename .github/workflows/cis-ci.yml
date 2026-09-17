@@ -26,19 +26,23 @@ jobs:
       - name: Multi-language indexer tests
         run: cargo test -p cis-core --features tree-sitter-all --lib '_indexer::'
       - name: Indexer corpus evaluation
-        run: cargo test -p cis-core --features tree-sitter-all --test indexer_corpus_eval -- --nocapture --test-threads=1
+        run: cargo test -p cis-core --release --features tree-sitter-all --test indexer_corpus_eval -- --nocapture --test-threads=1
       - name: Chess cross-file calls
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_cross_file_calls
       - name: Chess SQLite exploration
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_sqlite_exploration -- --nocapture
       - name: Chess semantic search (stub embedder)
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_semantic_search
+      - name: Chess query engine eval
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test chess_query_engine_eval
       - name: TypeScript cross-file calls
         run: cargo test -p cis-core --test typescript_cross_file_calls
       - name: Restart survival
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test restart_survival
       - name: Write path correctness (Phase 0)
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test write_path_correctness
+      - name: Store matrix (JSON + SQLite MCP)
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --test store_matrix -- --test-threads=1
       - name: Lease lifecycle / FS sync confirm race
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test lease_lifecycle --test fs_sync_confirm_race --test reindex_no_auto_promote
       - name: Durability / concurrency remediation
@@ -54,7 +58,7 @@ jobs:
       - name: Phase 2 reconciliation tracker
         run: cargo test -p cis-core --features tree-sitter,body-sqlite --test phase2_reconciliation
       - name: Core integration tests
-        run: cargo test -p cis-core --features tree-sitter,body-sqlite --tests -- --skip chess_query_engine_eval --skip indexer_corpus_eval
+        run: cargo test -p cis-core --features tree-sitter,body-sqlite --tests -- --skip chess_query_engine_real_world --skip indexer_corpus_recall --skip store_matrix_
 
   stress-fast:
     runs-on: ubuntu-latest

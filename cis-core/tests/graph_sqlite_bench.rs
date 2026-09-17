@@ -49,6 +49,7 @@ fn clear_store_env() {
     std::env::remove_var("CIS_DEFER_VECTOR_LOAD");
     std::env::remove_var("CIS_GRAPH_JSON_EXPORT");
     std::env::remove_var("CIS_WAL_MEMORY");
+    std::env::remove_var("CIS_SQLITE_UNIFIED");
 }
 
 fn set_sqlite_profile() {

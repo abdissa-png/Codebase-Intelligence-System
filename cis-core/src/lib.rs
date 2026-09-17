@@ -64,6 +64,7 @@ mod cpp_indexer;
 mod csharp_indexer;
 mod ingest;
 mod kv;
+mod sqlite_paths;
 #[cfg(feature = "body-sqlite")]
 mod sqlite_kv;
 mod language_indexer;
@@ -119,6 +120,7 @@ pub use body_blob::{
 };
 #[cfg(feature = "body-sqlite")]
 pub use body_blob::SqliteBodyBlobStore;
+pub use sqlite_paths::{sqlite_file, sqlite_unified_from_env};
 pub use metadata_store::{metadata_backend_from_env, store_db_path, MetadataBackendKind};
 #[cfg(feature = "body-sqlite")]
 pub use metadata_store::MetadataStore;

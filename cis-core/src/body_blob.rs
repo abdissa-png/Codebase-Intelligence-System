@@ -44,7 +44,7 @@ pub fn bodies_dir(cis: impl AsRef<Path>) -> PathBuf {
 }
 
 pub fn bodies_db_path(cis: impl AsRef<Path>) -> PathBuf {
-    cis.as_ref().join("bodies.db")
+    crate::sqlite_paths::sqlite_file(cis.as_ref(), "bodies.db")
 }
 
 /// Body blob backend selection (**Phase 8A**).

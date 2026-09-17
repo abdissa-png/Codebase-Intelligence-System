@@ -41,6 +41,10 @@ pub trait VectorPersistHook: Send + Sync {
     fn on_set_embedding(&self, body_hash: [u8; 32], embedding: &[f32], model_id: &str);
     fn on_delete_chunks(&self, ids: &[[u8; 32]]);
     fn checkpoint(&self) {}
+    /// Approximate nearest neighbors from durable storage. `None` if unsupported.
+    fn search_topk(&self, _query: &[f32], _k: usize) -> Option<Vec<([u8; 32], f64)>> {
+        None
+    }
 }
 
 pub struct InMemoryVectorStore {
@@ -91,6 +95,11 @@ impl InMemoryVectorStore {
         if let Some(p) = self.persist_hook() {
             p.checkpoint();
         }
+    }
+
+    /// ANN from the persist backend (sqlite-vec). Used when the RAM index is empty.
+    pub fn search_persist(&self, query: &[f32], k: usize) -> Option<Vec<([u8; 32], f64)>> {
+        self.persist_hook()?.search_topk(query, k)
     }
 
     /// Register a chunk referencing a body; embedding may be pending until worker fills it.

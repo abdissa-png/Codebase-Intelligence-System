@@ -1,7 +1,7 @@
 //! KV with CAS (merge locks, identity provisional keys, `wal:`, `ri:`, `saga_state:`).
 //!
 //! Default is an in-memory [`BTreeMap`] persisted as `kv.json`. `CIS_KV_BACKEND=sqlite`
-//! stores durable prefixes in `.cis/store.db`.
+//! stores durable prefixes in `.cis/store.db` or unified `.cis/cis.db`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};

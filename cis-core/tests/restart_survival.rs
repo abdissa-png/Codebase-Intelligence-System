@@ -46,6 +46,7 @@ fn clear_cis_integration_test_env() {
     std::env::remove_var("CIS_VECTOR_JSON_EXPORT");
     std::env::remove_var("CIS_DEFER_VECTOR_LOAD");
     std::env::remove_var("CIS_GRAPH_JSON_EXPORT");
+    std::env::remove_var("CIS_SQLITE_UNIFIED");
 }
 
 /// Phase 4 — sqlite coordinator boot must not `load_into` / `from_snapshot`.

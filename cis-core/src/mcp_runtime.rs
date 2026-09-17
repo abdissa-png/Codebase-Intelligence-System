@@ -3156,11 +3156,21 @@ impl CisMcpRuntime {
             .ok()
             .and_then(|mut v| v.pop());
         let ann_hits: Vec<([u8; 32], f64)> = if let Some(ref qv) = query_vec_early {
-            let ann = self.ann_index.lock().unwrap();
-            if ann.is_empty() {
-                Vec::new()
-            } else {
-                ann.search(qv, limit.saturating_mul(10).max(50))
+            let ram_hits = {
+                let ann = self.ann_index.lock().unwrap();
+                if ann.is_empty() {
+                    None
+                } else {
+                    Some(ann.search(qv, limit.saturating_mul(10).max(50)))
+                }
+            };
+            match ram_hits {
+                Some(hits) => hits,
+                None => self
+                    .coordinator
+                    .vector()
+                    .search_persist(qv, limit.saturating_mul(10).max(50))
+                    .unwrap_or_default(),
             }
         } else {
             Vec::new()
@@ -3244,7 +3254,7 @@ impl CisMcpRuntime {
             }
         });
 
-        let query_vec = if embedded_count > 0 {
+        let query_vec = if embedded_count > 0 || !ann_hits.is_empty() {
             query_vec_early
         } else {
             None

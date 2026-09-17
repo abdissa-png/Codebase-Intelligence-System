@@ -1,4 +1,4 @@
-//! SQLite-backed application WAL (`CIS_WAL_BACKEND=sqlite`) in `.cis/wal.db`.
+//! SQLite-backed application WAL (`CIS_WAL_BACKEND=sqlite`) in `.cis/wal.db` or `.cis/cis.db`.
 //!
 //! Append / phase update / compaction are single-row DML. The in-memory
 //! [`MutationLog`] remains the query cache so reconcile stays O(records) in RAM
@@ -49,7 +49,7 @@ pub fn wal_json_export_enabled() -> bool {
 }
 
 pub fn wal_db_path(cis_dir: impl AsRef<Path>) -> PathBuf {
-    cis_dir.as_ref().join("wal.db")
+    crate::sqlite_paths::sqlite_file(cis_dir.as_ref(), "wal.db")
 }
 
 fn phase_to_i64(p: MutationPhase) -> i64 {

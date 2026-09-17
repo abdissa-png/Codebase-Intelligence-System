@@ -1,9 +1,9 @@
-//! SQLite-backed KV (`CIS_KV_BACKEND=sqlite`) in `.cis/store.db`.
+//! SQLite-backed KV (`CIS_KV_BACKEND=sqlite`) in `.cis/store.db` or `.cis/cis.db`.
 //!
-//! Full-width `ri:{branch}:{identity}` and `deleted:{branch}:{identity}` keys live in
-//! typed tables (no hex-in-string rows). Remaining durable prefixes stay in `kv`.
-//! Ephemeral keys (`eto:`, `body:`, …) stay in a RAM overlay so enabling SQLite
-//! does not change product durability — **ETO does not survive restart**.
+//! Full-width `ri:`, `deleted:`, `saga_state:`, `saga_batch:`, `saga_payload:`, and
+//! `merge_lock:` keys live in typed tables (no hex-in-string rows). Remaining durable
+//! prefixes stay in `kv`. Ephemeral keys (`eto:`, `body:`, …) stay in a RAM overlay
+//! so enabling SQLite does not change product durability — **ETO does not survive restart**.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -34,6 +34,26 @@ const SCHEMA: &str = "
         payload BLOB NOT NULL,
         PRIMARY KEY (branch_id, identity_id)
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS saga_state (
+        merge_id BLOB NOT NULL PRIMARY KEY,
+        payload BLOB NOT NULL
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS saga_batch (
+        merge_id BLOB NOT NULL,
+        seq INTEGER NOT NULL,
+        payload BLOB NOT NULL,
+        PRIMARY KEY (merge_id, seq)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS saga_payload (
+        merge_id BLOB NOT NULL,
+        seq INTEGER NOT NULL,
+        payload BLOB NOT NULL,
+        PRIMARY KEY (merge_id, seq)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS merge_lock (
+        branch_id BLOB NOT NULL PRIMARY KEY,
+        merge_id BLOB NOT NULL
+    ) WITHOUT ROWID;
 ";
 
 #[derive(Clone, Copy)]
@@ -45,6 +65,20 @@ enum TypedKey {
     Deleted {
         branch: [u8; 16],
         identity: [u8; 16],
+    },
+    SagaState {
+        merge: [u8; 16],
+    },
+    SagaBatch {
+        merge: [u8; 16],
+        seq: u32,
+    },
+    SagaPayload {
+        merge: [u8; 16],
+        seq: u32,
+    },
+    MergeLock {
+        branch: [u8; 16],
     },
 }
 
@@ -92,7 +126,11 @@ impl SqliteKv {
         conn.query_row(
             "SELECT (SELECT COUNT(*) FROM kv)
                   + (SELECT COUNT(*) FROM ri)
-                  + (SELECT COUNT(*) FROM deleted)",
+                  + (SELECT COUNT(*) FROM deleted)
+                  + (SELECT COUNT(*) FROM saga_state)
+                  + (SELECT COUNT(*) FROM saga_batch)
+                  + (SELECT COUNT(*) FROM saga_payload)
+                  + (SELECT COUNT(*) FROM merge_lock)",
             [],
             |r| r.get::<_, i64>(0),
         )
@@ -358,11 +396,17 @@ impl SqliteKv {
                 let (k, v) = r.unwrap_or_else(|e| panic!("cis sqlite kv snapshot: {e}"));
                 entries.insert(k, v);
             }
-            for (k, v) in typed_scan(&conn, "ri:", &next_lexical_prefix("ri:")) {
-                entries.insert(k, v);
-            }
-            for (k, v) in typed_scan(&conn, "deleted:", &next_lexical_prefix("deleted:")) {
-                entries.insert(k, v);
+            for prefix in [
+                "ri:",
+                "deleted:",
+                "saga_state:",
+                "saga_batch:",
+                "saga_payload:",
+                "merge_lock:",
+            ] {
+                for (k, v) in typed_scan(&conn, prefix, &next_lexical_prefix(prefix)) {
+                    entries.insert(k, v);
+                }
             }
         }
         entries.extend(self.ephemeral.read().unwrap().clone());
@@ -372,8 +416,12 @@ impl SqliteKv {
     pub fn restore_snapshot(&self, snap: &KvSnapshot) {
         {
             let conn = self.conn.lock().expect("sqlite kv lock");
-            conn.execute_batch("DELETE FROM kv; DELETE FROM ri; DELETE FROM deleted;")
-                .unwrap_or_else(|e| panic!("cis sqlite kv restore: {e}"));
+            conn.execute_batch(
+                "DELETE FROM kv; DELETE FROM ri; DELETE FROM deleted;
+                 DELETE FROM saga_state; DELETE FROM saga_batch; DELETE FROM saga_payload;
+                 DELETE FROM merge_lock;",
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv restore: {e}"));
             self.bump_write();
         }
         self.ephemeral.write().unwrap().clear();
@@ -473,7 +521,11 @@ fn configure_conn(conn: &Connection) -> io::Result<()> {
 
 fn migrate_hex_kv_to_typed(conn: &Connection) -> io::Result<()> {
     let mut stmt = conn
-        .prepare("SELECT k, v FROM kv WHERE k LIKE 'ri:%' OR k LIKE 'deleted:%'")
+        .prepare(
+            "SELECT k, v FROM kv WHERE k LIKE 'ri:%' OR k LIKE 'deleted:%'
+             OR k LIKE 'saga_state:%' OR k LIKE 'saga_batch:%' OR k LIKE 'saga_payload:%'
+             OR k LIKE 'merge_lock:%'",
+        )
         .map_err(|e| io::Error::other(e.to_string()))?;
     let iter = stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
@@ -538,7 +590,37 @@ fn parse_typed_key(key: &str) -> Option<TypedKey> {
             identity: parse_hex16(ihex)?,
         });
     }
+    if let Some(rest) = key.strip_prefix("saga_state:") {
+        return Some(TypedKey::SagaState {
+            merge: parse_hex16(rest)?,
+        });
+    }
+    if let Some((merge, seq)) = parse_merge_seq_key("saga_batch:", key) {
+        return Some(TypedKey::SagaBatch { merge, seq });
+    }
+    if let Some((merge, seq)) = parse_merge_seq_key("saga_payload:", key) {
+        return Some(TypedKey::SagaPayload { merge, seq });
+    }
+    if let Some(rest) = key.strip_prefix("merge_lock:") {
+        return Some(TypedKey::MergeLock {
+            branch: parse_hex16(rest)?,
+        });
+    }
     None
+}
+
+fn parse_merge_seq_key(kind: &str, key: &str) -> Option<([u8; 16], u32)> {
+    let rest = key.strip_prefix(kind)?;
+    let (hex, seq_s) = rest.split_once(':')?;
+    Some((parse_hex16(hex)?, seq_s.parse().ok()?))
+}
+
+fn parse_typed_merge_scope(kind: &str, prefix: &str) -> Option<[u8; 16]> {
+    let rest = prefix.strip_prefix(kind)?;
+    if rest.len() < 32 {
+        return None;
+    }
+    parse_hex16(&rest[..32])
 }
 
 fn format_ri_key(branch: &[u8; 16], identity: &[u8; 16]) -> String {
@@ -577,6 +659,38 @@ fn typed_get(conn: &Connection, tk: TypedKey) -> Option<Vec<u8>> {
             )
             .optional()
             .unwrap_or_else(|e| panic!("cis sqlite kv deleted get: {e}")),
+        TypedKey::SagaState { merge } => conn
+            .query_row(
+                "SELECT payload FROM saga_state WHERE merge_id = ?1",
+                params![merge.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_state get: {e}")),
+        TypedKey::SagaBatch { merge, seq } => conn
+            .query_row(
+                "SELECT payload FROM saga_batch WHERE merge_id = ?1 AND seq = ?2",
+                params![merge.as_slice(), seq as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_batch get: {e}")),
+        TypedKey::SagaPayload { merge, seq } => conn
+            .query_row(
+                "SELECT payload FROM saga_payload WHERE merge_id = ?1 AND seq = ?2",
+                params![merge.as_slice(), seq as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_payload get: {e}")),
+        TypedKey::MergeLock { branch } => conn
+            .query_row(
+                "SELECT merge_id FROM merge_lock WHERE branch_id = ?1",
+                params![branch.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| panic!("cis sqlite kv merge_lock get: {e}")),
     }
 }
 
@@ -598,6 +712,38 @@ fn typed_upsert(conn: &Connection, tk: TypedKey, value: &[u8]) {
             )
             .unwrap_or_else(|e| panic!("cis sqlite kv deleted set: {e}"));
         }
+        TypedKey::SagaState { merge } => {
+            conn.execute(
+                "INSERT INTO saga_state (merge_id, payload) VALUES (?1, ?2)
+                 ON CONFLICT(merge_id) DO UPDATE SET payload = excluded.payload",
+                params![merge.as_slice(), value],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_state set: {e}"));
+        }
+        TypedKey::SagaBatch { merge, seq } => {
+            conn.execute(
+                "INSERT INTO saga_batch (merge_id, seq, payload) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(merge_id, seq) DO UPDATE SET payload = excluded.payload",
+                params![merge.as_slice(), seq as i64, value],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_batch set: {e}"));
+        }
+        TypedKey::SagaPayload { merge, seq } => {
+            conn.execute(
+                "INSERT INTO saga_payload (merge_id, seq, payload) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(merge_id, seq) DO UPDATE SET payload = excluded.payload",
+                params![merge.as_slice(), seq as i64, value],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_payload set: {e}"));
+        }
+        TypedKey::MergeLock { branch } => {
+            conn.execute(
+                "INSERT INTO merge_lock (branch_id, merge_id) VALUES (?1, ?2)
+                 ON CONFLICT(branch_id) DO UPDATE SET merge_id = excluded.merge_id",
+                params![branch.as_slice(), value],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv merge_lock set: {e}"));
+        }
     }
 }
 
@@ -616,6 +762,34 @@ fn typed_delete(conn: &Connection, tk: TypedKey) {
                 params![branch.as_slice(), identity.as_slice()],
             )
             .unwrap_or_else(|e| panic!("cis sqlite kv deleted delete: {e}"));
+        }
+        TypedKey::SagaState { merge } => {
+            conn.execute(
+                "DELETE FROM saga_state WHERE merge_id = ?1",
+                params![merge.as_slice()],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_state delete: {e}"));
+        }
+        TypedKey::SagaBatch { merge, seq } => {
+            conn.execute(
+                "DELETE FROM saga_batch WHERE merge_id = ?1 AND seq = ?2",
+                params![merge.as_slice(), seq as i64],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_batch delete: {e}"));
+        }
+        TypedKey::SagaPayload { merge, seq } => {
+            conn.execute(
+                "DELETE FROM saga_payload WHERE merge_id = ?1 AND seq = ?2",
+                params![merge.as_slice(), seq as i64],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv saga_payload delete: {e}"));
+        }
+        TypedKey::MergeLock { branch } => {
+            conn.execute(
+                "DELETE FROM merge_lock WHERE branch_id = ?1",
+                params![branch.as_slice()],
+            )
+            .unwrap_or_else(|e| panic!("cis sqlite kv merge_lock delete: {e}"));
         }
     }
 }
@@ -691,7 +865,143 @@ fn typed_scan(conn: &Connection, prefix: &str, end: &str) -> Vec<(String, Vec<u8
             }
         }
     }
+    if range_may_include(prefix, end, "saga_state:") {
+        typed_scan_merge_payload(
+            conn,
+            "SELECT merge_id, payload FROM saga_state",
+            "saga_state:",
+            prefix,
+            end,
+            &mut out,
+        );
+    }
+    if range_may_include(prefix, end, "saga_batch:") {
+        typed_scan_merge_seq(
+            conn,
+            "saga_batch",
+            "saga_batch:",
+            prefix,
+            end,
+            &mut out,
+        );
+    }
+    if range_may_include(prefix, end, "saga_payload:") {
+        typed_scan_merge_seq(
+            conn,
+            "saga_payload",
+            "saga_payload:",
+            prefix,
+            end,
+            &mut out,
+        );
+    }
+    if range_may_include(prefix, end, "merge_lock:") {
+        let mut stmt = conn
+            .prepare("SELECT branch_id, merge_id FROM merge_lock")
+            .unwrap_or_else(|e| panic!("cis sqlite kv merge_lock scan: {e}"));
+        let iter = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap_or_else(|e| panic!("cis sqlite kv merge_lock scan: {e}"));
+        for r in iter {
+            let (b, v) = r.unwrap_or_else(|e| panic!("cis sqlite kv merge_lock scan: {e}"));
+            let Some(bb) = blob16(&b) else {
+                continue;
+            };
+            let k = format!("merge_lock:{}", hex16(&bb));
+            if k.as_str() >= prefix && k.as_str() < end {
+                out.push((k, v));
+            }
+        }
+    }
     out
+}
+
+fn typed_scan_merge_payload(
+    conn: &Connection,
+    sql: &str,
+    key_prefix: &str,
+    prefix: &str,
+    end: &str,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+    let iter = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+    for r in iter {
+        let (mid, v) = r.unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+        let Some(mb) = blob16(&mid) else {
+            continue;
+        };
+        let k = format!("{key_prefix}{}", hex16(&mb));
+        if k.as_str() >= prefix && k.as_str() < end {
+            out.push((k, v));
+        }
+    }
+}
+
+fn typed_scan_merge_seq(
+    conn: &Connection,
+    table: &'static str,
+    key_prefix: &str,
+    prefix: &str,
+    end: &str,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    let sql = match (table, parse_typed_merge_scope(key_prefix, prefix)) {
+        ("saga_batch", Some(_)) => {
+            "SELECT merge_id, seq, payload FROM saga_batch WHERE merge_id = ?1"
+        }
+        ("saga_payload", Some(_)) => {
+            "SELECT merge_id, seq, payload FROM saga_payload WHERE merge_id = ?1"
+        }
+        ("saga_batch", None) => "SELECT merge_id, seq, payload FROM saga_batch",
+        ("saga_payload", None) => "SELECT merge_id, seq, payload FROM saga_payload",
+        _ => return,
+    };
+    let scoped = parse_typed_merge_scope(key_prefix, prefix);
+    let mut stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+    let map_row = |row: &rusqlite::Row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    };
+    let push = |mid: Vec<u8>, seq: i64, v: Vec<u8>, out: &mut Vec<(String, Vec<u8>)>| {
+        let Some(mb) = blob16(&mid) else {
+            return;
+        };
+        let k = format!("{key_prefix}{}:{seq}", hex16(&mb));
+        if k.as_str() >= prefix && k.as_str() < end {
+            out.push((k, v));
+        }
+    };
+    if let Some(mid) = scoped {
+        let iter = stmt
+            .query_map(params![mid.as_slice()], map_row)
+            .unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+        for r in iter {
+            let (m, seq, v) = r.unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+            push(m, seq, v, out);
+        }
+    } else {
+        let iter = stmt
+            .query_map([], map_row)
+            .unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+        for r in iter {
+            let (m, seq, v) = r.unwrap_or_else(|e| panic!("cis sqlite kv {key_prefix} scan: {e}"));
+            push(m, seq, v, out);
+        }
+    }
 }
 
 fn typed_copy_filter(conn: &Connection, src_prefix: &str, dst_prefix: &str, end: &str) -> usize {
@@ -787,5 +1097,32 @@ mod tests {
         kv.delete(&key);
         assert!(kv.get(&key).is_none());
         assert_eq!(kv.scan_prefix("deleted:").len(), 0);
+    }
+
+    #[test]
+    fn saga_and_merge_lock_use_typed_tables() {
+        let kv = SqliteKv::open_in_memory();
+        let merge = [9u8; 16];
+        let branch = [8u8; 16];
+        let hex_m = hex16(&merge);
+        let hex_b = hex16(&branch);
+        let state = format!("saga_state:{hex_m}");
+        let batch = format!("saga_batch:{hex_m}:3");
+        let payload = format!("saga_payload:{hex_m}:3");
+        let lock = format!("merge_lock:{hex_b}");
+        kv.set(&state, vec![1, 0, 0, 0, 0]);
+        kv.set(&batch, vec![1]);
+        kv.set(&payload, b"{\"seq\":3}".to_vec());
+        kv.set(&lock, merge.to_vec());
+        assert_eq!(kv.hex_kv_table_count(), 0);
+        assert_eq!(kv.get(&state), Some(vec![1, 0, 0, 0, 0]));
+        assert_eq!(kv.scan_prefix("saga_state:").len(), 1);
+        assert_eq!(kv.scan_prefix(&format!("saga_batch:{hex_m}:")).len(), 1);
+        assert_eq!(kv.scan_prefix("saga_payload:").len(), 1);
+        assert_eq!(kv.scan_prefix("merge_lock:").len(), 1);
+        kv.delete(&batch);
+        assert_eq!(kv.scan_prefix("saga_batch:").len(), 0);
+        kv.set("merge_lock:deadbeef", vec![1]);
+        assert_eq!(kv.hex_kv_table_count(), 1, "short lock keys stay in kv");
     }
 }

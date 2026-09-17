@@ -98,7 +98,7 @@ pub fn shadow_graph_view_diffs(
 }
 
 pub fn graph_db_path(cis: &Path) -> PathBuf {
-    cis.join("graph.db")
+    crate::sqlite_paths::sqlite_file(cis, "graph.db")
 }
 
 pub trait GraphStore: Send + Sync {

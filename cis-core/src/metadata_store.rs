@@ -23,7 +23,7 @@ pub fn metadata_backend_from_env() -> MetadataBackendKind {
 }
 
 pub fn store_db_path(cis: impl AsRef<Path>) -> PathBuf {
-    cis.as_ref().join("store.db")
+    crate::sqlite_paths::sqlite_file(cis.as_ref(), "store.db")
 }
 
 /// `.cis/store.db` — RIS snapshots + optional durable KV offload.

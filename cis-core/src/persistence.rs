@@ -64,7 +64,8 @@ pub const MCP_SQLITE_STORE_ENV_KEYS: &[&str] = &[
 /// `cisd --mcp` sqlite store profile: set each key to `sqlite` only if unset.
 ///
 /// Shell and `.env` (via [`load_env_file`]) win. Tests and [`crate::CisMcpRuntime::new_dev`]
-/// do not call this, so they keep JSON/`file` defaults.
+/// do not call this, so they keep JSON/`file` defaults. When every key is sqlite, new
+/// workspaces use one `.cis/cis.db` (see [`crate::sqlite_unified_from_env`]).
 ///
 /// Returns how many keys were filled. No-op without the `body-sqlite` feature.
 pub fn apply_mcp_sqlite_store_defaults() -> usize {
