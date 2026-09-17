@@ -443,18 +443,20 @@ fn prepare_daemon(
     {
         let merge_control_startup = cis_core::MergeControl::new(Arc::clone(&kv));
         let gate = cis_core::MergeRecoveryGate::new(Arc::clone(&kv));
-        let mut g = coord.graph().write();
-        let merge_rep = cis_core::recover_inflight_merges(
-            &mut *g,
-            kv.as_ref(),
-            &body_store_startup,
-            saga.as_ref(),
-            &merge_control_startup,
-            coord.vector_chunk_store(),
-            &gate,
-            None,
-        );
-        drop(g);
+        let merge_rep = coord
+            .with_merge_write(|g| {
+                cis_core::recover_inflight_merges(
+                    g,
+                    kv.as_ref(),
+                    &body_store_startup,
+                    saga.as_ref(),
+                    &merge_control_startup,
+                    coord.vector_chunk_store(),
+                    &gate,
+                    None,
+                )
+            })
+            .unwrap_or_default();
         let compensated = saga.compensate_orphans();
         eprintln!(
             "cisd: merge recovery resumed={} compensated_by_recover={} orphans_purged={}",

@@ -1420,25 +1420,23 @@ impl CisMcpRuntime {
             self.active_branch(),
         );
         if !std::env::var_os("CIS_SKIP_MERGE_RECOVER").is_some_and(|v| v == "1") {
-            let has_inflight = self.kv.scan_prefix("saga_state:").iter().any(|(_, v)| v.first() != Some(&6));
-            if has_inflight {
-                let _ = self.coordinator.hydrate_sql_into_overlay();
-            }
             let saga = MergeSagaOrchestrator::new(std::sync::Arc::clone(&self.kv));
             let gate = MergeRecoveryGate::new(std::sync::Arc::clone(&self.kv));
-            let mut g = self.coordinator.graph().write();
-            let report = crate::merge_engine::recover_inflight_merges(
-                &mut g,
-                &self.kv,
-                &self.body_store,
-                &saga,
-                &self.merge,
-                self.coordinator.vector(),
-                &gate,
-                Some(&self.reconciliation_tracker),
-            );
-            drop(g);
-            // Compensate leftovers only after resume attempts.
+            let report = self
+                .coordinator
+                .with_merge_write(|g| {
+                    crate::merge_engine::recover_inflight_merges(
+                        g,
+                        &self.kv,
+                        &self.body_store,
+                        &saga,
+                        &self.merge,
+                        self.coordinator.vector(),
+                        &gate,
+                        Some(&self.reconciliation_tracker),
+                    )
+                })
+                .unwrap_or_default();
             let _ = saga.compensate_orphans();
             for entry in report.entries {
                 self.append_merge_metrics_record(crate::merge_metrics::MergeMetricsRecord {
@@ -2133,16 +2131,15 @@ impl CisMcpRuntime {
         self.kv.delete(&crate::deletion_absence::fork_ts_key(branch));
         if let Some(parent) = parent {
             if !crate::deletion_absence::has_child_branches(self.kv.as_ref(), parent) {
-                let _ = self.coordinator.hydrate_sql_into_overlay();
-                {
-                    let mut g = self.coordinator.graph().write();
-                    n += crate::identity_resolution::finalize_soft_deletes_without_children(
-                        &mut g,
-                        self.kv.as_ref(),
-                    );
-                }
-                let _ = self.coordinator.flush_overlay_to_sql();
-                self.coordinator.discard_overlay();
+                n += self
+                    .coordinator
+                    .with_merge_write(|g| {
+                        crate::identity_resolution::finalize_soft_deletes_without_children(
+                            g,
+                            self.kv.as_ref(),
+                        )
+                    })
+                    .unwrap_or(0);
             }
         }
         let mut meta = QueryMeta::default();
@@ -2270,7 +2267,7 @@ impl CisMcpRuntime {
         {
             let mut g = self.coordinator.graph().write();
             for rid in rids_to_speculate {
-                if let Some(rev) = g.get_revision(rid).cloned() {
+                if let Some(rev) = g.get_revision(rid) {
                     let mut updated = rev;
                     updated.status = RevisionStatus::Speculative;
                     g.put_revision(updated);
@@ -3680,26 +3677,20 @@ impl CisMcpRuntime {
         let merge_id = parse_merge_id_hex(merge_id_hex).ok_or(AuthError::InvalidInput)?;
         let gate = MergeRecoveryGate::new(std::sync::Arc::clone(&self.kv));
         gate.begin_rollback(branch_id);
-        self.coordinator
-            .hydrate_sql_into_overlay()
-            .map_err(|_| AuthError::InvalidInput)?;
-        let mut g = self.coordinator.graph().write();
         let rep = self
-            .merge
-            .cancel_merge(
-                merge_id,
-                branch_id,
-                &mut g,
-                self.coordinator.vector(),
-                None,
-                &clear_edges_for,
-            )
+            .coordinator
+            .with_merge_write(|g| {
+                self.merge.cancel_merge(
+                    merge_id,
+                    branch_id,
+                    g,
+                    self.coordinator.vector(),
+                    None,
+                    &clear_edges_for,
+                )
+            })
+            .map_err(|_| AuthError::InvalidInput)?
             .map_err(|_| AuthError::InvalidInput)?;
-        drop(g);
-        self.coordinator
-            .flush_overlay_to_sql()
-            .map_err(|_| AuthError::Persist)?;
-        self.coordinator.discard_overlay();
         let saga = MergeSagaOrchestrator::new(std::sync::Arc::clone(&self.kv));
         saga.purge_merge_saga_state(merge_id);
         crate::merge_engine::MergeContext::remove(&self.kv, merge_id);
@@ -4011,9 +4002,6 @@ impl CisMcpRuntime {
         let t0 = Instant::now();
         let saga = MergeSagaOrchestrator::new(std::sync::Arc::clone(&self.kv));
         let mut timeline = Vec::new();
-        self.coordinator
-            .hydrate_sql_into_overlay()
-            .map_err(|_| AuthError::InvalidInput)?;
 
         if continuing {
             if merge_lock_holder(&self.kv, target) != Some(merge_id) {
@@ -4021,13 +4009,12 @@ impl CisMcpRuntime {
             }
         } else {
             let pre_bindings = crate::merge_engine::premerge_bindings_for_branch(&self.kv, target);
-            let paths: Vec<String> = {
-                let g = self.coordinator.graph().read();
+            let paths: Vec<String> = self.coordinator.with_graph_view(|g| {
                 pre_bindings
                     .iter()
-                    .filter_map(|(_, rid)| g.get_revision(*rid).map(|r| r.file_path.clone()))
+                    .filter_map(|(_, rid)| g.get_revision(*rid).map(|r| r.file_path))
                     .collect()
-            };
+            });
             MergePreflight::begin_with_snapshot(
                 std::sync::Arc::clone(&self.kv),
                 target,
@@ -4065,12 +4052,11 @@ impl CisMcpRuntime {
         );
 
         saga.persist(merge_id, SagaPhase::Classifying);
-        let phase_a = {
-            let g = self.coordinator.graph().read();
+        let phase_a = self.coordinator.with_graph_view(|g| {
             crate::merge_engine::phase_a_for_merge(
-                &g, &self.kv, merge_id, target, source, target, target,
+                g, &self.kv, merge_id, target, source, target, target,
             )
-        };
+        });
         report_merge_progress(
             &mut timeline,
             &mut progress_sink,
@@ -4129,16 +4115,30 @@ impl CisMcpRuntime {
         }
 
         saga.persist(merge_id, SagaPhase::Promoting);
-        let phase_b = {
-            let mut g = self.coordinator.graph().write();
-            crate::merge_engine::phase_b_promote(
-                &self.kv,
-                &mut g,
-                target,
-                &phase_a.classified,
-                strategy,
-            )
-        };
+        saga.persist(merge_id, SagaPhase::EdgeBatch { seq: 0 });
+        let recon_job = Self::merge_reconciliation_job_id(merge_id);
+        self.reconciliation_tracker.register(target, recon_job);
+        let (phase_b, phase_c) = self
+            .coordinator
+            .with_merge_write(|g| {
+                let phase_b = crate::merge_engine::phase_b_promote(
+                    &self.kv,
+                    g,
+                    target,
+                    &phase_a.classified,
+                    strategy,
+                );
+                let phase_c = crate::merge_engine::phase_c_reconcile_edges_full(
+                    g,
+                    &self.kv,
+                    Some(&self.body_store),
+                    target,
+                    &phase_b.promoted,
+                    Some(&phase_a.classified),
+                );
+                (phase_b, phase_c)
+            })
+            .map_err(|_| AuthError::Persist)?;
         report_merge_progress(
             &mut timeline,
             &mut progress_sink,
@@ -4151,21 +4151,6 @@ impl CisMcpRuntime {
                 phase_b.orphaned_revisions.len(),
             ),
         );
-
-        saga.persist(merge_id, SagaPhase::EdgeBatch { seq: 0 });
-        let recon_job = Self::merge_reconciliation_job_id(merge_id);
-        self.reconciliation_tracker.register(target, recon_job);
-        let phase_c = {
-            let mut g = self.coordinator.graph().write();
-            crate::merge_engine::phase_c_reconcile_edges_full(
-                &mut g,
-                &self.kv,
-                Some(&self.body_store),
-                target,
-                &phase_b.promoted,
-                Some(&phase_a.classified),
-            )
-        };
         if phase_c.needs_edge_regen.is_empty() {
             self.reconciliation_tracker.on_job_complete(target, recon_job);
         }
@@ -4229,10 +4214,6 @@ impl CisMcpRuntime {
             resumed_from_phase: None,
             compensated: false,
         });
-        self.coordinator
-            .flush_overlay_to_sql()
-            .map_err(|_| AuthError::Persist)?;
-        self.coordinator.discard_overlay();
         self.audit.record_sync(session_id, "merge_branch");
         Ok(MergeBranchResponse {
             merge_id_hex: hex16(&merge_id.0),

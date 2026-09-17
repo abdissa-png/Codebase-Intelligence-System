@@ -192,6 +192,92 @@ fn sqlite_boot_and_find_symbol_skips_hydrate() {
 }
 
 #[test]
+fn sqlite_merge_does_not_hydrate_full_graph() {
+    use cis_core::MergeStrategy;
+
+    let _env = CIS_ENV_LOCK.lock().unwrap();
+    clear_store_env();
+    set_sqlite_profile();
+    std::env::set_var("CIS_SKIP_MERGE_RECOVER", "1");
+    std::env::set_var("CIS_ALLOW_DEFAULT_SESSION", "1");
+    let root = temp_repo("merge-no-hydrate");
+    std::fs::write(root.join("app.py"), "def alpha():\n    return 1\n").unwrap();
+    let rt = CisMcpRuntime::new_dev(&root.to_string_lossy());
+    let report = rt.reindex_python_paths(&["app.py"]).expect("ingest main");
+    assert!(
+        report.applied > 0,
+        "ingest should apply app.py, got applied={} empty={} parse_errors={}",
+        report.applied,
+        report.skipped_empty_py,
+        report.parse_errors
+    );
+    let main_hex_pre: String = rt
+        .active_branch()
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let ri_n = rt.kv().scan_prefix(&format!("ri:{main_hex_pre}:")).len();
+    assert!(
+        ri_n > 0,
+        "ingest should write ri bindings under main (durable={})",
+        rt.coordinator().durable_revision_count()
+    );
+    assert_eq!(
+        rt.coordinator().graph().read().revision_count(),
+        0,
+        "sqlite overlay empty before merge"
+    );
+    let created = rt.create_branch(0, "feature", Some("main")).unwrap();
+    assert!(
+        created.bindings_copied > 0,
+        "fork should copy main ri bindings, got {}",
+        created.bindings_copied
+    );
+    rt.switch_branch(0, "feature").unwrap();
+    rt.write_file(0, "app.py", "def alpha():\n    return 99\n", true)
+        .unwrap();
+    rt.switch_branch(0, "main").unwrap();
+    let main_hex: String = rt
+        .active_branch()
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    let load_before = LOAD_INTO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    let resp = rt
+        .merge_branch(
+            0,
+            &created.branch_id_hex,
+            &main_hex,
+            Some(MergeStrategy::Theirs),
+            None,
+            None,
+        )
+        .expect("merge_branch");
+    let load_after = LOAD_INTO_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        load_after, load_before,
+        "sqlite merge must not GraphStore::load_into the full graph"
+    );
+    assert_eq!(resp.saga_phase, "Committed");
+    assert!(
+        resp.promoted_count >= 1,
+        "expected a promotion, got {}",
+        resp.promoted_count
+    );
+    assert_eq!(
+        rt.coordinator().graph().read().revision_count(),
+        0,
+        "overlay discarded after sqlite merge"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    clear_store_env();
+}
+
+#[test]
 #[ignore]
 fn bench_sqlite_boot_vs_json_find_symbol() {
     let _env = CIS_ENV_LOCK.lock().unwrap();

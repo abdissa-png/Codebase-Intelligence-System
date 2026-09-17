@@ -16,9 +16,8 @@ use crate::merge_saga_batch::SagaEdgeBatch;
 
 use crate::body_store::BodyStore;
 use crate::branch_reconciliation_tracker::BranchReconciliationTracker;
-use crate::graph::{
-    validate_edge_cardinality, EdgeType, InMemoryGraph, RevisionStatus,
-};
+use crate::graph::{validate_edge_cardinality, EdgeType, RevisionStatus};
+use crate::graph_view::{GraphView, GraphWrite};
 use crate::kv::MemoryKv;
 use crate::merge_control::MergeControl;
 use crate::merge_lock::{merge_lock_holder, release_merge_lock};
@@ -165,7 +164,7 @@ fn saga_phase_label(phase: &crate::saga::SagaPhase) -> String {
 }
 
 fn phase_c_reconcile_tracked(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     kv: &MemoryKv,
     body_store: Option<&BodyStore>,
     target: BranchId,
@@ -256,7 +255,7 @@ impl MergeContext {
 
 /// Resume a merge from the last persisted saga phase.
 pub fn resume_merge(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     kv: &MemoryKv,
     body_store: Option<&BodyStore>,
     merge_id: MergeId,
@@ -412,7 +411,7 @@ fn merge_id_from_saga_key(k: &str) -> Option<MergeId> {
 
 /// On startup: resume in-flight merges that still hold the lock, else compensate.
 pub fn recover_inflight_merges(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     kv: &MemoryKv,
     body_store: &BodyStore,
     saga: &crate::saga::MergeSagaOrchestrator,
@@ -657,7 +656,7 @@ pub fn premerge_bindings_for_branch(
 
 /// Distinct file paths touched by classified identities (for speculative quiescence).
 pub fn affected_paths_for_classified(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     classified: &[ClassifiedMergeIdentity],
 ) -> Vec<String> {
     let mut paths = HashSet::new();
@@ -684,7 +683,7 @@ fn identity_body_changed(class: MergeIdentityClass) -> bool {
 }
 
 fn files_for_edge_regen(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     classified: Option<&[ClassifiedMergeIdentity]>,
     target_branch: BranchId,
     promoted: &[(IdentityId, NodeRevisionId)],
@@ -722,7 +721,7 @@ fn files_for_edge_regen(
 
 /// Classify a single identity by comparing body hashes across base/ours/theirs.
 fn classify_single_identity(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     base_rid: Option<NodeRevisionId>,
     ours_rid: Option<NodeRevisionId>,
     theirs_rid: Option<NodeRevisionId>,
@@ -790,7 +789,7 @@ fn classify_single_identity(
 /// Scans `ri:` bindings for all three branches, compares body hashes,
 /// and produces a classification for each identity.
 pub fn phase_a_classify(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     kv: &MemoryKv,
     ours_branch: BranchId,
     theirs_branch: BranchId,
@@ -842,7 +841,7 @@ pub fn phase_a_classify(
 
 /// **Phase A** using explicit base bindings (e.g. preflight **`msnap`** = merge-base).
 pub fn phase_a_classify_with_base(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     kv: &MemoryKv,
     ours_branch: BranchId,
     theirs_branch: BranchId,
@@ -893,7 +892,7 @@ pub fn phase_a_classify_with_base(
 
 /// Phase A with msnap merge-base when available; otherwise `fallback_base_branch` bindings.
 pub fn phase_a_for_merge(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     kv: &MemoryKv,
     merge_id: MergeId,
     ours_branch: BranchId,
@@ -919,7 +918,7 @@ pub fn phase_a_for_merge(
 ///
 /// Prefer calling after [`detect_renames`] so `RenamedCandidate` rows are present.
 pub fn collect_rename_pairs(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     classified: &[ClassifiedMergeIdentity],
 ) -> Vec<(IdentityId, IdentityId)> {
     let mut rename_pairs: Vec<(IdentityId, IdentityId)> = Vec::new();
@@ -949,7 +948,7 @@ pub fn collect_rename_pairs(
 /// the new identity is reclassified as `RenamedCandidate` and the old
 /// (deleted) identity is reclassified as `BothDeleted` to suppress
 /// duplicate promotion.
-fn detect_renames(graph: &InMemoryGraph, classified: &mut [ClassifiedMergeIdentity]) {
+fn detect_renames(graph: &dyn GraphView, classified: &mut [ClassifiedMergeIdentity]) {
     let deleted_set: HashSet<IdentityId> = classified
         .iter()
         .filter(|c| {
@@ -1014,7 +1013,7 @@ fn detect_renames(graph: &InMemoryGraph, classified: &mut [ClassifiedMergeIdenti
 /// identities are left unresolved (returned in `unresolved_conflicts`).
 pub fn phase_b_promote(
     kv: &MemoryKv,
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     target_branch: BranchId,
     classified: &[ClassifiedMergeIdentity],
     strategy: Option<MergeStrategy>,
@@ -1130,7 +1129,7 @@ pub fn phase_b_promote(
 // ---------------------------------------------------------------------------
 
 fn record_edge_batch(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     result: &mut PhaseCResult,
     revision_id: NodeRevisionId,
     new_edges: Vec<crate::graph::GraphEdge>,
@@ -1152,7 +1151,7 @@ fn record_edge_batch(
 
 /// **Phase C**: Reconcile edges for promoted revisions (dangling cleanup, drift, cardinality).
 pub fn phase_c_reconcile_edges(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     kv: &MemoryKv,
     target_branch: BranchId,
     promoted: &[(IdentityId, NodeRevisionId)],
@@ -1162,7 +1161,7 @@ pub fn phase_c_reconcile_edges(
 
 /// Full Phase C with optional AST edge regeneration from `BodyStore`.
 pub fn phase_c_reconcile_edges_full(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     kv: &MemoryKv,
     body_store: Option<&BodyStore>,
     target_branch: BranchId,
@@ -1302,8 +1301,8 @@ pub fn phase_c_reconcile_edges_full(
         if let Err(v) = validate_edge_cardinality(&final_edges) {
             let qn = graph
                 .get_revision(revision_id)
-                .map(|r| r.qualified_name.as_str())
-                .unwrap_or("?");
+                .map(|r| r.qualified_name)
+                .unwrap_or_else(|| "?".into());
             result.cardinality_violations.push(format!(
                 "{qn}: {:?} count={} (min={}, max={})",
                 v.ty, v.count, v.min, v.max
@@ -1322,8 +1321,8 @@ mod tests {
     use cis_wal::{MutationIndex, MutationLog, MutationKind};
 
     use crate::graph::{
-        EdgeResolution, EdgeType, GraphEdge, Language, NodeIdentity, NodeKind, NodeRevision,
-        SourceSpan, SourceType,
+        EdgeResolution, EdgeType, GraphEdge, InMemoryGraph, Language, NodeIdentity, NodeKind,
+        NodeRevision, SourceSpan, SourceType,
     };
     use crate::kv::MemoryKv;
     use crate::merge_control::MergeControl;

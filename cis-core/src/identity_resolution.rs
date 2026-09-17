@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
 use crate::graph::{InMemoryGraph, NodeKind, NodeRevision, RevisionStatus};
+use crate::graph_view::GraphWrite;
 use crate::identity_cas::IdentityProvisionalCas;
 use crate::identity_resolver::{IdentityResolver, RenameEvidence, RenameSignalKind};
 use crate::ranking_policy::RankingPolicy;
@@ -616,7 +617,7 @@ fn do_tombstone(
 ///
 /// Returns the number of revisions converted.
 pub fn finalize_soft_deletes_without_children(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     kv: &crate::kv::MemoryKv,
 ) -> usize {
     let ts = now_ms();
@@ -625,7 +626,7 @@ pub fn finalize_soft_deletes_without_children(
         if crate::deletion_absence::has_child_branches(kv, branch) {
             continue;
         }
-        let Some(primary) = graph.primary_revision_for_identity(branch, identity).cloned() else {
+        let Some(primary) = graph.primary_revision_for_identity(branch, identity) else {
             continue;
         };
         if !matches!(

@@ -2,7 +2,8 @@
 
 use cis_wal::{MergeId, NodeRevisionId};
 
-use crate::graph::{GraphEdge, InMemoryGraph};
+use crate::graph::GraphEdge;
+use crate::graph_view::GraphWrite;
 use crate::kv::MemoryKv;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -16,14 +17,14 @@ pub struct SagaEdgeBatch {
 }
 
 pub fn apply_saga_edge_batch(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     batch: &SagaEdgeBatch,
 ) -> Result<(), &'static str> {
     graph.replace_edges_for_revision(batch.target_revision_id, batch.edges.clone())
 }
 
 /// **Compensate:** restore pre-batch edge sets in **reverse** application order.
-pub fn compensate_saga_edge_batches(graph: &mut InMemoryGraph, batches: &[SagaEdgeBatch]) {
+pub fn compensate_saga_edge_batches(graph: &mut dyn GraphWrite, batches: &[SagaEdgeBatch]) {
     for b in batches.iter().rev() {
         let _ = graph.replace_edges_for_revision(b.target_revision_id, b.prior_edges.clone());
     }
@@ -69,7 +70,7 @@ pub fn purge_saga_edge_payloads(kv: &MemoryKv, merge_id: MergeId) {
 
 /// Apply batches to the graph, persisting each payload and saga idempotency marker.
 pub fn apply_and_persist_saga_batches(
-    graph: &mut InMemoryGraph,
+    graph: &mut dyn GraphWrite,
     kv: &MemoryKv,
     merge_id: MergeId,
     saga: &crate::saga::MergeSagaOrchestrator,
@@ -89,8 +90,8 @@ mod tests {
     use cis_wal::{BranchId, IdentityId};
 
     use crate::graph::{
-        EdgeResolution, EdgeType, Language, NodeIdentity, NodeKind, NodeRevision, RevisionStatus,
-        SourceSpan, SourceType,
+        EdgeResolution, EdgeType, InMemoryGraph, Language, NodeIdentity, NodeKind, NodeRevision,
+        RevisionStatus, SourceSpan, SourceType,
     };
 
     #[test]

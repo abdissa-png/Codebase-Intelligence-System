@@ -88,19 +88,20 @@ impl PeriodicReconciler {
         last_consistency: Option<&LastConsistencySnapshot>,
     ) -> RecoveryReport {
         // Resume first, then compensate leftovers so resumable sagas are not purged.
-        let merge_rep = {
-            let mut g = coordinator.graph().write();
-            recover_inflight_merges(
-                &mut *g,
-                kv,
-                body_store,
-                saga,
-                merge_control,
-                coordinator.vector_chunk_store(),
-                gate,
-                None,
-            )
-        };
+        let merge_rep = coordinator
+            .with_merge_write(|g| {
+                recover_inflight_merges(
+                    g,
+                    kv,
+                    body_store,
+                    saga,
+                    merge_control,
+                    coordinator.vector_chunk_store(),
+                    gate,
+                    None,
+                )
+            })
+            .unwrap_or_default();
         let sagas_compensated = saga.compensate_orphans();
         let mut report = coordinator.reconcile_now(saga);
         report.sagas_compensated = sagas_compensated;

@@ -363,6 +363,134 @@ impl GraphView for OverlayGraphView<'_> {
     }
 }
 
+/// Mutable overlay over a committed [`GraphView`] (sqlite-primary merge).
+///
+/// Reads overlay first, then SQL. Writes copy-on-write into the overlay so merge
+/// does not hydrate the full graph via [`crate::graph_store::GraphStore::load_into`].
+pub struct OverlayGraphMut<'a> {
+    pub overlay: &'a mut InMemoryGraph,
+    pub committed: Option<&'a dyn GraphView>,
+}
+
+impl OverlayGraphMut<'_> {
+    fn view(&self) -> OverlayGraphView<'_> {
+        OverlayGraphView {
+            overlay: self.overlay,
+            committed: self.committed,
+        }
+    }
+
+    fn cow_revision(&mut self, id: NodeRevisionId) {
+        if GraphView::get_revision(self.overlay, id).is_some() {
+            return;
+        }
+        let Some(committed) = self.committed else {
+            return;
+        };
+        let Some(rev) = committed.get_revision(id) else {
+            return;
+        };
+        if let Some(kind) = committed.identity_kind(rev.identity_id) {
+            self.overlay.put_identity(NodeIdentity {
+                identity_id: rev.identity_id,
+                kind,
+            });
+        }
+        let edges = committed.outbound_edges(id);
+        self.overlay.put_revision(rev);
+        let _ = self.overlay.replace_edges_for_revision(id, edges);
+    }
+}
+
+impl GraphView for OverlayGraphMut<'_> {
+    fn get_revision(&self, id: NodeRevisionId) -> Option<NodeRevision> {
+        self.view().get_revision(id)
+    }
+    fn outbound_edges(&self, id: NodeRevisionId) -> Vec<GraphEdge> {
+        self.view().outbound_edges(id)
+    }
+    fn primary_revision_for_identity(
+        &self,
+        branch_id: BranchId,
+        identity_id: IdentityId,
+    ) -> Option<NodeRevision> {
+        self.view()
+            .primary_revision_for_identity(branch_id, identity_id)
+    }
+    fn revision_ids_for_file(&self, branch_id: BranchId, file_path: &str) -> Vec<NodeRevisionId> {
+        self.view().revision_ids_for_file(branch_id, file_path)
+    }
+    fn identity_kind(&self, id: IdentityId) -> Option<NodeKind> {
+        self.view().identity_kind(id)
+    }
+    fn tombstone_revision_for_identity(
+        &self,
+        branch_id: BranchId,
+        identity_id: IdentityId,
+    ) -> Option<NodeRevision> {
+        self.view()
+            .tombstone_revision_for_identity(branch_id, identity_id)
+    }
+    fn revision_ids_for_body_hash(&self, body_hash: &[u8; 32]) -> Vec<NodeRevisionId> {
+        self.view().revision_ids_for_body_hash(body_hash)
+    }
+    fn find_revisions_qn_contains(
+        &self,
+        chain: &[BranchId],
+        needle: &str,
+        limit: usize,
+    ) -> Vec<NodeRevision> {
+        self.view()
+            .find_revisions_qn_contains(chain, needle, limit)
+    }
+    fn inbound_edges_to(
+        &self,
+        target: IdentityId,
+        ty: Option<EdgeType>,
+    ) -> Vec<(NodeRevision, GraphEdge)> {
+        self.view().inbound_edges_to(target, ty)
+    }
+    fn index_counts(&self) -> GraphIndexCounts {
+        self.view().index_counts()
+    }
+    fn identity_ids_on_branch(&self, branch: BranchId) -> Vec<IdentityId> {
+        self.view().identity_ids_on_branch(branch)
+    }
+    fn count_revisions_with_status(
+        &self,
+        chain: &[BranchId],
+        identity_id: IdentityId,
+        status: RevisionStatus,
+    ) -> usize {
+        self.view()
+            .count_revisions_with_status(chain, identity_id, status)
+    }
+    fn revisions_on_branches(&self, branches: &[BranchId]) -> Vec<NodeRevision> {
+        self.view().revisions_on_branches(branches)
+    }
+}
+
+impl GraphWrite for OverlayGraphMut<'_> {
+    fn put_identity(&mut self, id: NodeIdentity) {
+        self.overlay.put_identity(id);
+    }
+    fn put_revision(&mut self, rev: NodeRevision) {
+        self.overlay.put_revision(rev);
+    }
+    fn set_revision_status(&mut self, id: NodeRevisionId, status: RevisionStatus) {
+        self.cow_revision(id);
+        self.overlay.set_revision_status(id, status);
+    }
+    fn replace_edges_for_revision(
+        &mut self,
+        revision_id: NodeRevisionId,
+        edges: Vec<GraphEdge>,
+    ) -> Result<(), &'static str> {
+        self.cow_revision(revision_id);
+        self.overlay.replace_edges_for_revision(revision_id, edges)
+    }
+}
+
 impl GraphView for InMemoryGraph {
     fn get_revision(&self, id: NodeRevisionId) -> Option<NodeRevision> {
         InMemoryGraph::get_revision(self, id).cloned()
@@ -586,5 +714,42 @@ mod tests {
         assert_eq!(one[0].revision_id, rid(1));
         let all = GraphView::revisions_on_branches(&g, &[]);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn overlay_mut_cows_status_without_copying_unrelated_rows() {
+        let mut committed = InMemoryGraph::default();
+        committed.put_identity(NodeIdentity {
+            identity_id: iid(1),
+            kind: NodeKind::Function,
+        });
+        committed.put_revision(rev(1, 1, 1, RevisionStatus::Active, "keep"));
+        committed.put_identity(NodeIdentity {
+            identity_id: iid(2),
+            kind: NodeKind::Function,
+        });
+        committed.put_revision(rev(2, 2, 1, RevisionStatus::Active, "other"));
+        let mut overlay = InMemoryGraph::default();
+        {
+            let mut g = OverlayGraphMut {
+                overlay: &mut overlay,
+                committed: Some(&committed),
+            };
+            GraphWrite::set_revision_status(&mut g, rid(1), RevisionStatus::Orphaned);
+            assert_eq!(
+                GraphView::get_revision(&g, rid(1)).unwrap().status,
+                RevisionStatus::Orphaned
+            );
+            assert_eq!(
+                GraphView::get_revision(&g, rid(2)).unwrap().qualified_name,
+                "other"
+            );
+        }
+        assert_eq!(overlay.revision_count(), 1);
+        assert_eq!(
+            GraphView::get_revision(&overlay, rid(1)).unwrap().status,
+            RevisionStatus::Orphaned
+        );
+        assert!(GraphView::get_revision(&overlay, rid(2)).is_none());
     }
 }

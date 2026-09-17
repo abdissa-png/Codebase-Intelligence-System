@@ -1342,18 +1342,22 @@ pub fn module_map_for_paths(
         .collect()
 }
 
+use crate::graph_view::GraphView;
+
 /// Active revision file paths on a branch (language-agnostic).
-pub fn paths_on_branch(
-    graph: &crate::graph::InMemoryGraph,
-    branch: BranchId,
-) -> HashSet<String> {
-    graph.active_file_paths_on_branch(branch)
+pub fn paths_on_branch(graph: &dyn GraphView, branch: BranchId) -> HashSet<String> {
+    graph
+        .revisions_on_branches(&[branch])
+        .into_iter()
+        .filter(|r| matches!(r.status, RevisionStatus::Active) && !r.file_path.is_empty())
+        .map(|r| r.file_path)
+        .collect()
 }
 
 /// Collect distinct indexed source paths with active revisions on a branch.
 ///
 /// Historically Python-only; now keeps any path registered in [`crate::language_indexer::default_indexers`].
-pub fn python_paths_on_branch(graph: &crate::graph::InMemoryGraph, branch: BranchId) -> HashSet<String> {
+pub fn python_paths_on_branch(graph: &dyn GraphView, branch: BranchId) -> HashSet<String> {
     paths_on_branch(graph, branch)
         .into_iter()
         .filter(|p| crate::language_indexer::path_is_indexable(p))

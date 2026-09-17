@@ -195,7 +195,7 @@ pub use graph::{
     EdgeTypeMetadata, GraphEdge, InMemoryGraph, Language, NodeIdentity, NodeKind, NodeRevision,
     ReconciliationTier, RevisionStatus, SourceSpan, SourceType,
 };
-pub use graph_view::{GraphIndexCounts, GraphView, GraphWrite, OverlayGraphView};
+pub use graph_view::{GraphIndexCounts, GraphView, GraphWrite, OverlayGraphMut, OverlayGraphView};
 pub use graph::FROM_SNAPSHOT_CALLS;
 pub use graph_consistency::{check_consistency, check_consistency_on_view, ConsistencyReport};
 pub use invariants::{

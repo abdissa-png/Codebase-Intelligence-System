@@ -501,6 +501,37 @@ impl WriteCoordinator {
         f(&*g)
     }
 
+    /// Run merge/cancel/recover against the durable graph without hydrating every row.
+    ///
+    /// SQLite-primary: copy-on-write overlay, then flush. JSON/RAM: mutate the live graph.
+    pub fn with_merge_write<R>(
+        &self,
+        f: impl FnOnce(&mut dyn crate::graph_view::GraphWrite) -> R,
+    ) -> Result<R, CoordinatorError> {
+        #[cfg(feature = "body-sqlite")]
+        if self.sqlite_primary {
+            let sql = self.sql_graph.clone();
+            let r = {
+                let mut overlay = self.graph.write();
+                *overlay = InMemoryGraph::default();
+                let committed = sql.as_ref().map(|s| s.as_ref() as &dyn crate::graph_view::GraphView);
+                let mut g = crate::graph_view::OverlayGraphMut {
+                    overlay: &mut overlay,
+                    committed,
+                };
+                f(&mut g)
+            };
+            self.flush_overlay_to_sql()?;
+            self.discard_overlay();
+            return Ok(r);
+        }
+        let r = {
+            let mut g = self.graph.write();
+            f(&mut *g)
+        };
+        Ok(r)
+    }
+
     /// Pull the file (+ branch tombstones) into the RAM overlay for ingest.
     pub fn preload_working_set(
         &self,

@@ -5,12 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use std::collections::HashSet;
-
 use cis_wal::BranchId;
 
 use crate::coordinator::{CoordinatorError, WriteCoordinator};
-use crate::graph::{InMemoryGraph, RevisionStatus};
+use crate::graph::RevisionStatus;
 use crate::shared_graph::SharedInMemoryGraph;
 use crate::identity_resolution::RenameConfig;
 use crate::ingest::{
@@ -162,8 +160,12 @@ impl IndexDebouncer {
     }
 }
 
-fn sync_revision_index_from_graph(
-    graph: &InMemoryGraph,
+/// Rebuild `ri:{branch}:*` from the durable graph (SQL when sqlite-primary).
+///
+/// Must not read the RAM overlay after sqlite ingest: `apply_index_events` discards
+/// it, and treating that empty overlay as source of truth would unbind every row.
+pub(crate) fn sync_revision_index_from_graph(
+    graph: &dyn crate::graph_view::GraphView,
     revision_index: &RevisionIndexCow,
     kv: &MemoryKv,
     branch: BranchId,
@@ -199,12 +201,7 @@ fn sync_revision_index_from_graph(
             _ => revision_index.unbind(identity),
         }
     }
-    let identities: HashSet<_> = graph
-        .revisions()
-        .filter(|r| r.branch_id == branch)
-        .map(|r| r.identity_id)
-        .collect();
-    for identity in identities {
+    for identity in graph.identity_ids_on_branch(branch) {
         if revision_index.lookup(identity).is_some() {
             continue;
         }
@@ -338,16 +335,18 @@ pub fn reindex_paths_on_coordinator(
         rename_config,
     )?;
 
-    let g = coord.graph().read();
-    sync_revision_index_from_graph(&g, revision_index, kv.as_ref(), branch);
-    drop(g);
+    coord.with_graph_view(|g| {
+        sync_revision_index_from_graph(g, revision_index, kv.as_ref(), branch);
+    });
     if reindex_persist_snapshots_enabled() {
         if let Err(e) = coord.wal().flush_persistent() {
             return Err(CoordinatorError::Persist(e.to_string()));
         }
-        let g = coord.graph().read();
-        save_workspace_snapshots(&cis_dir(&root), &g, coord.vector(), kv.as_ref())
-            .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
+        if !coord.sqlite_primary() {
+            let g = coord.graph().read();
+            save_workspace_snapshots(&cis_dir(&root), &g, coord.vector(), kv.as_ref())
+                .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
+        }
     }
 
     Ok(rep)

@@ -169,6 +169,93 @@ impl crate::graph_view::GraphView for GraphReadGuard<'_> {
     }
 }
 
+impl crate::graph_view::GraphView for GraphWriteGuard<'_> {
+    fn get_revision(&self, id: cis_wal::NodeRevisionId) -> Option<crate::graph::NodeRevision> {
+        crate::graph_view::GraphView::get_revision(&**self, id)
+    }
+    fn outbound_edges(&self, id: cis_wal::NodeRevisionId) -> Vec<crate::graph::GraphEdge> {
+        crate::graph_view::GraphView::outbound_edges(&**self, id)
+    }
+    fn primary_revision_for_identity(
+        &self,
+        branch_id: cis_wal::BranchId,
+        identity_id: cis_wal::IdentityId,
+    ) -> Option<crate::graph::NodeRevision> {
+        crate::graph_view::GraphView::primary_revision_for_identity(&**self, branch_id, identity_id)
+    }
+    fn revision_ids_for_file(
+        &self,
+        branch_id: cis_wal::BranchId,
+        file_path: &str,
+    ) -> Vec<cis_wal::NodeRevisionId> {
+        crate::graph_view::GraphView::revision_ids_for_file(&**self, branch_id, file_path)
+    }
+    fn identity_kind(&self, id: cis_wal::IdentityId) -> Option<crate::graph::NodeKind> {
+        crate::graph_view::GraphView::identity_kind(&**self, id)
+    }
+    fn tombstone_revision_for_identity(
+        &self,
+        branch_id: cis_wal::BranchId,
+        identity_id: cis_wal::IdentityId,
+    ) -> Option<crate::graph::NodeRevision> {
+        crate::graph_view::GraphView::tombstone_revision_for_identity(&**self, branch_id, identity_id)
+    }
+    fn revision_ids_for_body_hash(&self, body_hash: &[u8; 32]) -> Vec<cis_wal::NodeRevisionId> {
+        crate::graph_view::GraphView::revision_ids_for_body_hash(&**self, body_hash)
+    }
+    fn find_revisions_qn_contains(
+        &self,
+        chain: &[cis_wal::BranchId],
+        needle: &str,
+        limit: usize,
+    ) -> Vec<crate::graph::NodeRevision> {
+        crate::graph_view::GraphView::find_revisions_qn_contains(&**self, chain, needle, limit)
+    }
+    fn inbound_edges_to(
+        &self,
+        target: cis_wal::IdentityId,
+        ty: Option<crate::graph::EdgeType>,
+    ) -> Vec<(crate::graph::NodeRevision, crate::graph::GraphEdge)> {
+        crate::graph_view::GraphView::inbound_edges_to(&**self, target, ty)
+    }
+    fn index_counts(&self) -> crate::graph_view::GraphIndexCounts {
+        crate::graph_view::GraphView::index_counts(&**self)
+    }
+    fn identity_ids_on_branch(&self, branch: cis_wal::BranchId) -> Vec<cis_wal::IdentityId> {
+        crate::graph_view::GraphView::identity_ids_on_branch(&**self, branch)
+    }
+    fn count_revisions_with_status(
+        &self,
+        chain: &[cis_wal::BranchId],
+        identity_id: cis_wal::IdentityId,
+        status: crate::graph::RevisionStatus,
+    ) -> usize {
+        crate::graph_view::GraphView::count_revisions_with_status(&**self, chain, identity_id, status)
+    }
+    fn revisions_on_branches(&self, branches: &[cis_wal::BranchId]) -> Vec<crate::graph::NodeRevision> {
+        crate::graph_view::GraphView::revisions_on_branches(&**self, branches)
+    }
+}
+
+impl crate::graph_view::GraphWrite for GraphWriteGuard<'_> {
+    fn put_identity(&mut self, id: crate::graph::NodeIdentity) {
+        crate::graph_view::GraphWrite::put_identity(&mut **self, id);
+    }
+    fn put_revision(&mut self, rev: crate::graph::NodeRevision) {
+        crate::graph_view::GraphWrite::put_revision(&mut **self, rev);
+    }
+    fn set_revision_status(&mut self, id: cis_wal::NodeRevisionId, status: crate::graph::RevisionStatus) {
+        crate::graph_view::GraphWrite::set_revision_status(&mut **self, id, status);
+    }
+    fn replace_edges_for_revision(
+        &mut self,
+        revision_id: cis_wal::NodeRevisionId,
+        edges: Vec<crate::graph::GraphEdge>,
+    ) -> Result<(), &'static str> {
+        crate::graph_view::GraphWrite::replace_edges_for_revision(&mut **self, revision_id, edges)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

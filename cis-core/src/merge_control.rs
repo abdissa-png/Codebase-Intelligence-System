@@ -7,7 +7,7 @@ use cis_wal::{BranchId, IdentityId, MergeId, NodeRevisionId};
 use thiserror::Error;
 
 use crate::chunk_id::chunk_id;
-use crate::graph::InMemoryGraph;
+use crate::graph_view::GraphWrite;
 use crate::kv::{CasError, MemoryKv};
 use crate::merge_lock;
 use crate::revision_index::revision_binding_kv_key;
@@ -130,7 +130,7 @@ impl MergeControl {
         &self,
         merge_id: MergeId,
         branch_id: BranchId,
-        graph: &mut InMemoryGraph,
+        graph: &mut dyn GraphWrite,
         vector: &dyn VectorChunkStore,
         vector_dlq: Option<&VectorCleanupQueue>,
         clear_edges_for: &[NodeRevisionId],
@@ -197,7 +197,8 @@ mod tests {
     use super::*;
     use crate::chunk_id::chunk_id;
     use crate::graph::{
-        EdgeResolution, Language, NodeIdentity, NodeKind, NodeRevision, RevisionStatus, SourceType,
+        EdgeResolution, InMemoryGraph, Language, NodeIdentity, NodeKind, NodeRevision,
+        RevisionStatus, SourceType,
     };
     use crate::merge_lock::acquire_merge_lock;
     use crate::revision_index::RevisionIndex;

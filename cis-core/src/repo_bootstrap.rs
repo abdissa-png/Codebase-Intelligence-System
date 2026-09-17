@@ -1,13 +1,12 @@
 //! **FR-1.5** — filesystem walk + coordinator ingest on the runtime’s shared graph (**Phase 3**).
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cis_wal::BranchId;
 
 use crate::coordinator::{CoordinatorError, WriteCoordinator};
-use crate::fs_sync::reindex_persist_snapshots_enabled;
+use crate::fs_sync::{reindex_persist_snapshots_enabled, sync_revision_index_from_graph};
 use crate::graph::InMemoryGraph;
 use crate::identity_resolution::RenameConfig;
 use crate::ingest::{
@@ -52,80 +51,12 @@ pub fn collect_py_files(root: &Path, out: &mut Vec<PathBuf>) {
     collect_source_files(root, &["py"], out);
 }
 
-fn sync_revision_index_from_graph(
-    graph: &InMemoryGraph,
-    revision_index: &RevisionIndexCow,
-    kv: &MemoryKv,
-    branch: BranchId,
-) {
-    let branch_hex = branch
-        .0
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-    let prefix = format!("ri:{branch_hex}:");
-    let keys: Vec<String> = kv
-        .scan_prefix(&prefix)
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
-    for key in keys {
-        let parts: Vec<&str> = key.split(':').collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let Some(identity) = parse_identity_hex(parts[2]) else {
-            continue;
-        };
-        match graph.primary_revision_for_identity(branch, identity) {
-            Some(rev)
-                if matches!(
-                    rev.status,
-                    crate::graph::RevisionStatus::Active | crate::graph::RevisionStatus::Speculative
-                ) =>
-            {
-                revision_index.bind(identity, rev.revision_id);
-            }
-            _ => revision_index.unbind(identity),
-        }
-    }
-    let identities: HashSet<_> = graph
-        .revisions()
-        .filter(|r| r.branch_id == branch)
-        .map(|r| r.identity_id)
-        .collect();
-    for identity in identities {
-        if revision_index.lookup(identity).is_some() {
-            continue;
-        }
-        if let Some(rev) = graph.primary_revision_for_identity(branch, identity) {
-            if matches!(
-                rev.status,
-                crate::graph::RevisionStatus::Active | crate::graph::RevisionStatus::Speculative
-            ) {
-                revision_index.bind(identity, rev.revision_id);
-            }
-        }
-    }
-}
-
-fn parse_identity_hex(s: &str) -> Option<cis_wal::IdentityId> {
-    if s.len() != 32 {
-        return None;
-    }
-    let mut b = [0u8; 16];
-    for i in 0..16 {
-        b[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(cis_wal::IdentityId(b))
-}
-
 fn maybe_persist_workspace(
     root: &Path,
     coord: &WriteCoordinator,
     kv: &MemoryKv,
 ) -> Result<(), CoordinatorError> {
-    if !reindex_persist_snapshots_enabled() {
+    if !reindex_persist_snapshots_enabled() || coord.sqlite_primary() {
         return Ok(());
     }
     let g = coord.graph().read();
@@ -149,9 +80,9 @@ pub fn bootstrap_python_workspace_on_coordinator(
     let force = std::env::var_os("CIS_FORCE_REINDEX").is_some_and(|v| v == "1");
     let existing_revisions = coord.durable_revision_count();
     if existing_revisions > 0 && !force {
-        let g = coord.graph().read();
-        sync_revision_index_from_graph(&g, revision_index, kv.as_ref(), branch);
-        drop(g);
+        coord.with_graph_view(|g| {
+            sync_revision_index_from_graph(g, revision_index, kv.as_ref(), branch);
+        });
         maybe_persist_workspace(&root, coord, kv.as_ref())?;
         return Ok(IngestApplyReport::default());
     }
@@ -221,9 +152,9 @@ pub fn bootstrap_python_workspace_on_coordinator(
         rep.skipped_non_py + rep.skipped_empty_py,
     );
 
-    let g = coord.graph().read();
-    sync_revision_index_from_graph(&g, revision_index, kv.as_ref(), branch);
-    drop(g);
+    coord.with_graph_view(|g| {
+        sync_revision_index_from_graph(g, revision_index, kv.as_ref(), branch);
+    });
     maybe_persist_workspace(&root, coord, kv.as_ref())?;
 
     Ok(rep)

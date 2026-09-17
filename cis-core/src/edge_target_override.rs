@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
-use crate::graph::InMemoryGraph;
+use crate::graph_view::GraphView;
 use crate::kv::MemoryKv;
 
 fn hex16(b: &[u8; 16]) -> String {
@@ -167,7 +167,7 @@ impl EdgeTargetOverrideStore {
     /// even after the old identity's tombstone is GC'd.
     pub fn retarget_inbound_edges_for_rename(
         &self,
-        graph: &InMemoryGraph,
+        graph: &dyn GraphView,
         branch: BranchId,
         old_target: IdentityId,
         new_target: IdentityId,
@@ -184,7 +184,7 @@ impl EdgeTargetOverrideStore {
 /// any live Active/Speculative revision of the source identity (merge graphs often
 /// keep edges on base-branch revision rows that are merely rebound on the target).
 pub fn retarget_inbound_edges_for_rename(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     eto: &EdgeTargetOverrideStore,
     branch: BranchId,
     old_target: IdentityId,
@@ -194,12 +194,19 @@ pub fn retarget_inbound_edges_for_rename(
         return 0;
     }
     let mut n = 0usize;
-    for src_iid in graph.source_identities_targeting(old_target) {
+    let inbound = graph.inbound_edges_to(old_target, None);
+    let mut source_ids = Vec::new();
+    for (rev, _) in &inbound {
+        if !source_ids.contains(&rev.identity_id) {
+            source_ids.push(rev.identity_id);
+        }
+    }
+    for src_iid in source_ids {
         let mut source_revs: Vec<NodeRevisionId> = Vec::new();
         if let Some(src) = graph.primary_revision_for_identity(branch, src_iid) {
             source_revs.push(src.revision_id);
         } else {
-            for rev in graph.revisions() {
+            for (rev, _) in &inbound {
                 if rev.identity_id == src_iid
                     && matches!(
                         rev.status,
@@ -227,7 +234,7 @@ pub fn retarget_inbound_edges_for_rename(
 /// live edges still target it (query resolution still needs tombstone bridging /
 /// pending ETO coverage).
 pub fn tombstone_needed_for_inbound_bridge(
-    graph: &InMemoryGraph,
+    graph: &dyn GraphView,
     branch_id: BranchId,
     identity_id: IdentityId,
 ) -> bool {
@@ -237,7 +244,7 @@ pub fn tombstone_needed_for_inbound_bridge(
     {
         return false;
     }
-    !graph.source_identities_targeting(identity_id).is_empty()
+    !graph.inbound_edges_to(identity_id, None).is_empty()
 }
 
 fn parse_hex16_id(s: &str) -> Option<[u8; 16]> {
@@ -391,8 +398,8 @@ mod tests {
     #[test]
     fn retarget_inbound_edges_writes_eto_for_live_callers() {
         use crate::graph::{
-            EdgeResolution, EdgeType, GraphEdge, Language, NodeIdentity, NodeKind, NodeRevision,
-            RevisionStatus, SourceSpan, SourceType,
+            EdgeResolution, EdgeType, GraphEdge, InMemoryGraph, Language, NodeIdentity, NodeKind,
+            NodeRevision, RevisionStatus, SourceSpan, SourceType,
         };
         let kv = Arc::new(MemoryKv::new());
         let eto = EdgeTargetOverrideStore::new(kv);
@@ -461,8 +468,8 @@ mod tests {
     #[test]
     fn tombstone_needed_when_no_live_primary_and_inbound_edges() {
         use crate::graph::{
-            EdgeResolution, EdgeType, GraphEdge, Language, NodeIdentity, NodeKind, NodeRevision,
-            RevisionStatus, SourceSpan, SourceType,
+            EdgeResolution, EdgeType, GraphEdge, InMemoryGraph, Language, NodeIdentity, NodeKind,
+            NodeRevision, RevisionStatus, SourceSpan, SourceType,
         };
         let mut g = InMemoryGraph::default();
         let branch = BranchId([1u8; 16]);
