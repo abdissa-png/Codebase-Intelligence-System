@@ -849,7 +849,28 @@ pub(crate) fn resolve_call_target(
     batch_indexes: &HashMap<String, FileIndex>,
 ) -> Option<IdentityId> {
     let import_bindings = build_import_bindings(&index.imports, mod_map, path);
+    resolve_call_target_with_bindings(
+        path,
+        branch,
+        index,
+        call,
+        mod_map,
+        graph,
+        batch_indexes,
+        &import_bindings,
+    )
+}
 
+fn resolve_call_target_with_bindings(
+    path: &str,
+    branch: BranchId,
+    index: &FileIndex,
+    call: &ParsedCall,
+    mod_map: &HashMap<String, String>,
+    graph: Option<&dyn crate::graph_view::GraphView>,
+    batch_indexes: &HashMap<String, FileIndex>,
+    import_bindings: &HashMap<String, ImportBinding>,
+) -> Option<IdentityId> {
     if let Some(id) = resolve_imported_ufcs_target(
         path,
         branch,
@@ -1291,6 +1312,7 @@ pub(crate) fn attach_import_and_call_edges(
             ));
         }
     }
+    let import_bindings = build_import_bindings(&index.imports, mod_map, path);
     for call in &index.calls {
         let Some(caller_ikey) = identity_key_for_owner(index, &call.caller_stable_key)
             .or_else(|| identity_key_for_owner(index, "$file"))
@@ -1299,7 +1321,7 @@ pub(crate) fn attach_import_and_call_edges(
         };
         let caller_rid = NodeRevisionId(stable_rev_id_bytes(branch, path, &caller_ikey));
         let caller_scope = scope_start_line_for_key(index, &call.caller_stable_key);
-        if let Some(tiid) = resolve_call_target(
+        if let Some(tiid) = resolve_call_target_with_bindings(
             path,
             branch,
             index,
@@ -1307,6 +1329,7 @@ pub(crate) fn attach_import_and_call_edges(
             mod_map,
             graph,
             batch_indexes,
+            &import_bindings,
         ) {
             let label = format!("{}->{}", call.caller_stable_key, call.callee.label());
             edge_map.entry(caller_rid).or_default().push(call_edge(

@@ -163,6 +163,10 @@ fn spawn_background_threads(
         .name("cis-tombstone-gc".into())
         .spawn(move || loop {
             worker_hb_gc.tick("cis-tombstone-gc");
+            if coord_gc.snapshot_flush_deferred() {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
             let policy = policy_gc
                 .as_ref()
                 .map(|r| r.active().snapshot())
@@ -276,6 +280,10 @@ fn spawn_background_threads(
             let mut fail_streak: u32 = 0;
             loop {
                 worker_hb_vec.tick("cis-vector-cleanup");
+                if coord_bg.snapshot_flush_deferred() {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 let rep = cleaner.drain_batch(coord_bg.vector_chunk_store(), 64);
                 let delay = if rep.attempted == 0 {
                     fail_streak = 0;
@@ -312,6 +320,10 @@ fn spawn_background_threads(
             let mut fail_streak: u32 = 0;
             loop {
                 worker_hb_embed.tick("cis-embedding-worker");
+                if coord_embed.snapshot_flush_deferred() {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 let rep = EmbeddingWorker::drain_batch(
                     &coord_embed,
                     embedder.as_ref(),

@@ -204,6 +204,7 @@ pub fn apply_index_events_with_config(
     coord.discard_overlay();
 
     // Pre-parse batch so cross-file `Calls` resolve regardless of ingest order.
+    let parse_t0 = std::time::Instant::now();
     let mut batch_indexes: HashMap<String, FileIndex> = HashMap::new();
     for ev in &events {
         let Some(indexer) = indexer_for_path(&ev.path, &indexers) else {
@@ -223,6 +224,17 @@ pub fn apply_index_events_with_config(
             }
         }
     }
+    if events.len() >= 20 {
+        eprintln!(
+            "cis-mcp: index ingest pre-parse {} files in {:.1}s",
+            batch_indexes.len(),
+            parse_t0.elapsed().as_secs_f64()
+        );
+    }
+    if let Some(first) = events.first() {
+        let _ = coord.preload_branch_tombstones(first.branch_id);
+    }
+    let batch_indexes = Arc::new(batch_indexes);
 
     let mut rep = IngestApplyReport::default();
     let progress_total = events.len();
@@ -325,12 +337,12 @@ pub fn apply_index_events_with_config(
         let mut index = index;
         let lang = indexer.language();
         let branch = ev.branch_id;
+        let file_t0 = std::time::Instant::now();
         coord.preload_working_set(branch, &ev.path)?;
         {
             let g = coord.graph().read();
             stabilize_disambiguators(&mut index, &ev.path, branch, &*g);
         }
-        batch_indexes.insert(ev.path.clone(), index.clone());
         let revs: Vec<NodeRevisionId> = index
             .symbols
             .iter()
@@ -340,6 +352,8 @@ pub fn apply_index_events_with_config(
         let id = coord.begin_mutation(&set)?;
         let path = ev.path.clone();
         let index_c = index;
+        let symbol_n = index_c.symbols.len();
+        let call_n = index_c.calls.len();
         let mod_map = module_to_path.clone();
         let path_c = path.clone();
         let file_content = content.clone();
@@ -347,7 +361,7 @@ pub fn apply_index_events_with_config(
         let resolver_c = resolver.clone();
         let body_store_c = body_store.clone();
         let identity_cas_c = identity_cas.clone();
-        let batch_indexes_c = batch_indexes.clone();
+        let batch_indexes_c = Arc::clone(&batch_indexes);
         let lang_c = lang;
         let absence_c = absence.clone();
         let kv_c = Arc::clone(&kv);
@@ -597,6 +611,13 @@ pub fn apply_index_events_with_config(
             }
         }
         coord.commit_vector(id)?;
+        let file_ms = file_t0.elapsed().as_millis();
+        if file_ms >= 2000 {
+            eprintln!(
+                "cis-mcp: index ingest slow file {} ({}ms, {} symbols, {} calls)",
+                ev.path, file_ms, symbol_n, call_n
+            );
+        }
         if let Some(ri) = &time_travel_ri {
             crate::time_travel::record_committed_snapshot(
                 ri.as_ref(),

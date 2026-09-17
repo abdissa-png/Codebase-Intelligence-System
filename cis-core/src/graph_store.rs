@@ -214,9 +214,11 @@ mod sqlite {
             extra BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_revisions_branch_file ON revisions(branch_id, file_path);
+        CREATE INDEX IF NOT EXISTS idx_revisions_file_path ON revisions(file_path);
         CREATE INDEX IF NOT EXISTS idx_revisions_branch_identity ON revisions(branch_id, identity_id);
         CREATE INDEX IF NOT EXISTS idx_revisions_body_hash ON revisions(body_hash);
         CREATE INDEX IF NOT EXISTS idx_revisions_branch_qn ON revisions(branch_id, qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_revisions_branch_status ON revisions(branch_id, status);
         CREATE TABLE IF NOT EXISTS edges (
             edge_id BLOB PRIMARY KEY,
             source_revision_id BLOB NOT NULL,
@@ -778,24 +780,85 @@ mod sqlite {
             Ok(total)
         }
 
-        /// Load one file (all branches) plus branch tombstones into `graph` without a full hydrate.
+        fn absorb_revisions(
+            conn: &Connection,
+            graph: &mut InMemoryGraph,
+            revs: Vec<NodeRevision>,
+        ) -> io::Result<usize> {
+            let mut ident_ids: std::collections::HashSet<IdentityId> =
+                std::collections::HashSet::new();
+            let mut rids: Vec<NodeRevisionId> = Vec::new();
+            for rev in &revs {
+                ident_ids.insert(rev.identity_id);
+                rids.push(rev.revision_id);
+            }
+            for iid in &ident_ids {
+                let kind = conn
+                    .query_row(
+                        "SELECT kind FROM identities WHERE identity_id = ?1",
+                        params![iid.0.as_slice()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .ok()
+                    .map(NodeKind::from_i64)
+                    .unwrap_or(NodeKind::Function);
+                graph.put_identity(NodeIdentity {
+                    identity_id: *iid,
+                    kind,
+                });
+            }
+            for rev in revs {
+                graph.put_revision(rev);
+            }
+            let mut estmt = conn
+                .prepare(
+                    "SELECT edge_id, source_revision_id, target_identity_id, ty, extra
+                     FROM edges WHERE source_revision_id = ?1 ORDER BY edge_id",
+                )
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            for rid in &rids {
+                let eiter = estmt
+                    .query_map(params![rid.0.as_slice()], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                        ))
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut edges = Vec::new();
+                for er in eiter {
+                    let t = er.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(e) = Self::edge_from_parts(t.0, t.1, t.2, t.3, t.4)? {
+                        edges.push(e);
+                    }
+                }
+                if !edges.is_empty() {
+                    let _ = graph.replace_edges_for_revision(*rid, edges);
+                }
+            }
+            Ok(rids.len())
+        }
+
+        /// Load one file (all branches) into `graph` without a full hydrate.
         pub fn hydrate_working_set(
             &self,
             graph: &mut InMemoryGraph,
-            branch: BranchId,
+            _branch: BranchId,
             file_path: &str,
         ) -> io::Result<usize> {
             self.with_conn(|conn| {
                 let sql = format!(
-                    "SELECT {} FROM revisions WHERE file_path = ?1
-                     OR (branch_id = ?2 AND status = 2)",
+                    "SELECT {} FROM revisions WHERE file_path = ?1",
                     Self::REV_COLS
                 );
                 let mut stmt = conn
                     .prepare(&sql)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 let iter = stmt
-                    .query_map(params![file_path, branch.0.as_slice()], |row| {
+                    .query_map(params![file_path], |row| {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
@@ -819,62 +882,50 @@ mod sqlite {
                         revs.push(rev);
                     }
                 }
-                let mut ident_ids: std::collections::HashSet<IdentityId> =
-                    std::collections::HashSet::new();
-                let mut rids: Vec<NodeRevisionId> = Vec::new();
-                for rev in &revs {
-                    ident_ids.insert(rev.identity_id);
-                    rids.push(rev.revision_id);
-                }
-                for iid in &ident_ids {
-                    let kind = conn
-                        .query_row(
-                            "SELECT kind FROM identities WHERE identity_id = ?1",
-                            params![iid.0.as_slice()],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .ok()
-                        .map(NodeKind::from_i64)
-                        .unwrap_or(NodeKind::Function);
-                    graph.put_identity(NodeIdentity {
-                        identity_id: *iid,
-                        kind,
-                    });
-                }
-                for rev in revs {
-                    graph.put_revision(rev);
-                }
-                for rid in &rids {
-                    let mut estmt = conn
-                        .prepare(
-                            "SELECT edge_id, source_revision_id, target_identity_id, ty, extra
-                             FROM edges WHERE source_revision_id = ?1 ORDER BY edge_id",
-                        )
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    let eiter = estmt
-                        .query_map(params![rid.0.as_slice()], |row| {
-                            Ok((
-                                row.get::<_, Vec<u8>>(0)?,
-                                row.get::<_, Vec<u8>>(1)?,
-                                row.get::<_, Vec<u8>>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, Vec<u8>>(4)?,
-                            ))
-                        })
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    let mut edges = Vec::new();
-                    for er in eiter {
-                        let t = er.map_err(|e| io::Error::other(e.to_string()))?;
-                        if let Some(e) = Self::edge_from_parts(t.0, t.1, t.2, t.3, t.4)? {
-                            edges.push(e);
-                        }
-                    }
-                    drop(estmt);
-                    if !edges.is_empty() {
-                        let _ = graph.replace_edges_for_revision(*rid, edges);
+                Self::absorb_revisions(conn, graph, revs)
+            })
+        }
+
+        /// Load tombstones for `branch` once per ingest batch (rename detection).
+        pub fn hydrate_branch_tombstones(
+            &self,
+            graph: &mut InMemoryGraph,
+            branch: BranchId,
+        ) -> io::Result<usize> {
+            self.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT {} FROM revisions WHERE branch_id = ?1 AND status = 2",
+                    Self::REV_COLS
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let iter = stmt
+                    .query_map(params![branch.0.as_slice()], |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, Vec<u8>>(9)?,
+                        ))
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let mut revs = Vec::new();
+                for r in iter {
+                    let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                    if let Some(rev) =
+                        Self::map_revision_tuple(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)?
+                    {
+                        revs.push(rev);
                     }
                 }
-                Ok(rids.len())
+                Self::absorb_revisions(conn, graph, revs)
             })
         }
 

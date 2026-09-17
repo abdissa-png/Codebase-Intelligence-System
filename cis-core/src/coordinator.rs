@@ -48,6 +48,41 @@ pub struct CoordinatorPersistence {
     pub cis_dir: PathBuf,
 }
 
+/// Revisions to persist when flushing the sqlite-primary RAM overlay.
+///
+/// - Empty `affected` → entire overlay ([`WriteCoordinator::flush_overlay_to_sql`], merge writes).
+/// - Otherwise → WAL `affected_revisions` plus every overlay revision on the same `file_path`,
+///   so content-addressed remaps (stable id ≠ final revision id) are included without
+///   re-upserting unrelated files accumulated in the overlay during batch ingest.
+/// - Sentinel ids with no graph row (file-delete mutations) → full overlay fallback.
+fn sqlite_flush_revision_ids(
+    graph: &InMemoryGraph,
+    affected: &[cis_wal::NodeRevisionId],
+) -> Vec<cis_wal::NodeRevisionId> {
+    use std::collections::HashSet;
+
+    if affected.is_empty() {
+        return graph.revisions().map(|r| r.revision_id).collect();
+    }
+
+    let mut ids: HashSet<cis_wal::NodeRevisionId> = affected.iter().copied().collect();
+    let paths: HashSet<String> = affected
+        .iter()
+        .filter_map(|rid| graph.get_revision(*rid).map(|r| r.file_path.clone()))
+        .collect();
+
+    if paths.is_empty() {
+        return graph.revisions().map(|r| r.revision_id).collect();
+    }
+
+    for rev in graph.revisions() {
+        if paths.contains(&rev.file_path) {
+            ids.insert(rev.revision_id);
+        }
+    }
+    ids.into_iter().collect()
+}
+
 pub struct WriteCoordinator {
     wal: Arc<dyn MutationLogStore>,
     graph: SharedInMemoryGraph,
@@ -213,6 +248,12 @@ impl WriteCoordinator {
             || !crate::persistence::snapshot_persist_enabled()
     }
 
+    /// True while batch ingest has deferred snapshot flushes. Embedding/cleanup
+    /// workers should idle so they do not contend on the unified SQLite file.
+    pub fn snapshot_flush_deferred(&self) -> bool {
+        self.defer_snapshot_flush.load(Ordering::SeqCst)
+    }
+
     pub fn persistence_dir(&self) -> Option<&Path> {
         self.persistence.as_ref().map(|p| p.cis_dir.as_path())
     }
@@ -263,10 +304,7 @@ impl WriteCoordinator {
                     return Ok(());
                 };
                 let g = self.graph.read();
-                let mut ids: Vec<_> = g.revisions().map(|r| r.revision_id).collect();
-                if ids.is_empty() {
-                    ids.extend_from_slice(affected);
-                }
+                let ids = sqlite_flush_revision_ids(&g, affected);
                 if ids.is_empty() {
                     return Ok(());
                 }
@@ -292,28 +330,14 @@ impl WriteCoordinator {
     }
 
     fn flush_graph_snapshot_inner(&self, force: bool) -> Result<(), CoordinatorError> {
+        if self.sqlite_primary {
+            // Deltas already persist each mutation. A full DELETE+rewrite from the
+            // RAM overlay is both slow and unsafe (partial overlays).
+            return Ok(());
+        }
         let Some(ref p) = self.persistence else {
             return Ok(());
         };
-        if self.sqlite_primary {
-            #[cfg(feature = "body-sqlite")]
-            {
-                let overlay_n = self.graph.read().revision_count();
-                let sql_n = self
-                    .sql_graph
-                    .as_ref()
-                    .and_then(|s| s.durable_revision_count().ok())
-                    .unwrap_or(0);
-                // Partial ingest overlay must never DELETE+rewrite the SQL graph.
-                if overlay_n == 0 || overlay_n < sql_n {
-                    return Ok(());
-                }
-            }
-            #[cfg(not(feature = "body-sqlite"))]
-            {
-                return Ok(());
-            }
-        }
         if !force && self.should_skip_auto_snapshot_flush() {
             return Ok(());
         }
@@ -532,7 +556,8 @@ impl WriteCoordinator {
         Ok(r)
     }
 
-    /// Pull the file (+ branch tombstones) into the RAM overlay for ingest.
+    /// Pull the file into the RAM overlay for ingest. Branch tombstones are loaded
+    /// once per batch via [`Self::preload_branch_tombstones`].
     pub fn preload_working_set(
         &self,
         branch: cis_wal::BranchId,
@@ -548,6 +573,24 @@ impl WriteCoordinator {
                 .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
         }
         let _ = (branch, file_path);
+        Ok(())
+    }
+
+    /// Load rename-detection tombstones for `branch` (once per ingest batch).
+    pub fn preload_branch_tombstones(
+        &self,
+        branch: cis_wal::BranchId,
+    ) -> Result<(), CoordinatorError> {
+        #[cfg(feature = "body-sqlite")]
+        if self.sqlite_primary {
+            let Some(sql) = &self.sql_graph else {
+                return Ok(());
+            };
+            let mut g = self.graph.write();
+            sql.hydrate_branch_tombstones(&mut g, branch)
+                .map_err(|e| CoordinatorError::Persist(e.to_string()))?;
+        }
+        let _ = branch;
         Ok(())
     }
 
@@ -698,8 +741,10 @@ impl WriteCoordinator {
             .lock()
             .unwrap()
             .apply_transition(&rec_vd, MutationPhase::Committed);
-        self.flush_graph_snapshot()?;
-        self.flush_vector_snapshot()?;
+        if !self.should_skip_auto_snapshot_flush() {
+            self.flush_graph_snapshot()?;
+            self.flush_vector_snapshot()?;
+        }
         Ok(())
     }
 
@@ -839,6 +884,63 @@ mod tests {
         let mut b = [0u8; 16];
         b[14] = x;
         IdentityId(b)
+    }
+
+    fn sample_revision(rid: NodeRevisionId, path: &str) -> NodeRevision {
+        NodeRevision {
+            revision_id: rid,
+            identity_id: iid(rid.0[15]),
+            branch_id: BranchId([0u8; 16]),
+            status: RevisionStatus::Active,
+            qualified_name: format!("sym_{}", rid.0[15]),
+            file_path: path.into(),
+            body_hash: [3u8; 32],
+            signature_hash: [4u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            tombstoned_at_ms: None,
+            span: crate::graph::SourceSpan::UNKNOWN,
+        }
+    }
+
+    #[test]
+    fn sqlite_flush_revision_ids_empty_affected_flushes_overlay() {
+        let mut g = InMemoryGraph::default();
+        let r1 = rid(1);
+        let r2 = rid(2);
+        g.put_revision(sample_revision(r1, "a.py"));
+        g.put_revision(sample_revision(r2, "b.py"));
+        let ids = sqlite_flush_revision_ids(&g, &[]);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&r1));
+        assert!(ids.contains(&r2));
+    }
+
+    #[test]
+    fn sqlite_flush_revision_ids_scopes_to_affected_file_paths() {
+        let mut g = InMemoryGraph::default();
+        let stable = rid(1);
+        let content = rid(2);
+        g.put_revision(sample_revision(stable, "a.py"));
+        g.put_revision(sample_revision(content, "a.py"));
+        g.put_revision(sample_revision(rid(3), "b.py"));
+
+        let ids = sqlite_flush_revision_ids(&g, &[stable]);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&stable));
+        assert!(ids.contains(&content));
+        assert!(!ids.contains(&rid(3)));
+    }
+
+    #[test]
+    fn sqlite_flush_revision_ids_sentinel_falls_back_to_overlay() {
+        let mut g = InMemoryGraph::default();
+        let tomb = rid(1);
+        g.put_revision(sample_revision(tomb, "gone.py"));
+        let sentinel = rid(99);
+        let ids = sqlite_flush_revision_ids(&g, &[sentinel]);
+        assert_eq!(ids, vec![tomb]);
     }
 
     #[test]
