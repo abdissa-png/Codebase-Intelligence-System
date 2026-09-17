@@ -9,7 +9,7 @@ name = "cis_mcp"
 path = "src/lib.rs"
 
 [features]
-default = ["fs-notify"]
+default = ["fs-notify", "body-sqlite"]
 # Native inotify/kqueue FS watch (Phase 2); disable with `CIS_FS_POLL_ONLY=1` at runtime.
 fs-notify = ["cis-core/fs-notify"]
 # Enable richer Python ingest (classes/methods + call extraction) via cis-core tree-sitter path.
@@ -27,7 +27,7 @@ ts-cpp = ["cis-core/ts-cpp"]
 ts-csharp = ["cis-core/ts-csharp"]
 # Phase 6 — external HTTP embedding API (OpenAI-compatible).
 api-embeddings = ["cis-core/api-embeddings"]
-# Phase 8 — SQLite body/metadata backends for migration tools.
+# SQLite graph/KV/WAL/vector/body stores. `cisd --mcp` defaults unset CIS_*_BACKEND to sqlite.
 body-sqlite = ["cis-core/body-sqlite"]
 
 [dependencies]

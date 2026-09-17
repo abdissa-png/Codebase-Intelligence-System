@@ -85,9 +85,11 @@ impl WorkerHeartbeats {
                 let secs = now.saturating_sub(last) / 1000;
                 (Some(last), Some(secs))
             };
+            // Never-started workers are optional (e.g. `cis-policy-watch` when no
+            // policy file exists). Do not treat last_tick=0 as stale.
             let stale = secs_since
                 .map(|s| s > expected.saturating_mul(2))
-                .unwrap_or(true);
+                .unwrap_or(false);
             if stale {
                 any_stale = true;
             }
@@ -103,5 +105,41 @@ impl WorkerHeartbeats {
             workers,
             any_stale,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn never_started_workers_are_not_stale() {
+        let hb = WorkerHeartbeats::new();
+        let snap = hb.snapshot();
+        let policy = snap
+            .workers
+            .iter()
+            .find(|w| w.name == "cis-policy-watch")
+            .expect("policy-watch is listed");
+        assert!(!policy.stale);
+        assert!(!snap.any_stale);
+        assert!(policy.last_tick_ms.is_none());
+    }
+
+    #[test]
+    fn missed_ticks_are_stale() {
+        let hb = WorkerHeartbeats::new();
+        let h = hb.handle("cis-policy-watch");
+        let old = now_ms().saturating_sub(10 * 60 * 1000);
+        h.store(old, Ordering::Relaxed);
+        let snap = hb.snapshot();
+        let policy = snap
+            .workers
+            .iter()
+            .find(|w| w.name == "cis-policy-watch")
+            .unwrap();
+        assert!(policy.stale);
+        assert!(snap.any_stale);
     }
 }

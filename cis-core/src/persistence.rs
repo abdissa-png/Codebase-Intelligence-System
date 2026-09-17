@@ -51,6 +51,40 @@ pub fn snapshot_persist_enabled() -> bool {
     !std::env::var_os("CIS_REINDEX_PERSIST").is_some_and(|v| v == "0")
 }
 
+/// Store backend env keys filled by [`apply_mcp_sqlite_store_defaults`].
+pub const MCP_SQLITE_STORE_ENV_KEYS: &[&str] = &[
+    "CIS_GRAPH_BACKEND",
+    "CIS_KV_BACKEND",
+    "CIS_WAL_BACKEND",
+    "CIS_VECTOR_BACKEND",
+    "CIS_BODY_BACKEND",
+    "CIS_METADATA_BACKEND",
+];
+
+/// `cisd --mcp` sqlite store profile: set each key to `sqlite` only if unset.
+///
+/// Shell and `.env` (via [`load_env_file`]) win. Tests and [`crate::CisMcpRuntime::new_dev`]
+/// do not call this, so they keep JSON/`file` defaults.
+///
+/// Returns how many keys were filled. No-op without the `body-sqlite` feature.
+pub fn apply_mcp_sqlite_store_defaults() -> usize {
+    #[cfg(feature = "body-sqlite")]
+    {
+        let mut n = 0usize;
+        for key in MCP_SQLITE_STORE_ENV_KEYS {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, "sqlite");
+                n += 1;
+            }
+        }
+        n
+    }
+    #[cfg(not(feature = "body-sqlite"))]
+    {
+        0
+    }
+}
+
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// On-disk vector snapshot (v2: content-addressed store; v1 legacy chunk-only).
@@ -883,5 +917,31 @@ mod tests {
         std::env::remove_var("CIS_VECTOR_JSON_EXPORT");
         std::env::remove_var("CIS_VECTOR_BACKEND");
         assert!(vector_snapshot_path(dir.path()).is_file());
+    }
+
+    #[cfg(feature = "body-sqlite")]
+    #[test]
+    fn mcp_sqlite_defaults_fill_only_unset() {
+        let prev: Vec<(String, Option<std::ffi::OsString>)> = MCP_SQLITE_STORE_ENV_KEYS
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var_os(k)))
+            .collect();
+        for k in MCP_SQLITE_STORE_ENV_KEYS {
+            std::env::remove_var(k);
+        }
+        let filled = apply_mcp_sqlite_store_defaults();
+        assert_eq!(filled, MCP_SQLITE_STORE_ENV_KEYS.len());
+        for k in MCP_SQLITE_STORE_ENV_KEYS {
+            assert_eq!(std::env::var(k).as_deref(), Ok("sqlite"));
+        }
+        std::env::set_var("CIS_GRAPH_BACKEND", "json");
+        assert_eq!(apply_mcp_sqlite_store_defaults(), 0);
+        assert_eq!(std::env::var("CIS_GRAPH_BACKEND").unwrap(), "json");
+        for (k, v) in prev {
+            match v {
+                Some(val) => std::env::set_var(&k, val),
+                None => std::env::remove_var(&k),
+            }
+        }
     }
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use cis_wal::{MutationIndex, MutationLogStore};
 
 use crate::consistency_snapshot::LastConsistencySnapshot;
-use crate::graph_consistency::{check_consistency, ConsistencyReport};
+use crate::graph_consistency::{check_consistency_on_view, ConsistencyReport};
 use crate::merge_control::MergeControl;
 use crate::merge_engine::recover_inflight_merges;
 use crate::merge_gate::MergeRecoveryGate;
@@ -113,7 +113,9 @@ impl PeriodicReconciler {
                 ),
             );
         }
-        let consistency = check_consistency(coordinator.graph(), kv, body_store, branches);
+        let consistency = coordinator.with_graph_view(|g| {
+            check_consistency_on_view(g, kv, &|h| body_store.get(h).is_some(), branches)
+        });
         if let Some(cache) = last_consistency {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

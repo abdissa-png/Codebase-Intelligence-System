@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cis_core::{
-    body_store_with_blobs, cis_dir, defer_vector_snapshot_load, embedder_from_env, kv_snapshot_path, load_env_file,
-    load_kv_snapshot, load_vector_into, open_persisted_coordinator, open_workspace_kv,
-    ActiveRankingPolicy, BodyStore,
+    apply_mcp_sqlite_store_defaults, body_store_with_blobs, cis_dir, defer_vector_snapshot_load,
+    embedder_from_env, kv_snapshot_path, load_env_file, load_kv_snapshot, load_vector_into,
+    open_persisted_coordinator, open_workspace_kv, ActiveRankingPolicy, BodyStore,
     CisDaemonHandles, CisMcpRuntime, EmbeddingWorker, MemoryKv, MergeRecoveryGate,
     MergeSagaOrchestrator, PolicyFileReloader, PolicyReloadOutcome, VectorCleanupQueue,
     VectorCleanupWorker, disk_free_percent, sweep_all_expired_merge_intents,
@@ -468,8 +468,14 @@ fn prepare_daemon(
             v == "0" || v.eq_ignore_ascii_case("false")
         }));
     if run_consistency {
-        let consistency =
-            cis_core::check_consistency(coord.graph(), &kv, &body_store_startup, &branches);
+        let consistency = coord.with_graph_view(|g| {
+            cis_core::check_consistency_on_view(
+                g,
+                &kv,
+                &|h| body_store_startup.get(h).is_some(),
+                &branches,
+            )
+        });
         let startup_now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -532,14 +538,17 @@ fn boot_mcp_runtime(
     if defer_vector_snapshot_load() {
         let coord_bg = Arc::clone(rt.coordinator());
         let cis_bg = cis_dir(&repo);
+        let rt_bg = Arc::clone(&rt);
         std::thread::spawn(move || {
             let t = std::time::Instant::now();
             let rep = load_vector_into(&cis_bg, coord_bg.vector());
+            rt_bg.rebuild_ann_index();
+            rt_bg.sync_index_status_from_graph();
             eprintln!(
                 "cisd: background vector load done in {:.1}s (loaded={} chunks={})",
                 t.elapsed().as_secs_f64(),
                 rep.vector_loaded,
-                rep.vector_chunks
+                rep.vector_chunks,
             );
         });
     }
@@ -580,8 +589,17 @@ fn main() {
 
     // MCP clients (Cursor) time out if initialize/tools/list wait on full warm-start.
     // Defer vector.json by default; structural tools work without embeddings loaded.
-    if mcp_mode && std::env::var_os("CIS_DEFER_VECTOR_LOAD").is_none() {
-        std::env::set_var("CIS_DEFER_VECTOR_LOAD", "1");
+    // With `body-sqlite`, unset store backends default to sqlite (shell / `.env` win).
+    if mcp_mode {
+        if std::env::var_os("CIS_DEFER_VECTOR_LOAD").is_none() {
+            std::env::set_var("CIS_DEFER_VECTOR_LOAD", "1");
+        }
+        let filled = apply_mcp_sqlite_store_defaults();
+        if filled > 0 {
+            eprintln!(
+                "cisd: MCP sqlite store profile ({filled} unset CIS_*_BACKEND → sqlite; set json/file to keep snapshots)"
+            );
+        }
     }
 
     // Cursor MCP IPC metadata timeout defaults to 10s — answer handshake before WAL/graph boot.

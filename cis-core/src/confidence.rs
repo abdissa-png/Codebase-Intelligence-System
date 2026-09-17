@@ -45,6 +45,11 @@ pub fn freshness_decay(last_validation_ms: i64, now_ms: u64, half_life_ms: u64) 
     if half_life_ms == 0 {
         return 1.0;
     }
+    // Ingest leaves `last_validation_ms = 0` until an LSP/compiler pass. Treating
+    // that as Unix epoch made every Ast edge look ancient (0.60 × 0.5 = 0.30).
+    if last_validation_ms <= 0 {
+        return 1.0;
+    }
     let now = now_ms as i64;
     let delta = now.saturating_sub(last_validation_ms).max(0) as f64;
     let tau = half_life_ms as f64;
@@ -84,7 +89,30 @@ mod tests {
 
     #[test]
     fn freshness_never_below_min() {
-        let f = freshness_decay(0, 10_000_000_000, 7 * 24 * 60 * 60 * 1000);
+        let f = freshness_decay(1, 10_000_000_000, 7 * 24 * 60 * 60 * 1000);
         assert!(f >= 0.5);
+    }
+
+    #[test]
+    fn freshness_never_validated_is_fresh() {
+        let f = freshness_decay(0, 10_000_000_000, 7 * 24 * 60 * 60 * 1000);
+        assert!((f - 1.0).abs() < 1e-9);
+        let ast = edge_confidence(
+            &crate::graph::GraphEdge {
+                edge_id: [0u8; 16],
+                ty: crate::graph::EdgeType::Calls,
+                source_revision_id: cis_wal::NodeRevisionId([1u8; 16]),
+                target_identity_id: cis_wal::IdentityId([2u8; 16]),
+                resolution: crate::graph::EdgeResolution {
+                    target_signature_hash: [0u8; 32],
+                    resolver: SourceType::Ast,
+                    last_validation_ms: 0,
+                },
+                anchor: crate::graph::SourceSpan::UNKNOWN,
+            },
+            10_000_000_000,
+            7 * 24 * 60 * 60 * 1000,
+        );
+        assert!((ast - source_weight(SourceType::Ast)).abs() < 1e-9);
     }
 }

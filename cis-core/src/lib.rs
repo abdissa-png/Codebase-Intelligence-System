@@ -153,7 +153,7 @@ pub use query_engine::{
     count_pruned_expand_neighbors, count_unresolved_definition_edges, expand_context_bfs,
     expand_context_bfs_with_absence, file_hub_revision_for_path, for_each_inbound_edge,
     is_opaque_traversal_gate, node_hit_confidence, node_hit_confidence_with_absence,
-    outbound_context_edges, rename_successor_identity, resolve_definition_target,
+    outbound_context_edges, outbound_local_context_edges, rename_successor_identity, resolve_definition_target,
     resolve_definition_target_with_absence, resolve_edge_target, resolve_edge_target_with_absence,
     resolve_identity_revision, resolve_identity_revision_with_absence, ExpandContextResult,
 };
@@ -197,7 +197,7 @@ pub use graph::{
 };
 pub use graph_view::{GraphIndexCounts, GraphView, GraphWrite, OverlayGraphView};
 pub use graph::FROM_SNAPSHOT_CALLS;
-pub use graph_consistency::{check_consistency, ConsistencyReport};
+pub use graph_consistency::{check_consistency, check_consistency_on_view, ConsistencyReport};
 pub use invariants::{
     assert_invariants, check_all_invariants, check_all_invariants_with_mode,
     check_merge_invariants, check_merge_invariants_with_mode, check_write_path_invariants,
@@ -285,12 +285,12 @@ pub use optimistic_patcher::{OptimisticPatcher, OptimisticPatchError};
 pub use path_lease::{LeaseError, PathLeaseManager, SessionId, SpeculativePathTracker};
 pub use pre_write_snapshot::PreWriteSnapshotStore;
 pub use persistence::{
-    cis_dir, defer_vector_snapshot_load, graph_snapshot_path, kv_snapshot_path, load_kv_snapshot,
-    load_state_from_cis_dir, load_vector_into, load_workspace_into, open_persisted_coordinator,
-    open_workspace_kv, open_workspace_wal,
-    save_graph_snapshot, save_kv_snapshot,
-    save_vector_snapshot, save_workspace_snapshots, snapshot_persist_enabled,
-    vector_snapshot_path, wal_path, PersistenceLoadReport, VectorSnapshot,
+    apply_mcp_sqlite_store_defaults, cis_dir, defer_vector_snapshot_load, graph_snapshot_path,
+    kv_snapshot_path, load_kv_snapshot, load_state_from_cis_dir, load_vector_into,
+    load_workspace_into, open_persisted_coordinator, open_workspace_kv, open_workspace_wal,
+    save_graph_snapshot, save_kv_snapshot, save_vector_snapshot, save_workspace_snapshots,
+    snapshot_persist_enabled, vector_snapshot_path, wal_path, MCP_SQLITE_STORE_ENV_KEYS,
+    PersistenceLoadReport, VectorSnapshot,
 };
 #[cfg(feature = "body-sqlite")]
 pub use sqlite_wal::{wal_backend_from_env, wal_db_path, wal_json_export_enabled, SqliteMutationLog, WalBackendKind};

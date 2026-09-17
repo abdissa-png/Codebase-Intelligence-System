@@ -54,17 +54,28 @@ fn is_file_hub_revision(g: &impl GraphView, rid: NodeRevisionId) -> bool {
         == Some(NodeKind::File)
 }
 
-/// Outbound edges for context traversal, including file-hub import hop (imports not duplicated on symbols).
+/// Outbound Calls/Imports/Uses/Extends on `source` only (no file-hub import hop).
+pub fn outbound_local_context_edges(
+    g: &impl GraphView,
+    source_revision: NodeRevisionId,
+) -> Vec<GraphEdge> {
+    g.outbound_edges(source_revision)
+        .into_iter()
+        .filter(|e| is_context_edge(e.ty))
+        .collect()
+}
+
+/// Outbound edges for definition resolution, including file-hub import hop
+/// (imports are stored on `$file`, not duplicated on every symbol).
+///
+/// `get_dependencies` / `expand_context` use [`outbound_local_context_edges`] so a
+/// function query does not dump every import of its parent file.
 pub fn outbound_context_edges(
     g: &impl GraphView,
     chain: &[BranchId],
     source_revision: NodeRevisionId,
 ) -> Vec<GraphEdge> {
-    let mut out: Vec<GraphEdge> = g
-        .outbound_edges(source_revision)
-        .into_iter()
-        .filter(|e| is_context_edge(e.ty))
-        .collect();
+    let mut out = outbound_local_context_edges(g, source_revision);
     if !is_file_hub_revision(g, source_revision) {
         if let Some(rev) = g.get_revision(source_revision) {
             if let Some(fr) = file_hub_revision_for_path(g, chain, &rev.file_path) {
@@ -416,7 +427,7 @@ pub fn expand_context_bfs_with_absence(
             continue;
         }
 
-        for e in outbound_context_edges(g, chain, rid) {
+        for e in outbound_local_context_edges(g, rid) {
             let ec = edge_confidence(&e, now_ms, half_life_ms);
             let next_min = min_source_on_path(min_src, &e);
             // Build next path only after prune check would need the scores —
@@ -777,6 +788,84 @@ mod tests {
         assert!(ids.contains(&seed));
         assert!(ids.contains(&stub_rid));
         assert!(!ids.contains(&NodeRevisionId([6u8; 16])));
+    }
+
+    #[test]
+    fn expand_skips_parent_file_hub_imports() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let b = branch();
+        let chain = [b];
+        let file_path = "m.py";
+        let hub_iid = IdentityId([10u8; 16]);
+        let hub_rid = NodeRevisionId(crate::index_model::stable_rev_id_bytes(
+            b, file_path, "$file",
+        ));
+        g.put_identity(NodeIdentity {
+            identity_id: hub_iid,
+            kind: NodeKind::File,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: hub_rid,
+            identity_id: hub_iid,
+            branch_id: b,
+            status: RevisionStatus::Active,
+            qualified_name: file_path.into(),
+            file_path: file_path.into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Python,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let dep = rev(&mut g, 8, 8, "pkg.dep", RevisionStatus::Active);
+        let import = GraphEdge {
+            edge_id: [40u8; 16],
+            ty: EdgeType::Imports,
+            source_revision_id: hub_rid,
+            target_identity_id: IdentityId([8u8; 16]),
+            resolution: EdgeResolution {
+                target_signature_hash: [0u8; 32],
+                resolver: SourceType::Ast,
+                last_validation_ms: 0,
+            },
+            anchor: SourceSpan {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 20,
+            },
+        };
+        g.replace_edges_for_revision(hub_rid, vec![import]).unwrap();
+        let seed = rev(&mut g, 1, 1, "foo", RevisionStatus::Active);
+        let leaf = rev(&mut g, 2, 2, "leaf", RevisionStatus::Active);
+        call_edge(&mut g, seed, IdentityId([2u8; 16]), 1);
+        let _ = (dep, leaf);
+
+        let hopped = outbound_context_edges(&g, &chain, seed);
+        assert!(
+            hopped.iter().any(|e| e.ty == EdgeType::Imports),
+            "definition resolution still hops file-hub imports"
+        );
+        let local = outbound_local_context_edges(&g, seed);
+        assert!(
+            local.iter().all(|e| e.ty != EdgeType::Imports),
+            "local edges must not include parent-file Imports: {:?}",
+            local.iter().map(|e| e.ty).collect::<Vec<_>>()
+        );
+
+        let policy = RankingPolicy::default();
+        let out = expand_context_bfs(&g, &eto, &policy, &chain, seed, 1, 1_000_000);
+        let ids: HashSet<_> = out.hits.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&seed));
+        assert!(ids.contains(&NodeRevisionId([2u8; 16])));
+        assert!(
+            !ids.contains(&NodeRevisionId([8u8; 16])),
+            "expand_context must not dump parent-file import targets"
+        );
     }
 
     #[test]

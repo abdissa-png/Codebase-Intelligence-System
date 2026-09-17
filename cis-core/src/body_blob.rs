@@ -12,6 +12,7 @@ use cis_wal::BranchId;
 
 use crate::body_store::BodyStore;
 use crate::graph::{InMemoryGraph, RevisionStatus};
+use crate::graph_view::GraphView;
 use crate::ingest::file_body_hash_key;
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -71,8 +72,18 @@ pub fn referenced_body_hashes(
     include_speculative: bool,
     include_tombstones: bool,
 ) -> HashSet<[u8; 32]> {
+    referenced_body_hashes_view(graph, branch, include_speculative, include_tombstones)
+}
+
+/// Same as [`referenced_body_hashes`] against any [`GraphView`] (SQL graph when sqlite-primary).
+pub fn referenced_body_hashes_view(
+    graph: &dyn GraphView,
+    branch: BranchId,
+    include_speculative: bool,
+    include_tombstones: bool,
+) -> HashSet<[u8; 32]> {
     let mut out = HashSet::new();
-    for r in graph.revisions() {
+    for r in graph.revisions_on_branches(&[branch]) {
         if r.branch_id != branch {
             continue;
         }
@@ -113,7 +124,10 @@ fn open_sqlite_or_fallback(cis: &Path) -> Arc<dyn BodyBlobStore> {
     #[cfg(feature = "body-sqlite")]
     {
         match SqliteBodyBlobStore::open(cis) {
-            Ok(s) => return Arc::new(s),
+            Ok(s) => {
+                seed_sqlite_from_files(&s, cis);
+                return Arc::new(s);
+            }
             Err(e) => eprintln!("cis: CIS_BODY_BACKEND=sqlite open failed ({e}); using files"),
         }
     }
@@ -124,6 +138,34 @@ fn open_sqlite_or_fallback(cis: &Path) -> Arc<dyn BodyBlobStore> {
         );
     }
     Arc::new(FileBodyBlobStore::new(cis))
+}
+
+/// Copy `.cis/bodies/` shards into an empty `bodies.db` so sqlite-primary MCP
+/// does not leave the SQL store empty while file blobs already exist.
+#[cfg(feature = "body-sqlite")]
+fn seed_sqlite_from_files(store: &SqliteBodyBlobStore, cis: &Path) {
+    match store.list_hashes() {
+        Ok(existing) if !existing.is_empty() => return,
+        _ => {}
+    }
+    let files = FileBodyBlobStore::new(cis);
+    let Ok(hashes) = files.list_hashes() else {
+        return;
+    };
+    if hashes.is_empty() {
+        return;
+    }
+    let mut n = 0usize;
+    for h in hashes {
+        if let Ok(Some(bytes)) = files.get(&h) {
+            if store.put(&h, &bytes).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        eprintln!("cis: seeded bodies.db from .cis/bodies ({n} blobs)");
+    }
 }
 
 /// File-backed store under `.cis/bodies/`.
@@ -166,6 +208,7 @@ impl BodyBlobStore for FileBodyBlobStore {
 #[cfg(feature = "body-sqlite")]
 #[derive(Debug)]
 pub struct SqliteBodyBlobStore {
+    cis_dir: PathBuf,
     conn: std::sync::Mutex<rusqlite::Connection>,
 }
 
@@ -187,6 +230,7 @@ impl SqliteBodyBlobStore {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(Self {
+            cis_dir: cis.to_path_buf(),
             conn: std::sync::Mutex::new(conn),
         })
     }
@@ -211,7 +255,7 @@ impl BodyBlobStore for SqliteBodyBlobStore {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(Some(bytes))
         } else {
-            Ok(None)
+            load_body_blob_file(&self.cis_dir, body_hash)
         }
     }
 
@@ -621,6 +665,26 @@ mod tests {
         assert_eq!(store.gc_except(&keep).unwrap(), 1);
         assert!(store.get(&h1).unwrap().is_some());
         assert!(store.get(&h2).unwrap().is_none());
+        std::env::remove_var("CIS_BODY_BACKEND");
+    }
+
+    #[cfg(feature = "body-sqlite")]
+    #[test]
+    fn sqlite_seeds_from_files_and_get_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = content_hash("seed-me");
+        save_body_blob_file(tmp.path(), &h, b"from-file").unwrap();
+        std::env::set_var("CIS_BODY_BACKEND", "sqlite");
+        let store = open_body_blob_store(tmp.path());
+        assert_eq!(store.get(&h).unwrap(), Some(b"from-file".to_vec()));
+        assert!(
+            store
+                .list_hashes()
+                .unwrap()
+                .iter()
+                .any(|x| x == &h),
+            "empty bodies.db should be seeded from file shards"
+        );
         std::env::remove_var("CIS_BODY_BACKEND");
     }
 }

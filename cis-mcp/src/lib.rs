@@ -3,6 +3,7 @@
 //! `Content-Length` framing is still accepted on read (`CIS_MCP_CONTENT_LENGTH=1` to write it).
 //! Prefer **`cisd --mcp`** (single process with background policy / merge TTL / vector cleanup).
 //! `cis-mcp` execs sibling `cisd --mcp` unless `CIS_STANDALONE_MCP=1`.
+//! With default `body-sqlite`, `cisd --mcp` sets unset `CIS_*_BACKEND` vars to `sqlite`.
 //! Env: `CIS_REPO_ROOT` (default `.`), `CIS_MCP_SKIP_INDEX=1` skips startup Python walk.
 //! **Phase 2 FS sync:** enabled by default (`CIS_FS_SYNC=0` to disable). Native **`notify`**
 //! watcher is on by default (`fs-notify` feature). `CIS_FS_POLL_ONLY=1` forces mtime polling;
@@ -681,10 +682,10 @@ fn read_tool_description(name: &str) -> String {
         "go_to_definition" => "First IMPORTS/EXTENDS/CALLS target revision (graph).".into(),
         "find_references" => "Reverse-index references to symbol (graph).".into(),
         "get_callers" => "Call edges inbound to identity (graph). Provide identity_id or symbol. Response uses hits[] with optional edge_type.".into(),
-        "get_dependencies" => "IMPORTS/USES/CALLS/EXTENDS outbound from revision (graph). Input revision_id or revision_id_hex; response hits[] with edge_type.".into(),
-        "file_imports" => "Import edges for a repo-relative file path via its file hub (no manual hub lookup).".into(),
-        "expand_context" => "BFS neighbors over Calls/Imports/Uses. Response hits[] (not nodes).".into(),
-        "semantic_search" => "Vector + structural hybrid search. When no embeddings are indexed, falls back to structural match and sets meta.degraded_reason.".into(),
+        "get_dependencies" => "IMPORTS/USES/CALLS/EXTENDS outbound from the given revision (no parent-file hub import hop). Input revision_id or revision_id_hex; response hits[] with edge_type.".into(),
+        "file_imports" => "Import edges for a repo-relative file path via its file hub. Hit spans are the imported symbol, not the import statement.".into(),
+        "expand_context" => "BFS neighbors over Calls/Imports/Uses/Extends on each visited node (no parent-file hub import hop). Response hits[] (not nodes).".into(),
+        "semantic_search" => "Vector + structural hybrid search. Hits include qualified_name, file_path, score, revision_id_hex. When no embeddings are indexed, falls back to structural match and sets meta.degraded_reason.".into(),
         "explain_context" => "Policy axis weights and hybrid ranker snapshot for a revision (FR-4.3).".into(),
         "index_status" => "Indexing observability: symbol/edge counts, embedding coverage, watcher metrics, embedding queue depth/state/drain rates.".into(),
         "embedding_status" => "Embedding queue depth, HWM/LWM, state, and per-minute drain/embed rates (Phase 5.3).".into(),

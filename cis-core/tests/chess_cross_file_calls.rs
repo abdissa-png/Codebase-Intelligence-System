@@ -247,6 +247,9 @@ fn chess_mcp_queries_after_graph_sync() {
         return;
     }
 
+    let _guard = CHESS_MCP_LOCK.lock().unwrap();
+    std::env::remove_var("CIS_GRAPH_BACKEND");
+
     let wal: Arc<dyn cis_wal::MutationLogStore> = Arc::new(MutationLog::new());
     let coord = WriteCoordinator::new(Arc::clone(&wal));
     let kv = Arc::new(MemoryKv::new());
@@ -316,8 +319,26 @@ fn chess_mcp_queries_after_graph_sync() {
         .unwrap();
     let names: Vec<_> = exp.hits.iter().map(|h| h.qualified_name.as_str()).collect();
     assert!(
-        names.iter().any(|n| n.contains("BoardUtils")),
-        "expand_context from Board method should reach BoardUtils (call/import), got {names:?}"
+        names
+            .iter()
+            .any(|n| n.contains("separateColors") || n.contains("calculateMoves")),
+        "expand_context should follow local Calls on the method, got {names:?}"
+    );
+
+    let imports = rt
+        .file_imports(0, &board_caller.file_path, None, 50)
+        .expect("file_imports");
+    assert!(
+        imports
+            .hits
+            .iter()
+            .any(|h| h.qualified_name.contains("BoardUtils")),
+        "file_imports on Board.py should list BoardUtils (hub Imports, not expand_context), got {:?}",
+        imports
+            .hits
+            .iter()
+            .map(|h| h.qualified_name.as_str())
+            .collect::<Vec<_>>()
     );
 }
 

@@ -83,6 +83,9 @@ pub trait GraphView {
         identity_id: IdentityId,
         status: RevisionStatus,
     ) -> usize;
+
+    /// Revisions whose `branch_id` is in `branches`. Empty `branches` means every revision.
+    fn revisions_on_branches(&self, branches: &[BranchId]) -> Vec<NodeRevision>;
 }
 
 impl<T: GraphView + ?Sized> GraphView for &T {
@@ -150,6 +153,9 @@ impl<T: GraphView + ?Sized> GraphView for &T {
         status: RevisionStatus,
     ) -> usize {
         (**self).count_revisions_with_status(chain, identity_id, status)
+    }
+    fn revisions_on_branches(&self, branches: &[BranchId]) -> Vec<NodeRevision> {
+        (**self).revisions_on_branches(branches)
     }
 }
 
@@ -342,6 +348,19 @@ impl GraphView for OverlayGraphView<'_> {
             None => overlay,
         }
     }
+
+    fn revisions_on_branches(&self, branches: &[BranchId]) -> Vec<NodeRevision> {
+        let mut out = GraphView::revisions_on_branches(self.overlay, branches);
+        if let Some(c) = self.committed {
+            for r in c.revisions_on_branches(branches) {
+                if !out.iter().any(|x| x.revision_id == r.revision_id) {
+                    out.push(r);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.revision_id.0.cmp(&b.revision_id.0));
+        out
+    }
 }
 
 impl GraphView for InMemoryGraph {
@@ -472,6 +491,16 @@ impl GraphView for InMemoryGraph {
             })
             .count()
     }
+
+    fn revisions_on_branches(&self, branches: &[BranchId]) -> Vec<NodeRevision> {
+        let mut out: Vec<NodeRevision> = self
+            .revisions()
+            .filter(|r| branches.is_empty() || branches.iter().any(|b| *b == r.branch_id))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.revision_id.0.cmp(&b.revision_id.0));
+        out
+    }
 }
 
 pub(crate) fn sort_revisions_qn(rows: &mut [NodeRevision]) {
@@ -545,5 +574,17 @@ mod tests {
         let hits = GraphView::find_revisions_qn_contains(&g, &chain, "alpha", 8);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].revision_id, rid(1));
+    }
+
+    #[test]
+    fn revisions_on_branches_filters_and_empty_means_all() {
+        let mut g = InMemoryGraph::default();
+        g.put_revision(rev(1, 1, 1, RevisionStatus::Active, "a"));
+        g.put_revision(rev(2, 2, 2, RevisionStatus::Active, "b"));
+        let one = GraphView::revisions_on_branches(&g, &[branch(1)]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].revision_id, rid(1));
+        let all = GraphView::revisions_on_branches(&g, &[]);
+        assert_eq!(all.len(), 2);
     }
 }

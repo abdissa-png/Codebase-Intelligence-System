@@ -41,7 +41,7 @@ use crate::daemon_handles::CisDaemonHandles;
 use crate::consistency_snapshot::{ConsistencyStatusSummary, LastConsistencySnapshot};
 use crate::degraded::{disk_free_percent, DiskPressureFlag, VectorDegradedController};
 use crate::embedding_metrics::{EmbeddingMetrics, EmbeddingStatusSnapshot};
-use crate::graph_consistency::check_consistency;
+use crate::graph_consistency::check_consistency_on_view;
 use crate::watcher_metrics::{WatcherMetrics, WatcherStatusSnapshot};
 use crate::worker_heartbeats::WorkerHeartbeats;
 use crate::vector_store::InMemoryVectorStore;
@@ -121,6 +121,7 @@ pub struct FileImportsResponse {
 #[derive(Debug, serde::Serialize)]
 pub struct SemanticSearchHit {
     pub qualified_name: String,
+    pub file_path: String,
     pub score: f64,
     pub revision_id_hex: String,
 }
@@ -1000,27 +1001,22 @@ impl CisMcpRuntime {
 
     /// **Phase 7** — GC + persist referenced bodies; rebuild ANN index.
     pub fn sync_bodies_after_commit(&self, branch: BranchId) {
-        if self.coordinator.sqlite_primary() {
-            // Overlay is empty after ingest. Do not compute a keep-set from RAM
-            // (an empty set would GC every blob).
+        let keep = self.coordinator.with_graph_view(|g| {
+            crate::body_blob::referenced_body_hashes_view(g, branch, true, true)
+        });
+        let cis = self.cis_path();
+        if keep.is_empty() {
+            // Empty keep-set on sqlite-primary would GC every blob if we proceeded.
             self.rebuild_ann_index();
             return;
         }
-        let cis = self.cis_path();
-        let keep = {
-            let g = self.coordinator.graph().read();
-            let _ = crate::body_blob::gc_bodies_for_branch(
-                self.body_blob_store.as_ref(),
-                &cis,
-                &self.body_store,
-                self.kv.as_ref(),
-                &g,
-                branch,
-                true,
-                true,
-            );
-            crate::body_blob::referenced_body_hashes(&g, branch, true, true)
-        };
+        let _ = crate::body_blob::gc_bodies_with_store(
+            self.body_blob_store.as_ref(),
+            &cis,
+            &self.body_store,
+            self.kv.as_ref(),
+            &keep,
+        );
         let _ = crate::body_blob::sync_bodies_to_store(
             self.body_blob_store.as_ref(),
             &self.body_store,
@@ -2952,7 +2948,7 @@ impl CisMcpRuntime {
             }
             let mut seen: HashSet<NodeRevisionId> = HashSet::new();
             let mut hits = Vec::new();
-            for e in crate::query_engine::outbound_context_edges(&g, &chain, rid) {
+            for e in crate::query_engine::outbound_local_context_edges(&g, rid) {
                 if hits.len() >= limit {
                     break;
                 }
@@ -3044,7 +3040,10 @@ impl CisMcpRuntime {
                             half,
                             Some(&absence),
                         );
-                        hits.push(hit_from_rev_and_edge(&trev, &e, conf));
+                        // Span is the imported symbol, not the import statement on the hub.
+                        let mut hit = hit_from_rev(&trev, conf);
+                        hit.edge_type = Some(edge_type_label(e.ty));
+                        hits.push(hit);
                     }
                 }
             }
@@ -3139,6 +3138,7 @@ impl CisMcpRuntime {
         struct SemanticRow {
             revision_id_hex: String,
             qualified_name: String,
+            file_path: String,
             body_hash: [u8; 32],
             structural_score: f64,
             vector_score: f64,
@@ -3203,6 +3203,7 @@ impl CisMcpRuntime {
                         rows.push(SemanticRow {
                             revision_id_hex: hex16(&r.revision_id.0),
                             qualified_name: r.qualified_name.clone(),
+                            file_path: r.file_path.clone(),
                             body_hash: *hash,
                             structural_score: structural_substring_score(&needle, &r.qualified_name),
                             vector_score: 0.0,
@@ -3237,6 +3238,7 @@ impl CisMcpRuntime {
                     rows.push(SemanticRow {
                         revision_id_hex: hex16(&r.revision_id.0),
                         qualified_name: r.qualified_name.clone(),
+                        file_path: r.file_path.clone(),
                         body_hash: r.body_hash,
                         structural_score: structural_substring_score(&needle, &r.qualified_name),
                         vector_score: 0.0,
@@ -3301,6 +3303,7 @@ impl CisMcpRuntime {
                 if let Some(row) = by_hex.get(&c.id) {
                     hits.push(SemanticSearchHit {
                         qualified_name: row.qualified_name.clone(),
+                        file_path: row.file_path.clone(),
                         score: c.vector_score * w_sem + c.structural_score * w_str,
                         revision_id_hex: c.id,
                     });
@@ -3326,6 +3329,7 @@ impl CisMcpRuntime {
             for row in scored.into_iter().take(limit) {
                 hits.push(SemanticSearchHit {
                     qualified_name: row.qualified_name.clone(),
+                    file_path: row.file_path.clone(),
                     score: row.structural_score,
                     revision_id_hex: row.revision_id_hex.clone(),
                 });
@@ -3878,15 +3882,12 @@ impl CisMcpRuntime {
         session_id: u64,
     ) -> Result<GraphConsistencyResponse, AuthError> {
         self.require_session(session_id)?;
-        let _ = self.coordinator.hydrate_sql_into_overlay();
         let branches = self.branch_registry.list_branches();
         let branch_ids: Vec<BranchId> = branches.into_iter().map(|(_, id)| id).collect();
-        let report = check_consistency(
-            self.coordinator.graph(),
-            &self.kv,
-            &self.body_store,
-            &branch_ids,
-        );
+        let body_store = &self.body_store;
+        let report = self.coordinator.with_graph_view(|g| {
+            check_consistency_on_view(g, &self.kv, &|h| body_store.get(h).is_some(), &branch_ids)
+        });
         self.update_consistency_cache(&report);
         self.audit.record_sync(session_id, "check_graph_consistency");
         let mut meta = QueryMeta::default();
@@ -4635,6 +4636,7 @@ mod tests {
             resp.hits
         );
         assert!(resp.hits[0].score > resp.hits.get(1).map(|h| h.score).unwrap_or(0.0));
+        assert_eq!(resp.hits[0].file_path, "x.py");
         assert!(!resp.meta.degraded_modes.contains(&"semantic_degraded".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -684,6 +684,68 @@ mod sqlite {
             })
         }
 
+        pub fn query_revisions_on_branches(
+            &self,
+            branches: &[BranchId],
+        ) -> io::Result<Vec<NodeRevision>> {
+            self.with_conn(|conn| {
+                let sql_all = format!("SELECT {} FROM revisions", Self::REV_COLS);
+                let sql_one = format!(
+                    "SELECT {} FROM revisions WHERE branch_id = ?1",
+                    Self::REV_COLS
+                );
+                let mut out = Vec::new();
+                let map_row = |row: &rusqlite::Row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
+                    ))
+                };
+                if branches.is_empty() {
+                    let mut stmt = conn
+                        .prepare(&sql_all)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let iter = stmt
+                        .query_map([], map_row)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    for r in iter {
+                        let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                        if let Some(rev) =
+                            Self::map_revision_tuple(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)?
+                        {
+                            out.push(rev);
+                        }
+                    }
+                    return Ok(out);
+                }
+                let mut stmt = conn
+                    .prepare(&sql_one)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                for branch in branches {
+                    let iter = stmt
+                        .query_map(params![branch.0.as_slice()], map_row)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    for r in iter {
+                        let t = r.map_err(|e| io::Error::other(e.to_string()))?;
+                        if let Some(rev) =
+                            Self::map_revision_tuple(t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9)?
+                        {
+                            out.push(rev);
+                        }
+                    }
+                }
+                Ok(out)
+            })
+        }
+
         pub fn query_count_revisions_with_status(
             &self,
             chain: &[BranchId],
@@ -1499,6 +1561,11 @@ mod sqlite {
         ) -> usize {
             self.query_count_revisions_with_status(chain, identity_id, status)
                 .unwrap_or(0)
+        }
+
+        fn revisions_on_branches(&self, branches: &[BranchId]) -> Vec<NodeRevision> {
+            self.query_revisions_on_branches(branches)
+                .unwrap_or_default()
         }
     }
 }

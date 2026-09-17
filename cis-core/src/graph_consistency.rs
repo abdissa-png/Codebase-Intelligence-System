@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use cis_wal::{BranchId, IdentityId, NodeRevisionId};
 
-use crate::graph::{InMemoryGraph, RevisionStatus};
+use crate::graph::RevisionStatus;
+use crate::graph_view::GraphView;
 use crate::revision_index::revision_binding_kv_key;
 use crate::{MemoryKv, SharedInMemoryGraph};
 
@@ -51,6 +52,16 @@ pub fn check_consistency(
     branches: &[BranchId],
 ) -> ConsistencyReport {
     let g = graph.read();
+    check_consistency_on_view(&*g, kv, &|h| body_store.get(h).is_some(), branches)
+}
+
+/// Same checks as [`check_consistency`] against any [`GraphView`] (SQL graph when sqlite-primary).
+pub fn check_consistency_on_view(
+    g: &dyn GraphView,
+    kv: &MemoryKv,
+    body_present: &dyn Fn(&[u8; 32]) -> bool,
+    branches: &[BranchId],
+) -> ConsistencyReport {
     let mut report = ConsistencyReport::default();
 
     let mut bound_on_branch: HashSet<(BranchId, IdentityId)> = HashSet::new();
@@ -87,8 +98,13 @@ pub fn check_consistency(
     }
 
     let branch_set: HashSet<BranchId> = branches.iter().copied().collect();
+    let walk_branches: Vec<BranchId> = if branch_set.is_empty() {
+        Vec::new()
+    } else {
+        branches.to_vec()
+    };
     let mut active_per_identity: HashMap<(BranchId, IdentityId), usize> = HashMap::new();
-    for rev in g.revisions() {
+    for rev in g.revisions_on_branches(&walk_branches) {
         if !branch_set.is_empty() && !branch_set.contains(&rev.branch_id) {
             continue;
         }
@@ -102,7 +118,7 @@ pub fn check_consistency(
                 report.orphaned_active_without_binding.push(rev.revision_id);
             }
         }
-        if body_store.get(&rev.body_hash).is_none() && rev.body_hash != [0u8; 32] {
+        if !body_present(&rev.body_hash) && rev.body_hash != [0u8; 32] {
             report.body_hash_missing_from_store.push(rev.body_hash);
         }
     }
@@ -341,5 +357,50 @@ mod tests {
             !rep.secondary_index_desync.is_empty(),
             "expected primary/binding mismatch"
         );
+    }
+
+    #[test]
+    fn view_reads_committed_when_overlay_empty() {
+        use crate::graph_view::OverlayGraphView;
+
+        let branch = BranchId([1u8; 16]);
+        let identity = IdentityId([2u8; 16]);
+        let mut committed = InMemoryGraph::default();
+        let rev = mk_rev(3, 2, 1, RevisionStatus::Active);
+        committed.put_identity(NodeIdentity {
+            identity_id: identity,
+            kind: NodeKind::Function,
+        });
+        committed.put_revision(rev.clone());
+        let overlay = InMemoryGraph::default();
+        let view = OverlayGraphView {
+            overlay: &overlay,
+            committed: Some(&committed),
+        };
+        let kv = MemoryKv::new();
+        kv.set(
+            &revision_binding_kv_key(branch, identity),
+            rev.revision_id.0.to_vec(),
+        );
+        let body = crate::BodyStore::new(std::sync::Arc::new(kv.clone()));
+        body.put(rev.body_hash, b"body".to_vec());
+        let overlay_only = check_consistency_on_view(
+            &overlay,
+            &kv,
+            &|h| body.get(h).is_some(),
+            &[branch],
+        );
+        assert_eq!(
+            overlay_only.dangling_bindings.len(),
+            1,
+            "empty overlay still reports dangling"
+        );
+        let rep = check_consistency_on_view(&view, &kv, &|h| body.get(h).is_some(), &[branch]);
+        assert!(
+            rep.dangling_bindings.is_empty(),
+            "committed GraphView must resolve bindings: {}",
+            rep.summary()
+        );
+        assert!(rep.orphaned_active_without_binding.is_empty());
     }
 }

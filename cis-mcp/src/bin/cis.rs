@@ -18,12 +18,12 @@ fn usage() {
     eprintln!("      --rebuild-normalized rewrites normalized rows from blob snapshot.");
     eprintln!();
     eprintln!("Environment:");
-    eprintln!("  CIS_BODY_BACKEND=file|sqlite   (default: file)");
-    eprintln!("  CIS_METADATA_BACKEND=json|sqlite (default: json)");
-    eprintln!("  CIS_KV_BACKEND=json|sqlite     (default: json)");
-    eprintln!("  CIS_GRAPH_BACKEND=json|sqlite  (default: json)");
-    eprintln!("  CIS_WAL_BACKEND=json|sqlite    (default: json)");
-    eprintln!("  CIS_VECTOR_BACKEND=json|sqlite (default: json)");
+    eprintln!("  CIS_BODY_BACKEND=file|sqlite   (default: file; cisd --mcp → sqlite if unset)");
+    eprintln!("  CIS_METADATA_BACKEND=json|sqlite (default: json; cisd --mcp → sqlite if unset)");
+    eprintln!("  CIS_KV_BACKEND=json|sqlite     (default: json; cisd --mcp → sqlite if unset)");
+    eprintln!("  CIS_GRAPH_BACKEND=json|sqlite  (default: json; cisd --mcp → sqlite if unset)");
+    eprintln!("  CIS_WAL_BACKEND=json|sqlite    (default: json; cisd --mcp → sqlite if unset)");
+    eprintln!("  CIS_VECTOR_BACKEND=json|sqlite (default: json; cisd --mcp → sqlite if unset)");
     eprintln!("  CIS_GRAPH_SHADOW=1             debug: compare SQL GraphView vs RAM overlay");
     eprintln!("  CIS_GRAPH_JSON_EXPORT=1        also write graph.json when backend is sqlite");
     eprintln!("  CIS_WAL_JSON_EXPORT=1          also write wal.json when backend is sqlite");

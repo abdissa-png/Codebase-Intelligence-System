@@ -164,6 +164,9 @@ impl crate::graph_view::GraphView for GraphReadGuard<'_> {
     ) -> usize {
         crate::graph_view::GraphView::count_revisions_with_status(&**self, chain, identity_id, status)
     }
+    fn revisions_on_branches(&self, branches: &[cis_wal::BranchId]) -> Vec<crate::graph::NodeRevision> {
+        crate::graph_view::GraphView::revisions_on_branches(&**self, branches)
+    }
 }
 
 #[cfg(test)]
