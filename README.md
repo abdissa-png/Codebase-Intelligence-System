@@ -8,7 +8,7 @@ CIS is a Rust daemon that builds a **versioned code graph** over your repository
 
 | Capability | Description |
 |------------|-------------|
-| **Symbol navigation** | Find symbols, go to definition, list callers/callees, expand context around a node |
+| **Symbol navigation** | Find symbols, go to definition from that symbol's own edges, list callers and dependencies, expand context. A file's imports are a separate query (`file_imports`); they are not treated as every symbol's definition. |
 | **Semantic & hybrid search** | Vector search over indexed symbols; optional HTTP embedding API |
 | **Speculative writes** | `write_file` / `apply_patch` create draft graph revisions; `confirm_patch` or `revert_patch` promotes or rolls back (including disk content) |
 | **Branching & merge** | Explicit CIS branches (`create_branch`, `switch_branch`); three-phase merge with saga recovery |
@@ -16,7 +16,7 @@ CIS is a Rust daemon that builds a **versioned code graph** over your repository
 | **Crash recovery** | WAL-backed coordinator; graph/KV snapshots survive restarts |
 | **Background workers** | WAL compaction, tombstone GC, audit epochs, embedding queue, disk pressure, consistency checks |
 
-CIS is designed for **local agent-assisted development**: one developer runs `cisd` against one repo over MCP stdio (e.g. from Cursor). It is not a multi-tenant hosted service.
+CIS is designed for **local agent-assisted development**: one developer runs `cisd` against one repo over MCP stdio (Cursor, Antigravity, or any other stdio MCP client). It is not a multi-tenant hosted service.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ Three crates in this workspace:
 | **`cis-core`** | Graph, KV store, ingest, query, merge engine, MCP runtime |
 | **`cis-mcp`** | MCP JSON-RPC server and binaries (`cisd`, `cis-mcp`, `cis`) |
 
-State lives under `.cis/` in the repo root (graph, KV, WAL, bodies, audit log, merge metrics).
+State lives under `.cis/` in the repo root. `cisd --mcp` (with the default `body-sqlite` feature) sets any unset `CIS_*_BACKEND` variable to `sqlite` and, when all six are sqlite, stores them in one `.cis/cis.db`. Set a backend to `json` or `file` to keep the split snapshot files. Library tests do not apply that default.
 
 ## Binaries
 
@@ -63,7 +63,9 @@ export CIS_REPO_ROOT="$(pwd)"
 /path/to/cisd --mcp
 ```
 
-On first run, CIS walks the tree, builds the graph, and writes `.cis/`. Subsequent starts load persisted state.
+On first run, CIS walks the tree (honoring `.gitignore` unless `CIS_INDEX_RESPECT_GITIGNORE=0`), builds the graph, and writes `.cis/`. Subsequent starts load persisted state.
+
+Rust `crate::` / `self::` / `super::` imports resolve from the importing file's crate root (`lib.rs` or `main.rs`). An ambiguous basename is kept only when one module matches, or one sibling file matches. A named import whose symbol is missing is dropped. It is not attached to a file hub.
 
 ### Cursor MCP config (example)
 
@@ -80,6 +82,10 @@ On first run, CIS walks the tree, builds the graph, and writes `.cis/`. Subseque
 }
 ```
 
+Set `CIS_REPO_ROOT` to the repo to index. `cisd --mcp` fills any unset `CIS_*_BACKEND` with `sqlite`; set one to `json` or `file` only when you want the split snapshot files.
+
+Antigravity reads the same stdio server from `~/.gemini/config/mcp_config.json` (global) or `.agents/mcp_config.json` (one workspace), under `mcpServers`. Use `command` and `env` as above. Remote HTTP servers in Antigravity use `serverUrl`, which this local binary does not.
+
 List tool names without starting the server:
 
 ```bash
@@ -88,7 +94,7 @@ cis-mcp --tools
 
 ## Local embedding server (semantic search)
 
-CIS can use an external OpenAI-compatible `/v1/embeddings` endpoint for `semantic_search` and `hybrid_search`. For offline development, a small Python server ships in `scripts/` using [fastembed](https://github.com/qdrant/fastembed) (ONNX, no GPU).
+CIS can use an external OpenAI-compatible `/v1/embeddings` endpoint for `semantic_search`. `hybrid_search` only reranks candidates you pass in; it does not call the embedder. For offline development, a small Python server ships in `scripts/` using [fastembed](https://github.com/qdrant/fastembed) (ONNX, no GPU).
 
 ### 1. Create the Python virtual environment
 
@@ -161,7 +167,9 @@ Without the embed server, CIS falls back to a deterministic **stub embedder** (o
 
 ### Write (15)
 
-`write_file`, `apply_patch`, `reindex_paths`, `confirm_patch`, `revert_patch`, `sweep_confirm_sidecars`, `purge_branch`, `save_workspace`, `cancel_merge`, `merge_ttl_sweep`, `merge_branch`, `ingest_cis_config`, `create_branch`, `switch_branch`
+`write_file`, `apply_patch`, `reindex_paths`, `confirm_patch`, `revert_patch`, `sweep_confirm_sidecars`, `purge_branch`, `retarget_edge`, `save_workspace`, `cancel_merge`, `merge_ttl_sweep`, `merge_branch`, `ingest_cis_config`, `create_branch`, `switch_branch`
+
+`go_to_definition` follows Calls, then Imports or Extends, then Uses, on the revision you pass. It does not copy the parent file's imports onto that symbol. `why_no_definition` reports the same edge set: `no_outbound_definition_edges`, `target_identity_without_active_revision`, or `index_mode_regex_limits_call_precision`. `file_imports` is the file-level import list.
 
 ## Configuration
 
@@ -170,6 +178,8 @@ CIS reads an optional `.env` in the repo root (does not override variables alrea
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `CIS_REPO_ROOT` | `.` | Repository root to index |
+| `CIS_GRAPH_BACKEND`, `CIS_KV_BACKEND`, `CIS_WAL_BACKEND`, `CIS_VECTOR_BACKEND`, `CIS_BODY_BACKEND`, `CIS_METADATA_BACKEND` | `json` / `file` in library code; `sqlite` when unset under `cisd --mcp` | Store backend. All six `sqlite` → one `.cis/cis.db` |
+| `CIS_INDEX_RESPECT_GITIGNORE` | on | Set `0` to index files that `.gitignore` excludes (builtin skip dirs such as `target/` and `.git/` still apply) |
 | `CIS_FS_SYNC` | on | Set `0` to disable filesystem watcher |
 | `CIS_FS_POLL_ONLY` | off | Force mtime polling instead of native notify |
 | `CIS_INDEX_DEBOUNCE_MS` | — | Debounce delay before re-indexing after FS events |
@@ -245,7 +255,8 @@ cis/
 
 **Version 0.1.0** — solid for local agent workflows on medium-sized repos. Known limits:
 
-- Full in-memory graph; flat ANN for semantic search (large monorepos will need scale work)
+- SQLite graph queries are the `cisd --mcp` path; the JSON/RAM graph remains the library default and the fallback if sqlite open fails
+- Flat ANN for semantic search (large monorepos will need scale work)
 - MCP over stdio with a trusted local session (no network auth)
 - Observability is primarily `eprintln!` plus `system_status` / merge metrics JSONL
 

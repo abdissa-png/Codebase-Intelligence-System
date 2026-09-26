@@ -13,6 +13,21 @@ use crate::index_model::{
     FileIndex, ImportBinding, ImportStyle, ParsedCall, ParsedImport,
 };
 
+/// Map `dir/foo.rs` → `dir.foo` so Rust imports align with module-map keys.
+///
+/// Lives here, not in `rust_indexer`, because CI's `tree-sitter` job does not
+/// enable `ts-rust` and still resolves `crate::` paths.
+pub(crate) fn path_to_rust_module_key(rel_path: &str) -> String {
+    let base = rel_path.trim_end_matches(".rs").replace('/', ".");
+    if base.ends_with(".mod") {
+        base.trim_end_matches(".mod").to_string()
+    } else if base.ends_with(".lib") || base.ends_with(".main") {
+        base.rsplit_once('.').map(|(parent, _)| parent.to_string()).unwrap_or(base)
+    } else {
+        base
+    }
+}
+
 const MODULE_EXTS: &[&str] = &[
     ".ts", ".tsx", ".py", ".rs", ".go", ".js", ".jsx", ".java", ".cs", ".c",
     ".h", ".cpp", ".cxx", ".cc", ".hpp", ".hxx", ".hh",
@@ -232,6 +247,10 @@ fn resolve_relative_or_include(
 
 /// Strip Rust path prefixes (`crate.` / `self.` / leading `super.`) so imports like
 /// `crate.coordinator` match mod-map keys such as `cis-core.src.coordinator`.
+///
+/// This is only a fallback when the import is not anchored to a source file.
+/// Anchored `crate` / `self` / `super` paths are resolved from the importing file
+/// so a bare suffix cannot collide (`graph` vs `indexer_eval/graph`).
 fn strip_rust_path_prefixes(module: &str) -> &str {
     let mut s = module;
     loop {
@@ -252,24 +271,144 @@ fn strip_rust_path_prefixes(module: &str) -> &str {
     s
 }
 
-fn lookup_module_candidates(candidate: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+fn is_rust_prelude_module(module: &str) -> bool {
+    module == "std"
+        || module == "core"
+        || module == "alloc"
+        || module.starts_with("std.")
+        || module.starts_with("core.")
+        || module.starts_with("alloc.")
+}
+
+fn rust_path_is_anchored(module: &str) -> bool {
+    module == "crate"
+        || module == "self"
+        || module == "super"
+        || module.starts_with("crate.")
+        || module.starts_with("self.")
+        || module.starts_with("super.")
+}
+
+/// Every module-map path that suffix-matches `candidate`. Exact key hits return
+/// that single path. Multiple hits stay unresolved — `HashMap` iteration order
+/// must not pick `indexer_eval/graph.rs` over `graph.rs`.
+fn module_candidate_paths(candidate: &str, mod_map: &HashMap<String, String>) -> Vec<String> {
     if candidate.is_empty() {
-        return None;
+        return Vec::new();
     }
     if let Some(p) = mod_map.get(candidate) {
-        return Some(p.clone());
+        return vec![p.clone()];
     }
     // Path-segment / file-suffix match only — never bare `ends_with("utils")`
     // (that would incorrectly match `my_utils`, `test_utils`, …).
-    mod_map
+    let mut hits: Vec<String> = mod_map
         .iter()
-        .find(|(k, v)| {
+        .filter(|(k, v)| {
             *k == candidate
                 || k.ends_with(&format!("/{candidate}"))
                 || k.ends_with(&format!(".{candidate}"))
                 || path_matches_stripped_module(v, candidate)
         })
         .map(|(_, v)| v.clone())
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+fn unique_module_candidate(candidate: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+    let mut hits = module_candidate_paths(candidate, mod_map);
+    if hits.len() == 1 {
+        hits.pop()
+    } else {
+        None
+    }
+}
+
+fn same_dir_candidate(hits: &[String], from_path: &str) -> Option<String> {
+    let dir = path_dir(from_path);
+    let mut same: Vec<&String> = hits.iter().filter(|v| path_dir(v) == dir).collect();
+    same.sort();
+    same.dedup();
+    if same.len() == 1 {
+        Some(same[0].clone())
+    } else {
+        None
+    }
+}
+
+/// Nearest ancestor `lib.rs` (preferred) or `main.rs` module key for `from_path`.
+fn rust_crate_root_key(from_path: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+    let mut dir = path_dir(from_path).to_string();
+    loop {
+        for name in ["lib.rs", "main.rs"] {
+            let candidate = if dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{dir}/{name}")
+            };
+            if mod_map.values().any(|v| v == &candidate) {
+                return Some(path_to_rust_module_key(&candidate));
+            }
+        }
+        if dir.is_empty() {
+            return None;
+        }
+        match dir.rsplit_once('/') {
+            Some((parent, _)) => dir = parent.to_string(),
+            None => dir.clear(),
+        }
+    }
+}
+
+/// Resolve `crate` / `self` / `super` against the importing file's crate, not a
+/// basename suffix. `crate::graph` from `cis-core/src/coordinator.rs` is
+/// `cis-core.src.graph`, never `cis-core.src.indexer_eval.graph`.
+fn resolve_rust_path(
+    normalized: &str,
+    from_path: &str,
+    mod_map: &HashMap<String, String>,
+) -> Option<String> {
+    if !rust_path_is_anchored(normalized) {
+        return None;
+    }
+    let mut parts: Vec<&str> = normalized.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let base = match parts[0] {
+        "crate" => {
+            parts.remove(0);
+            rust_crate_root_key(from_path, mod_map)?
+        }
+        "self" => {
+            parts.remove(0);
+            path_to_rust_module_key(from_path)
+        }
+        "super" => {
+            let mut current = path_to_rust_module_key(from_path);
+            while parts.first().copied() == Some("super") {
+                parts.remove(0);
+                current = current
+                    .rsplit_once('.')
+                    .map(|(parent, _)| parent.to_string())
+                    .unwrap_or_default();
+            }
+            current
+        }
+        _ => return None,
+    };
+    if base.is_empty() && parts.is_empty() {
+        return None;
+    }
+    let key = if parts.is_empty() {
+        base
+    } else if base.is_empty() {
+        parts.join(".")
+    } else {
+        format!("{base}.{}", parts.join("."))
+    };
+    mod_map.get(&key).cloned()
 }
 
 /// Resolve an import module string to a repo-relative file path via `mod_map`.
@@ -277,15 +416,51 @@ fn resolve_module_path(module: &str, mod_map: &HashMap<String, String>) -> Optio
     resolve_module_path_at(module, None, mod_map)
 }
 
-fn resolve_module_path_at(
+pub(crate) fn resolve_module_path_at(
     module: &str,
     from_path: Option<&str>,
     mod_map: &HashMap<String, String>,
 ) -> Option<String> {
+    let raw = module
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>');
+    if raw.is_empty() {
+        return None;
+    }
+    // Go import paths and other URL-like modules: exact keys only.
+    // `github.com/gorilla/mux` is not whichever file happens to be named `mux`.
+    if raw.contains('/') && !raw.starts_with('.') {
+        if let Some(p) = mod_map.get(raw) {
+            return Some(p.clone());
+        }
+        return mod_map.get(&raw.replace('/', ".")).cloned();
+    }
     // Normalize Rust `::` separators to `.` (indexers may emit either).
-    let normalized = module.trim().replace("::", ".");
-    if let Some(p) = lookup_module_candidates(&normalized, mod_map) {
-        return Some(p);
+    let normalized = raw.replace("::", ".");
+    if is_rust_prelude_module(&normalized) {
+        return None;
+    }
+    if let Some(p) = mod_map.get(&normalized) {
+        return Some(p.clone());
+    }
+    if let Some(from) = from_path {
+        if from.ends_with(".rs") {
+            if let Some(p) = resolve_rust_path(&normalized, from, mod_map) {
+                return Some(p);
+            }
+            // Crate root unknown (no lib.rs/main.rs in the map): accept a unique
+            // suffix of the path after `crate`/`self`/`super`, and refuse when
+            // several files share that basename.
+            if rust_path_is_anchored(&normalized) {
+                let stripped = strip_rust_path_prefixes(&normalized);
+                return unique_module_candidate(stripped, mod_map);
+            }
+        }
+        if raw.starts_with('.') || raw.contains('/') {
+            if let Some(p) = resolve_relative_or_include(module, from, mod_map) {
+                return Some(p);
+            }
+        }
     }
     let mut stripped = normalized.as_str();
     while stripped.starts_with("./") || stripped.starts_with("../") {
@@ -293,18 +468,21 @@ fn resolve_module_path_at(
             .trim_start_matches("./")
             .trim_start_matches("../");
     }
-    if let Some(p) = lookup_module_candidates(stripped, mod_map) {
+    let rust_stripped = strip_rust_path_prefixes(stripped);
+    if is_rust_prelude_module(rust_stripped) {
+        return None;
+    }
+    if let Some(p) = unique_module_candidate(rust_stripped, mod_map) {
         return Some(p);
     }
-    let rust_stripped = strip_rust_path_prefixes(stripped);
-    if rust_stripped != stripped {
-        if let Some(p) = lookup_module_candidates(rust_stripped, mod_map) {
-            return Some(p);
-        }
-    }
+    // Ambiguous basename: a sibling file is a safe guess for unanchored imports.
+    // Anchored `crate::` paths already returned above.
     if let Some(from) = from_path {
-        if let Some(p) = resolve_relative_or_include(module, from, mod_map) {
-            return Some(p);
+        let hits = module_candidate_paths(rust_stripped, mod_map);
+        if hits.len() > 1 {
+            if let Some(p) = same_dir_candidate(&hits, from) {
+                return Some(p);
+            }
         }
     }
     None
@@ -320,7 +498,7 @@ pub(crate) fn build_import_bindings(
         let tp = resolve_module_path_at(&imp.module, Some(from_path), mod_map).or_else(|| {
             if imp.style == ImportStyle::Names && imp.names.len() == 1 {
                 let fq = format!("{}.{}", imp.module, imp.names[0]);
-                lookup_module_candidates(&fq, mod_map)
+                unique_module_candidate(&fq, mod_map)
             } else {
                 None
             }
@@ -1220,7 +1398,7 @@ pub(crate) fn attach_import_and_call_edges(
         let Some(tp) = resolve_module_path_at(&imp.module, Some(path), mod_map).or_else(|| {
             if imp.style == ImportStyle::Names && imp.names.len() == 1 {
                 let fq = format!("{}.{}", imp.module, imp.names[0]);
-                lookup_module_candidates(&fq, mod_map)
+                unique_module_candidate(&fq, mod_map)
             } else {
                 None
             }
@@ -1244,8 +1422,14 @@ pub(crate) fn attach_import_and_call_edges(
             }
             ImportStyle::Names => {
                 for name in &imp.names {
-                    let tiid = resolve_symbol_in_module(&tp, name, branch, graph, batch_indexes)
-                        .unwrap_or(hub);
+                    // A missing symbol is not the module's file hub. Falling back
+                    // stored a poisoned Imports edge whenever module resolution
+                    // picked the wrong `graph.rs`.
+                    let Some(tiid) =
+                        resolve_symbol_in_module(&tp, name, branch, graph, batch_indexes)
+                    else {
+                        continue;
+                    };
                     let label = format!("{}:{}", imp.module, name);
                     edge_map.entry(file_hub_rid).or_default().push(import_edge(
                         file_hub_rid,
@@ -1509,6 +1693,124 @@ mod tests {
         assert_eq!(
             resolve_module_path("crate::coordinator", &mod_map),
             Some("cis-core/src/coordinator.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn crate_graph_resolves_to_crate_root_not_nested_basename() {
+        let mut mod_map = HashMap::new();
+        let real = "cis-core/src/graph.rs";
+        let nested = "cis-core/src/indexer_eval/graph.rs";
+        mod_map.insert("cis-core.src".into(), "cis-core/src/lib.rs".into());
+        mod_map.insert(
+            "cis-core.src.graph".into(),
+            real.into(),
+        );
+        mod_map.insert(
+            "cis-core.src.indexer_eval.graph".into(),
+            nested.into(),
+        );
+        mod_map.insert(
+            "cis-core.src.indexer_eval".into(),
+            "cis-core/src/indexer_eval/mod.rs".into(),
+        );
+        let from = "cis-core/src/coordinator.rs";
+        assert_eq!(
+            resolve_module_path_at("crate::graph", Some(from), &mod_map),
+            Some(real.to_string()),
+            "crate::graph must not suffix-match indexer_eval/graph.rs"
+        );
+        assert_eq!(
+            resolve_module_path_at("crate.graph", Some(from), &mod_map),
+            Some(real.to_string())
+        );
+        assert_eq!(
+            resolve_module_path_at(
+                "crate::indexer_eval::graph",
+                Some(from),
+                &mod_map
+            ),
+            Some(nested.to_string())
+        );
+        assert_eq!(
+            resolve_module_path_at(
+                "super::graph",
+                Some("cis-core/src/indexer_eval/mod.rs"),
+                &mod_map
+            ),
+            Some(real.to_string()),
+            "super::graph from indexer_eval is the parent crate module"
+        );
+        assert_eq!(
+            resolve_module_path_at(
+                "super::graph",
+                Some("cis-core/src/indexer_eval/other.rs"),
+                &mod_map
+            ),
+            Some(nested.to_string())
+        );
+        assert_eq!(
+            resolve_module_path_at(
+                "crate::graph",
+                Some("cis-core/src/indexer_eval/mod.rs"),
+                &mod_map
+            ),
+            Some(real.to_string()),
+            "crate:: from a nested file is the crate root, not the nested basename"
+        );
+        assert_eq!(
+            resolve_module_path_at("graph", Some(from), &mod_map),
+            Some(real.to_string()),
+            "an unanchored bare name may use the unique sibling file"
+        );
+        assert_eq!(
+            resolve_module_path_at("graph", Some("other/place.rs"), &mod_map),
+            None,
+            "ambiguous bare graph must not pick a HashMap victim"
+        );
+    }
+
+    #[test]
+    fn named_import_miss_does_not_target_file_hub() {
+        let branch = BranchId([0u8; 16]);
+        let path = "cis-core/src/coordinator.rs";
+        let wrong = "cis-core/src/indexer_eval/graph.rs";
+        let mut mod_map = HashMap::new();
+        mod_map.insert("cis-core.src".into(), "cis-core/src/lib.rs".into());
+        mod_map.insert(
+            "cis-core.src.graph".into(),
+            "cis-core/src/graph.rs".into(),
+        );
+        mod_map.insert("cis-core.src.indexer_eval.graph".into(), wrong.into());
+        let mut index = FileIndex::default();
+        index.imports.push(ParsedImport {
+            module: "crate.graph".into(),
+            style: ImportStyle::Names,
+            names: vec!["InMemoryGraph".into(), "RevisionStatus".into()],
+            span: span(),
+        });
+        let mut wrong_idx = FileIndex::default();
+        wrong_idx.symbols.push(ParsedSymbol {
+            stable_key: "$file".into(),
+            disambiguator: String::new(),
+            qualified_name: wrong.into(),
+            kind: NodeKind::File,
+            span: span(),
+        });
+        let mut batch = HashMap::new();
+        batch.insert(wrong.into(), wrong_idx);
+        let edges =
+            attach_import_and_call_edges(path, branch, &index, &mod_map, None, &batch);
+        let file_hub = NodeRevisionId(stable_rev_id_bytes(branch, path, "$file"));
+        let imports = edges.get(&file_hub).map(Vec::as_slice).unwrap_or(&[]);
+        assert!(
+            imports.is_empty(),
+            "missing symbols must not become Imports to a file hub, got {imports:?}"
+        );
+        let wrong_hub = IdentityId(stable_id_bytes("file", wrong, "$hub"));
+        assert!(
+            imports.iter().all(|e| e.target_identity_id != wrong_hub),
+            "must not poison the indexer_eval/graph.rs hub"
         );
     }
 
@@ -1900,7 +2202,17 @@ mod tests {
             names: vec!["helper".to_string()],
             span: span(),
         });
-        let edges = attach_import_and_call_edges(path, branch, &index, &mod_map, None, &HashMap::new());
+        let mut helpers = FileIndex::default();
+        helpers.symbols.push(ParsedSymbol {
+            stable_key: "helper".into(),
+            disambiguator: String::new(),
+            qualified_name: "helpers.py::helper".into(),
+            kind: NodeKind::Function,
+            span: span(),
+        });
+        let mut batch = HashMap::new();
+        batch.insert("helpers.py".into(), helpers);
+        let edges = attach_import_and_call_edges(path, branch, &index, &mod_map, None, &batch);
         let file_hub = NodeRevisionId(stable_rev_id_bytes(branch, path, "$file"));
         assert!(edges.contains_key(&file_hub));
         assert_eq!(edges.get(&file_hub).map(|v| v.len()), Some(1));
@@ -1913,9 +2225,33 @@ mod tests {
         let branch = BranchId([0u8; 16]);
         let path = "app.ts";
         let content = "import { helper } from './util';\nexport function run() { helper(); }\n";
+        let util_src = "export function helper() { return 1; }\n";
         let indexers = crate::language_indexer::default_indexers();
         let mod_map = module_map_for_paths(["app.ts", "util.ts"], &indexers);
-        let edges = regen_edges_for_file_with_graph(
+        let app = crate::language_indexer::indexer_for_path(path, &indexers)
+            .expect("ts indexer")
+            .index_file(path, content)
+            .expect("index app.ts");
+        let util = crate::language_indexer::indexer_for_path("util.ts", &indexers)
+            .expect("ts indexer")
+            .index_file("util.ts", util_src)
+            .expect("index util.ts");
+        let mut batch = HashMap::new();
+        batch.insert(path.to_string(), app.clone());
+        batch.insert("util.ts".to_string(), util);
+        let edges = attach_import_and_call_edges(path, branch, &app, &mod_map, None, &batch);
+        let file_hub = NodeRevisionId(stable_rev_id_bytes(branch, path, "$file"));
+        let imports = edges.get(&file_hub).expect("typescript named import edge");
+        let helper = IdentityId(stable_id_bytes("id", "util.ts", "helper"));
+        assert!(
+            imports.iter().any(|e| e.ty == EdgeType::Imports && e.target_identity_id == helper),
+            "named import must target helper, not a file hub: {imports:?}"
+        );
+        let util_hub = IdentityId(stable_id_bytes("file", "util.ts", "$hub"));
+        assert!(imports.iter().all(|e| e.target_identity_id != util_hub));
+
+        // Single-file regen cannot see `helper`, so it must not invent a hub edge.
+        let regen = regen_edges_for_file_with_graph(
             path,
             content,
             branch,
@@ -1924,10 +2260,10 @@ mod tests {
             &indexers,
         )
         .expect("ts regen");
-        let file_hub = NodeRevisionId(stable_rev_id_bytes(branch, path, "$file"));
+        let regen_imports = regen.get(&file_hub).map(Vec::as_slice).unwrap_or(&[]);
         assert!(
-            edges.contains_key(&file_hub),
-            "typescript file should produce import edges via language dispatch"
+            regen_imports.is_empty(),
+            "missing symbol must not fall back to the util.ts file hub: {regen_imports:?}"
         );
     }
 

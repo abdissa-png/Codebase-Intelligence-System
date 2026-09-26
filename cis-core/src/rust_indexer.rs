@@ -14,14 +14,7 @@ use crate::graph::Language;
 /// Map `dir/foo.rs` → `dir.foo` so Rust imports align with [`crate::call_resolve`]
 /// module lookup (same `.` convention as Python / TS).
 pub fn path_to_rust_module_key(rel_path: &str) -> String {
-    let base = rel_path.trim_end_matches(".rs").replace('/', ".");
-    if base.ends_with(".mod") {
-        base.trim_end_matches(".mod").to_string()
-    } else if base.ends_with(".lib") || base.ends_with(".main") {
-        base.rsplit_once('.').map(|(p, _)| p.to_string()).unwrap_or(base)
-    } else {
-        base
-    }
+    crate::call_resolve::path_to_rust_module_key(rel_path)
 }
 
 pub fn index_rust_file(path: &str, content: &str) -> Result<FileIndex, IndexError> {

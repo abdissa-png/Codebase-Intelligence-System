@@ -3930,10 +3930,13 @@ impl CisMcpRuntime {
                     return Err(AuthError::InvalidInput);
                 }
                 let mut reasons = Vec::new();
-                let outbound = g.outbound_edges(rid);
+                let outbound = crate::query_engine::outbound_context_edges(&g, &chain, rid);
                 let mut candidate_target_identities = 0usize;
                 for e in outbound {
-                    if !matches!(e.ty, EdgeType::Imports | EdgeType::Extends | EdgeType::Calls) {
+                    if !matches!(
+                        e.ty,
+                        EdgeType::Imports | EdgeType::Extends | EdgeType::Calls | EdgeType::Uses
+                    ) {
                         continue;
                     }
                     candidate_target_identities += 1;

@@ -48,12 +48,6 @@ pub fn file_hub_revision_for_path(
     None
 }
 
-fn is_file_hub_revision(g: &impl GraphView, rid: NodeRevisionId) -> bool {
-    g.get_revision(rid)
-        .and_then(|r| g.identity_kind(r.identity_id))
-        == Some(NodeKind::File)
-}
-
 /// Outbound Calls/Imports/Uses/Extends on `source` only (no file-hub import hop).
 pub fn outbound_local_context_edges(
     g: &impl GraphView,
@@ -65,29 +59,18 @@ pub fn outbound_local_context_edges(
         .collect()
 }
 
-/// Outbound edges for definition resolution, including file-hub import hop
-/// (imports are stored on `$file`, not duplicated on every symbol).
+/// Outbound edges for definition resolution.
 ///
-/// `get_dependencies` / `expand_context` use [`outbound_local_context_edges`] so a
-/// function query does not dump every import of its parent file.
+/// Imports live on the `$file` hub. They are definitions of that hub only —
+/// inheriting them onto every symbol made `go_to_definition` prefer a poisoned
+/// file-hub `Imports` edge over the symbol's own `Uses` edge.
+/// `file_imports` reads the hub directly.
 pub fn outbound_context_edges(
     g: &impl GraphView,
-    chain: &[BranchId],
+    _chain: &[BranchId],
     source_revision: NodeRevisionId,
 ) -> Vec<GraphEdge> {
-    let mut out = outbound_local_context_edges(g, source_revision);
-    if !is_file_hub_revision(g, source_revision) {
-        if let Some(rev) = g.get_revision(source_revision) {
-            if let Some(fr) = file_hub_revision_for_path(g, chain, &rev.file_path) {
-                for e in g.outbound_edges(fr) {
-                    if e.ty == EdgeType::Imports {
-                        out.push(e);
-                    }
-                }
-            }
-        }
-    }
-    out
+    outbound_local_context_edges(g, source_revision)
 }
 
 /// **FR-2.5 / §01.3** — `Stub` nodes are traversal boundaries (OPAQUE gate).
@@ -466,8 +449,9 @@ pub fn resolve_definition_target(
 
 /// Like [`resolve_definition_target`] with deletion absence.
 ///
-/// Priority: Calls, then Imports/Extends, then Uses (aligned with context edges so
-/// navigation and expansion do not disagree on reachable definition edges).
+/// Priority: Calls, then Imports/Extends, then Uses, on this revision only.
+/// A `File` target (module hub) is used only when no symbol target resolves,
+/// so a file-hub import cannot outrank a real type use.
 pub fn resolve_definition_target_with_absence(
     g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
@@ -475,28 +459,31 @@ pub fn resolve_definition_target_with_absence(
     source_revision: NodeRevisionId,
     absence: Option<&DeletionAbsenceStore>,
 ) -> Option<NodeRevision> {
-    for e in outbound_context_edges(g, chain, source_revision) {
-        if e.ty == EdgeType::Calls {
-            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, &e, absence) {
+    let edges = outbound_context_edges(g, chain, source_revision);
+    let mut file_fallback = None;
+    let tiers: [fn(&GraphEdge) -> bool; 3] = [
+        |e| e.ty == EdgeType::Calls,
+        |e| matches!(e.ty, EdgeType::Imports | EdgeType::Extends),
+        |e| e.ty == EdgeType::Uses,
+    ];
+    for pred in tiers {
+        for e in &edges {
+            if !pred(e) {
+                continue;
+            }
+            let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, e, absence) else {
+                continue;
+            };
+            if g.identity_kind(trev.identity_id) == Some(NodeKind::File) {
+                if file_fallback.is_none() {
+                    file_fallback = Some(trev);
+                }
+            } else {
                 return Some(trev);
             }
         }
     }
-    for e in outbound_context_edges(g, chain, source_revision) {
-        if matches!(e.ty, EdgeType::Imports | EdgeType::Extends) {
-            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, &e, absence) {
-                return Some(trev);
-            }
-        }
-    }
-    for e in outbound_context_edges(g, chain, source_revision) {
-        if e.ty == EdgeType::Uses {
-            if let Some(trev) = resolve_edge_target_with_absence(g, eto, chain, &e, absence) {
-                return Some(trev);
-            }
-        }
-    }
-    None
+    file_fallback
 }
 
 /// Count outbound definition edges that fail resolution (for explain_context).
@@ -511,7 +498,7 @@ pub fn count_unresolved_definition_edges(
         .filter(|e| {
             matches!(
                 e.ty,
-                EdgeType::Imports | EdgeType::Extends | EdgeType::Calls
+                EdgeType::Imports | EdgeType::Extends | EdgeType::Calls | EdgeType::Uses
             ) && resolve_edge_target(g, eto, chain, e).is_none()
         })
         .count()
@@ -847,8 +834,9 @@ mod tests {
 
         let hopped = outbound_context_edges(&g, &chain, seed);
         assert!(
-            hopped.iter().any(|e| e.ty == EdgeType::Imports),
-            "definition resolution still hops file-hub imports"
+            hopped.iter().all(|e| e.ty != EdgeType::Imports),
+            "definition resolution must not inherit parent-file Imports: {:?}",
+            hopped.iter().map(|e| e.ty).collect::<Vec<_>>()
         );
         let local = outbound_local_context_edges(&g, seed);
         assert!(
@@ -866,6 +854,168 @@ mod tests {
             !ids.contains(&NodeRevisionId([8u8; 16])),
             "expand_context must not dump parent-file import targets"
         );
+    }
+
+    #[test]
+    fn definition_uses_local_type_not_poisoned_file_hub_import() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let b = branch();
+        let chain = [b];
+        let file_path = "cis-core/src/coordinator.rs";
+        let symbol = rev(&mut g, 1, 1, "CoordinatorError", RevisionStatus::Active);
+        // `rev` stamps m.py; retarget the symbol onto the file that owns the hub.
+        let mut symbol_rev = g.get_revision(symbol).unwrap().clone();
+        symbol_rev.file_path = file_path.into();
+        g.put_revision(symbol_rev);
+        let type_iid = IdentityId([2u8; 16]);
+        let _ty = rev(&mut g, 2, 2, "graph.rs::RevisionStatus", RevisionStatus::Active);
+        let hub_iid = IdentityId([10u8; 16]);
+        let hub_rid = NodeRevisionId(crate::index_model::stable_rev_id_bytes(
+            b, file_path, "$file",
+        ));
+        g.put_identity(NodeIdentity {
+            identity_id: hub_iid,
+            kind: NodeKind::File,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: hub_rid,
+            identity_id: hub_iid,
+            branch_id: b,
+            status: RevisionStatus::Active,
+            qualified_name: file_path.into(),
+            file_path: file_path.into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Rust,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let poisoned = IdentityId([8u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: poisoned,
+            kind: NodeKind::File,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: NodeRevisionId([8u8; 16]),
+            identity_id: poisoned,
+            branch_id: b,
+            status: RevisionStatus::Active,
+            qualified_name: "cis-core/src/indexer_eval/graph.rs".into(),
+            file_path: "cis-core/src/indexer_eval/graph.rs".into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Rust,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let resolution = EdgeResolution {
+            target_signature_hash: [0u8; 32],
+            resolver: SourceType::Ast,
+            last_validation_ms: 0,
+        };
+        g.replace_edges_for_revision(
+            hub_rid,
+            vec![GraphEdge {
+                edge_id: [40u8; 16],
+                ty: EdgeType::Imports,
+                source_revision_id: hub_rid,
+                target_identity_id: poisoned,
+                resolution: resolution.clone(),
+                anchor: SourceSpan::UNKNOWN,
+            }],
+        )
+        .unwrap();
+        g.replace_edges_for_revision(
+            symbol,
+            vec![GraphEdge {
+                edge_id: [41u8; 16],
+                ty: EdgeType::Uses,
+                source_revision_id: symbol,
+                target_identity_id: type_iid,
+                resolution,
+                anchor: SourceSpan::UNKNOWN,
+            }],
+        )
+        .unwrap();
+        let target = resolve_definition_target(&g, &eto, &chain, symbol).unwrap();
+        assert_eq!(target.qualified_name, "graph.rs::RevisionStatus");
+        assert_ne!(target.identity_id, poisoned);
+
+        let bare = rev(&mut g, 3, 3, "Bare", RevisionStatus::Active);
+        let mut bare_rev = g.get_revision(bare).unwrap().clone();
+        bare_rev.file_path = file_path.into();
+        g.put_revision(bare_rev);
+        assert!(
+            resolve_definition_target(&g, &eto, &chain, bare).is_none(),
+            "a symbol with no local edges must not inherit the file hub's import"
+        );
+    }
+
+    #[test]
+    fn definition_demotes_file_target_behind_uses() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let b = branch();
+        let chain = [b];
+        let symbol = rev(&mut g, 1, 1, "CoordinatorError", RevisionStatus::Active);
+        let type_iid = IdentityId([2u8; 16]);
+        let _ty = rev(&mut g, 2, 2, "graph.rs::RevisionStatus", RevisionStatus::Active);
+        let file_iid = IdentityId([8u8; 16]);
+        g.put_identity(NodeIdentity {
+            identity_id: file_iid,
+            kind: NodeKind::File,
+        });
+        g.put_revision(NodeRevision {
+            revision_id: NodeRevisionId([8u8; 16]),
+            identity_id: file_iid,
+            branch_id: b,
+            status: RevisionStatus::Active,
+            qualified_name: "wrong.rs".into(),
+            file_path: "wrong.rs".into(),
+            body_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+            language: Language::Rust,
+            parent_revision_id: None,
+            rename_source_id: None,
+            span: SourceSpan::UNKNOWN,
+            tombstoned_at_ms: None,
+        });
+        let resolution = EdgeResolution {
+            target_signature_hash: [0u8; 32],
+            resolver: SourceType::Ast,
+            last_validation_ms: 0,
+        };
+        g.replace_edges_for_revision(
+            symbol,
+            vec![
+                GraphEdge {
+                    edge_id: [1u8; 16],
+                    ty: EdgeType::Imports,
+                    source_revision_id: symbol,
+                    target_identity_id: file_iid,
+                    resolution: resolution.clone(),
+                    anchor: SourceSpan::UNKNOWN,
+                },
+                GraphEdge {
+                    edge_id: [2u8; 16],
+                    ty: EdgeType::Uses,
+                    source_revision_id: symbol,
+                    target_identity_id: type_iid,
+                    resolution,
+                    anchor: SourceSpan::UNKNOWN,
+                },
+            ],
+        )
+        .unwrap();
+        let target = resolve_definition_target(&g, &eto, &chain, symbol).unwrap();
+        assert_eq!(target.qualified_name, "graph.rs::RevisionStatus");
     }
 
     #[test]
