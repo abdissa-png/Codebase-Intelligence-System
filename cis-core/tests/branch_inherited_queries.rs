@@ -132,17 +132,41 @@ fn feature_branch_sees_inherited_and_edited_symbols() {
         names(&deps.hits)
     );
 
-    let gtd = rt
+    let gtd_beta = rt
         .go_to_definition(0, &beta_hit.revision_id_hex, None)
         .expect("go_to_definition");
     assert!(
-        gtd.target
-            .as_ref()
-            .map(|t| t.qualified_name.contains("alpha"))
-            .unwrap_or(false),
-        "go_to_definition from beta should reach alpha: {:?}",
-        gtd.target
+        gtd_beta.target.is_none(),
+        "a call inside beta is a dependency, not a definition: {:?}",
+        gtd_beta.target
     );
+
+    let hub = rt.find_symbol(0, "b.py", None, 20, true).unwrap();
+    let hub_hit = hub
+        .matches
+        .iter()
+        .find(|m| m.qualified_name == m.file_path && m.file_path.ends_with("b.py"))
+        .expect("b.py file hub");
+    let gtd = rt
+        .go_to_definition(0, &hub_hit.revision_id_hex, None)
+        .expect("go_to_definition");
+    let target = gtd
+        .target
+        .as_ref()
+        .expect("from a import alpha on b.py should resolve");
+    assert!(
+        target.qualified_name.contains("alpha"),
+        "go_to_definition from the import should reach alpha: {target:?}"
+    );
+    let g = rt.graph_mutex().read();
+    let resolved = g
+        .get_revision(parse_rev(&target.revision_id_hex))
+        .expect("resolved alpha");
+    assert_eq!(
+        resolved.branch_id, feature_id,
+        "import should resolve to the edited feature alpha, not the parent copy"
+    );
+    drop(g);
 
     let refs = rt
         .find_references(0, &alpha_hit.revision_id_hex, None, 20)
