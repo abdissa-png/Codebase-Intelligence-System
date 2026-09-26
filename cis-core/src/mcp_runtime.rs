@@ -587,6 +587,36 @@ fn hit_from_span(rev: &NodeRevision, span: SourceSpan, confidence: f64) -> Symbo
     }
 }
 
+/// File hubs sort first only when `prefer_file_hub` is set. Otherwise a symbol
+/// whose name is the query (`UserCard.tsx::UserCard`) outranks the hub
+/// (`UserCard.tsx`), which also contains the query as a path substring.
+fn find_symbol_rank(hit: &SymbolHit, needle: &str, prefer_file_hub: bool) -> (u8, usize) {
+    let is_hub = hit.qualified_name == hit.file_path;
+    if prefer_file_hub {
+        return if is_hub {
+            (0, hit.qualified_name.len())
+        } else if hit.qualified_name.ends_with(needle) {
+            (1, hit.qualified_name.len())
+        } else {
+            (2, hit.qualified_name.len())
+        };
+    }
+    let symbol_name = hit
+        .qualified_name
+        .rsplit("::")
+        .next()
+        .unwrap_or(hit.qualified_name.as_str());
+    if !is_hub && symbol_name == needle {
+        (0, hit.qualified_name.len())
+    } else if !is_hub && symbol_name.ends_with(needle) {
+        (1, hit.qualified_name.len())
+    } else if !is_hub {
+        (2, hit.qualified_name.len())
+    } else {
+        (3, hit.qualified_name.len())
+    }
+}
+
 fn hit_from_rev(rev: &NodeRevision, confidence: f64) -> SymbolHit {
     hit_from_span(rev, rev.span, confidence)
 }
@@ -2516,8 +2546,7 @@ impl CisMcpRuntime {
         let mut matches = Vec::new();
         self.coordinator.with_graph_view(|g| {
             let mut seen = HashSet::new();
-            let qn_limit = if prefer_file_hub { 0 } else { limit.saturating_mul(4).max(limit) };
-            for rev in g.find_revisions_qn_contains(&chain, needle, qn_limit) {
+            for rev in g.find_revisions_qn_contains(&chain, needle, 0) {
                 if !seen.insert(rev.identity_id) {
                     continue;
                 }
@@ -2532,9 +2561,6 @@ impl CisMcpRuntime {
                 if !resolved.qualified_name.contains(needle) {
                     continue;
                 }
-                if !prefer_file_hub && matches.len() >= limit {
-                    break;
-                }
                 let conf = crate::query_engine::node_hit_confidence_with_absence(
                     &g,
                     &eto,
@@ -2547,19 +2573,10 @@ impl CisMcpRuntime {
                 matches.push(hit_from_rev(&resolved, conf));
             }
         });
-        if prefer_file_hub {
-            matches.sort_by(|a, b| {
-                let rank = |h: &SymbolHit| -> (u8, usize) {
-                    if h.qualified_name == h.file_path {
-                        (0, h.qualified_name.len())
-                    } else if h.qualified_name.ends_with(needle) {
-                        (1, h.qualified_name.len())
-                    } else {
-                        (2, h.qualified_name.len())
-                    }
-                };
-                rank(a).cmp(&rank(b))
-            });
+        matches.sort_by(|a, b| {
+            find_symbol_rank(a, needle, prefer_file_hub).cmp(&find_symbol_rank(b, needle, prefer_file_hub))
+        });
+        if limit > 0 {
             matches.truncate(limit);
         }
         let node_count = matches.len();
@@ -3933,10 +3950,7 @@ impl CisMcpRuntime {
                 let outbound = crate::query_engine::outbound_context_edges(&g, &chain, rid);
                 let mut candidate_target_identities = 0usize;
                 for e in outbound {
-                    if !matches!(
-                        e.ty,
-                        EdgeType::Imports | EdgeType::Extends | EdgeType::Calls | EdgeType::Uses
-                    ) {
+                    if !crate::query_engine::is_definition_edge(e.ty) {
                         continue;
                     }
                     candidate_target_identities += 1;
@@ -4364,6 +4378,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let rt = CisMcpRuntime::new_dev(&dir.to_string_lossy());
         (dir, rt)
+    }
+
+    #[test]
+    fn find_symbol_ranks_named_symbol_ahead_of_file_hub() {
+        let hub = SymbolHit {
+            identity_id_hex: "aa".into(),
+            revision_id_hex: "bb".into(),
+            qualified_name: "src/components/UserCard.tsx".into(),
+            file_path: "src/components/UserCard.tsx".into(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 0,
+            confidence: 0.5,
+            edge_type: None,
+        };
+        let symbol = SymbolHit {
+            qualified_name: "src/components/UserCard.tsx::UserCard".into(),
+            ..hub.clone()
+        };
+        assert!(find_symbol_rank(&symbol, "UserCard", false) < find_symbol_rank(&hub, "UserCard", false));
+        assert!(find_symbol_rank(&hub, "UserCard", true) < find_symbol_rank(&symbol, "UserCard", true));
     }
 
     #[test]

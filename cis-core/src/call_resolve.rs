@@ -289,6 +289,153 @@ fn rust_path_is_anchored(module: &str) -> bool {
         || module.starts_with("super.")
 }
 
+fn python_import_root_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() || prefix.contains('.') {
+        return false;
+    }
+    !matches!(prefix, "test" | "tests" | "testing" | "__pycache__")
+}
+
+/// Absolute `import flask` matches `flask` or `src.flask`, not
+/// `tests...inner2.flask` and not `src.flask.typing` for `import typing`.
+fn python_absolute_module(module: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+    let module = module.trim();
+    if module.is_empty() || module.starts_with('.') {
+        return None;
+    }
+    let suffix = format!(".{module}");
+    let mut hits: Vec<String> = mod_map
+        .iter()
+        .filter(|(k, _)| {
+            k.strip_suffix(suffix.as_str())
+                .is_some_and(python_import_root_prefix)
+        })
+        .map(|(_, v)| v.clone())
+        .collect();
+    hits.sort();
+    hits.dedup();
+    if hits.len() == 1 {
+        hits.pop()
+    } else {
+        None
+    }
+}
+
+fn python_package_of_file(from_path: &str) -> String {
+    let key = crate::python_indexer::path_to_python_module_key(from_path);
+    if from_path.ends_with("/__init__.py") || from_path == "__init__.py" {
+        return key;
+    }
+    match key.rfind('.') {
+        Some(i) => key[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// `from .cli import AppGroup` and `from ..helpers import x`, counted in dots.
+fn resolve_python_relative(
+    module: &str,
+    from_path: &str,
+    mod_map: &HashMap<String, String>,
+) -> Option<String> {
+    let module = module.trim();
+    let mut dots = 0usize;
+    let rest = module.trim_start_matches(|c| {
+        if c == '.' {
+            dots += 1;
+            true
+        } else {
+            false
+        }
+    });
+    if dots == 0 {
+        return None;
+    }
+    let mut base = python_package_of_file(from_path);
+    for _ in 1..dots {
+        if let Some(i) = base.rfind('.') {
+            base.truncate(i);
+        } else {
+            base.clear();
+            break;
+        }
+    }
+    let target = if rest.is_empty() {
+        base
+    } else if base.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{base}.{rest}")
+    };
+    if target.is_empty() {
+        None
+    } else {
+        mod_map.get(&target).cloned()
+    }
+}
+
+fn is_script_module_path(path: &str) -> bool {
+    path.ends_with(".js")
+        || path.ends_with(".jsx")
+        || path.ends_with(".mjs")
+        || path.ends_with(".cjs")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
+}
+
+fn normalize_rel_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            parts.pop();
+            continue;
+        }
+        parts.push(part);
+    }
+    parts.join("/")
+}
+
+/// `require("./application")` and `from './util'` omit or include the extension.
+fn resolve_script_relative(
+    module: &str,
+    from_path: &str,
+    mod_map: &HashMap<String, String>,
+) -> Option<String> {
+    let raw = module.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    if !raw.starts_with('.') {
+        return None;
+    }
+    let dir = path_dir(from_path);
+    let joined = if dir.is_empty() {
+        raw.to_string()
+    } else {
+        format!("{dir}/{raw}")
+    };
+    let joined = normalize_rel_path(&joined);
+    let candidates = [
+        joined.clone(),
+        format!("{joined}.js"),
+        format!("{joined}.jsx"),
+        format!("{joined}.mjs"),
+        format!("{joined}.cjs"),
+        format!("{joined}.ts"),
+        format!("{joined}.tsx"),
+        format!("{joined}/index.js"),
+        format!("{joined}/index.jsx"),
+        format!("{joined}/index.ts"),
+        format!("{joined}/index.tsx"),
+    ];
+    for candidate in candidates {
+        if let Some(p) = mod_map.values().find(|v| v.as_str() == candidate) {
+            return Some(p.clone());
+        }
+    }
+    None
+}
+
 /// Every module-map path that suffix-matches `candidate`. Exact key hits return
 /// that single path. Multiple hits stay unresolved — `HashMap` iteration order
 /// must not pick `indexer_eval/graph.rs` over `graph.rs`.
@@ -444,6 +591,21 @@ pub(crate) fn resolve_module_path_at(
         return Some(p.clone());
     }
     if let Some(from) = from_path {
+        if from.ends_with(".py") {
+            if raw.starts_with('.') {
+                return resolve_python_relative(raw, from, mod_map);
+            }
+            return python_absolute_module(&normalized, mod_map);
+        }
+        if is_script_module_path(from) && raw.starts_with('.') {
+            if let Some(p) = resolve_script_relative(raw, from, mod_map) {
+                return Some(p);
+            }
+        }
+        if is_script_module_path(from) && !raw.starts_with('.') && !raw.contains('/') {
+            // `require("fs")` / `require("debug")` is a package, not a basename in the repo.
+            return None;
+        }
         if from.ends_with(".rs") {
             if let Some(p) = resolve_rust_path(&normalized, from, mod_map) {
                 return Some(p);
@@ -1543,8 +1705,14 @@ pub fn module_map_for_paths(
         .into_iter()
         .filter_map(|p| {
             let s = p.as_ref().to_string();
-            crate::language_indexer::indexer_for_path(&s, indexers)
-                .map(|idx| (idx.module_key(&s), s))
+            crate::language_indexer::indexer_for_path(&s, indexers).and_then(|idx| {
+                let k = idx.module_key(&s);
+                if k.is_empty() {
+                    None
+                } else {
+                    Some((k, s))
+                }
+            })
         })
         .collect()
 }
@@ -2820,5 +2988,44 @@ mod tests {
                 "InMemoryGraph.revision_count"
             ))
         );
+    }
+
+    #[test]
+    fn python_absolute_import_prefers_package_over_nested_basename() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert(
+            "src.flask".into(),
+            "src/flask/__init__.py".into(),
+        );
+        mod_map.insert(
+            "tests.test_apps.cliapp.inner1.inner2.flask".into(),
+            "tests/test_apps/cliapp/inner1/inner2/flask.py".into(),
+        );
+        mod_map.insert("src.flask.typing".into(), "src/flask/typing.py".into());
+        mod_map.insert("src.flask.cli".into(), "src/flask/cli.py".into());
+        let flask = resolve_module_path_at("flask", Some("tests/test_basic.py"), &mod_map);
+        assert_eq!(flask.as_deref(), Some("src/flask/__init__.py"));
+        let typing = resolve_module_path_at("typing", Some("src/flask/app.py"), &mod_map);
+        assert!(typing.is_none(), "stdlib typing must not bind to flask/typing.py, got {typing:?}");
+        let cli = resolve_module_path_at(".cli", Some("src/flask/app.py"), &mod_map);
+        assert_eq!(cli.as_deref(), Some("src/flask/cli.py"));
+        let nested = resolve_module_path_at(
+            "...flask",
+            Some("src/flask/app.py"),
+            &mod_map,
+        );
+        assert!(nested.is_none());
+    }
+
+    #[test]
+    fn script_require_resolves_relative_not_bare_package() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert("lib.application".into(), "lib/application.js".into());
+        mod_map.insert("lib.utils".into(), "lib/utils.js".into());
+        mod_map.insert("elsewhere.fs".into(), "elsewhere/fs.js".into());
+        let app = resolve_module_path_at("./application", Some("lib/express.js"), &mod_map);
+        assert_eq!(app.as_deref(), Some("lib/application.js"));
+        let fs = resolve_module_path_at("fs", Some("lib/express.js"), &mod_map);
+        assert!(fs.is_none(), "bare require must not suffix-match, got {fs:?}");
     }
 }

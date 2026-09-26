@@ -169,7 +169,7 @@ Without the embed server, CIS falls back to a deterministic **stub embedder** (o
 
 `write_file`, `apply_patch`, `reindex_paths`, `confirm_patch`, `revert_patch`, `sweep_confirm_sidecars`, `purge_branch`, `retarget_edge`, `save_workspace`, `cancel_merge`, `merge_ttl_sweep`, `merge_branch`, `ingest_cis_config`, `create_branch`, `switch_branch`
 
-`go_to_definition` follows Calls, then Imports or Extends, then Uses, on the revision you pass. It does not copy the parent file's imports onto that symbol. `why_no_definition` reports the same edge set: `no_outbound_definition_edges`, `target_identity_without_active_revision`, or `index_mode_regex_limits_call_precision`. `file_imports` is the file-level import list.
+`go_to_definition` follows Extends, then Imports, on the revision you pass. Calls and Uses are dependencies of that revision (`get_dependencies`, `get_callers`), not another definition. It does not copy the parent file's imports onto that symbol. `why_no_definition` reports the same Extends and Imports edges: `no_outbound_definition_edges`, `target_identity_without_active_revision`, or `index_mode_regex_limits_call_precision`. `file_imports` is the file-level import list. `find_symbol` ranks a symbol whose name matches the query ahead of a file hub whose path contains it.
 
 ## Configuration
 

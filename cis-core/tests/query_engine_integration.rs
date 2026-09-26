@@ -113,7 +113,7 @@ fn eto_overrides_definition_resolution() {
     let edges = if edges.is_empty() {
         vec![cis_core::GraphEdge {
             edge_id,
-            ty: EdgeType::Calls,
+            ty: EdgeType::Extends,
             source_revision_id: caller_rid,
             target_identity_id: wrong_i,
             resolution: cis_core::EdgeResolution {
@@ -126,7 +126,7 @@ fn eto_overrides_definition_resolution() {
     } else {
         edges
     };
-    if let Some(e) = edges.iter().find(|e| e.ty == EdgeType::Calls) {
+    if let Some(e) = edges.iter().find(|e| e.ty == EdgeType::Extends) {
         eto.set_override(BRANCH, caller_rid, e.edge_id, right_i);
     } else {
         eto.set_override(BRANCH, caller_rid, edge_id, right_i);

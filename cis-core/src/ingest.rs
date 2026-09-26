@@ -187,7 +187,9 @@ pub fn apply_index_events_with_config(
     for ev in &events {
         if let Some(idx) = indexer_for_path(&ev.path, &indexers) {
             let k = idx.module_key(&ev.path);
-            module_to_path.insert(k, ev.path.clone());
+            if !k.is_empty() {
+                module_to_path.insert(k, ev.path.clone());
+            }
         }
     }
 

@@ -10,8 +10,16 @@ use crate::index_model::{
 };
 
 /// Map `dir/Mod.py` → `dir.Mod` for **`from X import …`** resolution.
+///
+/// `pkg/__init__.py` is the package `pkg`, not the module `pkg.__init__`.
+/// A nested `flask.py` must not be the only key that ends in `.flask`.
 pub fn path_to_python_module_key(rel_path: &str) -> String {
-    rel_path.trim_end_matches(".py").replace('/', ".")
+    let trimmed = rel_path.trim_end_matches(".py");
+    let trimmed = trimmed.strip_suffix("/__init__").unwrap_or(trimmed);
+    if trimmed.is_empty() || trimmed == "__init__" {
+        return String::new();
+    }
+    trimmed.replace('/', ".")
 }
 
 fn parse_import_names(tail: &str) -> Vec<String> {
@@ -36,7 +44,11 @@ fn extract_imports_regex(content: &str) -> Vec<ParsedImport> {
     let Ok(re_imp) = regex::Regex::new(r"(?m)^import\s+([\w.]+)") else {
         return out;
     };
-    let Ok(re_from) = regex::Regex::new(r"(?m)^from\s+([\w.]+)\s+import\s+(.+)") else {
+    // Leading dots are relative (`from .cli import AppGroup`, `from . import typing`).
+    // A parenthesized name list may span lines.
+    let Ok(re_from) = regex::Regex::new(
+        r"(?m)^from\s+(\.+|\.+[\w.]+|[\w.]+)\s+import\s+(\([^)]*\)|[^\n#]+)",
+    ) else {
         return out;
     };
     for cap in re_imp.captures_iter(content) {
@@ -51,17 +63,40 @@ fn extract_imports_regex(content: &str) -> Vec<ParsedImport> {
     }
     for cap in re_from.captures_iter(content) {
         if let (Some(full), Some(m), Some(tail)) = (cap.get(0), cap.get(1), cap.get(2)) {
-            let tail = tail.as_str().trim();
-            let (style, names) = if tail == "*" {
+            let module = m.as_str().trim();
+            let tail = tail.as_str().trim().trim_matches(|c| c == '(' || c == ')');
+            let span = span_from_byte_range(content, full.start(), full.end());
+            // `from . import name` imports the submodule, not a symbol inside this file.
+            if !module.is_empty() && module.chars().all(|c| c == '.') {
+                if tail.trim() == "*" {
+                    out.push(ParsedImport {
+                        module: module.to_string(),
+                        style: ImportStyle::Star,
+                        names: vec![],
+                        span,
+                    });
+                } else {
+                    for name in parse_import_names(tail) {
+                        out.push(ParsedImport {
+                            module: format!("{module}{name}"),
+                            style: ImportStyle::ModuleOnly,
+                            names: vec![],
+                            span,
+                        });
+                    }
+                }
+                continue;
+            }
+            let (style, names) = if tail.trim() == "*" {
                 (ImportStyle::Star, vec![])
             } else {
                 (ImportStyle::Names, parse_import_names(tail))
             };
             out.push(ParsedImport {
-                module: m.as_str().to_string(),
+                module: module.to_string(),
                 style,
                 names,
-                span: span_from_byte_range(content, full.start(), full.end()),
+                span,
             });
         }
     }
@@ -788,5 +823,35 @@ mod tests {
             "chained unwrap, got {:?}",
             idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn package_init_is_the_package_key() {
+        assert_eq!(
+            path_to_python_module_key("src/flask/__init__.py"),
+            "src.flask"
+        );
+        assert_eq!(
+            path_to_python_module_key("tests/test_apps/cliapp/inner1/inner2/flask.py"),
+            "tests.test_apps.cliapp.inner1.inner2.flask"
+        );
+        assert_eq!(path_to_python_module_key("src/flask/typing.py"), "src.flask.typing");
+    }
+
+    #[test]
+    fn relative_imports_are_extracted() {
+        let src = "\
+from .cli import AppGroup
+from .sansio.blueprints import Blueprint as SansioBlueprint
+from . import typing
+import typing as t
+import flask
+";
+        let imports = extract_imports_regex(src);
+        assert!(imports.iter().any(|i| i.module == ".cli" && i.names == ["AppGroup"]));
+        assert!(imports.iter().any(|i| i.module == ".sansio.blueprints" && i.names == ["Blueprint"]));
+        assert!(imports.iter().any(|i| i.module == ".typing" && i.style == ImportStyle::ModuleOnly));
+        assert!(imports.iter().any(|i| i.module == "typing" && i.style == ImportStyle::ModuleOnly));
+        assert!(imports.iter().any(|i| i.module == "flask"));
     }
 }

@@ -36,8 +36,8 @@ pub fn index_javascript_file(path: &str, content: &str) -> Result<FileIndex, Ind
     });
 
     visit(root, content, path, &mut Vec::new(), &mut idx);
-    visit_module_level_calls(root, content, &mut idx.calls, &mut idx.uses);
     idx.imports = extract_imports(root, content);
+    collect_require_imports(root, content, &mut idx.imports);
     assign_collision_disambiguators(&mut idx);
     Ok(idx)
 }
@@ -67,39 +67,51 @@ fn parse_call_receiver(node: Node, src: &str) -> Option<CallReceiver> {
     }
 }
 
+fn is_js_builtin_call(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "console"
+            | "log"
+            | "warn"
+            | "error"
+            | "info"
+            | "debug"
+            | "require"
+            | "parseInt"
+            | "parseFloat"
+            | "isNaN"
+            | "setTimeout"
+            | "setInterval"
+            | "clearTimeout"
+            | "clearInterval"
+    )
+}
+
+fn record_call(node: Node, src: &str, caller: &str, calls: &mut Vec<ParsedCall>) {
+    let func = match node.kind() {
+        "call_expression" => node.child_by_field_name("function"),
+        "new_expression" => node.child_by_field_name("constructor"),
+        _ => None,
+    };
+    let Some(func) = func else { return };
+    let Some(callee) = parse_call_receiver(func, src) else { return };
+    if node.kind() == "call_expression" && is_js_builtin_call(callee.leaf_name()) {
+        return;
+    }
+    calls.push(ParsedCall {
+        caller_stable_key: caller.to_string(),
+        callee,
+        span: span_from_tree_sitter_node(node),
+    });
+}
+
 fn visit_calls(
     node: Node, src: &str, caller: &str,
     calls: &mut Vec<ParsedCall>, uses: &mut Vec<ParsedUse>,
 ) {
     match node.kind() {
-        "call_expression" => {
-            if let Some(func) = node.child_by_field_name("function") {
-                if let Some(callee) = parse_call_receiver(func, src) {
-                    let leaf = callee.leaf_name();
-                    if !matches!(leaf,
-                        "console" | "log" | "warn" | "error" | "info" | "debug"
-                        | "require" | "parseInt" | "parseFloat" | "isNaN"
-                        | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
-                    ) {
-                        calls.push(ParsedCall {
-                            caller_stable_key: caller.to_string(),
-                            callee,
-                            span: span_from_tree_sitter_node(node),
-                        });
-                    }
-                }
-            }
-        }
-        "new_expression" => {
-            if let Some(constructor) = node.child_by_field_name("constructor") {
-                if let Some(callee) = parse_call_receiver(constructor, src) {
-                    calls.push(ParsedCall {
-                        caller_stable_key: caller.to_string(),
-                        callee,
-                        span: span_from_tree_sitter_node(node),
-                    });
-                }
-            }
+        "call_expression" | "new_expression" => {
+            record_call(node, src, caller, calls);
         }
         "jsx_self_closing_element" | "jsx_opening_element" => {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -119,19 +131,6 @@ fn visit_calls(
     for i in 0..count {
         if let Some(c) = node.named_child(i) {
             visit_calls(c, src, caller, calls, uses);
-        }
-    }
-}
-
-fn visit_module_level_calls(
-    root: Node, src: &str,
-    calls: &mut Vec<ParsedCall>, uses: &mut Vec<ParsedUse>,
-) {
-    let count = root.named_child_count();
-    for i in 0..count {
-        let Some(child) = root.named_child(i) else { continue };
-        if child.kind() == "expression_statement" {
-            visit_calls(child, src, "$file", calls, uses);
         }
     }
 }
@@ -289,6 +288,69 @@ fn extract_single_import(node: Node, src: &str, imports: &mut Vec<ParsedImport>)
     });
 }
 
+fn collect_require_imports(node: Node, src: &str, imports: &mut Vec<ParsedImport>) {
+    if node.kind() == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            if node_text(func, src) == "require" {
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let mut i = 0;
+                    while let Some(arg) = args.named_child(i) {
+                        if arg.kind() == "string" {
+                            let module = node_text(arg, src)
+                                .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                                .to_string();
+                            if !module.is_empty() {
+                                imports.push(ParsedImport {
+                                    module,
+                                    style: ImportStyle::ModuleOnly,
+                                    names: vec![],
+                                    span: span_from_tree_sitter_node(node),
+                                });
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut i = 0;
+    while let Some(child) = node.named_child(i) {
+        collect_require_imports(child, src, imports);
+        i += 1;
+    }
+}
+
+/// `exports.normalizeType = function () {}` and `module.exports.foo = function () {}`.
+fn exported_function_assignment<'a>(node: Node<'a>, src: &str) -> Option<(String, Node<'a>)> {
+    if node.kind() != "assignment_expression" {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    if !matches!(
+        right.kind(),
+        "function_expression" | "arrow_function" | "generator_function"
+    ) {
+        return None;
+    }
+    if left.kind() != "member_expression" {
+        return None;
+    }
+    let obj = left.child_by_field_name("object")?;
+    let prop = left.child_by_field_name("property")?;
+    let prop_name = node_text(prop, src).trim().to_string();
+    if prop_name.is_empty() {
+        return None;
+    }
+    let obj_text = node_text(obj, src);
+    if obj_text == "exports" || obj_text == "module.exports" {
+        return Some((prop_name, right));
+    }
+    None
+}
+
 fn collect_named_imports(node: Node, src: &str, names: &mut Vec<String>) {
     let count = node.named_child_count();
     for i in 0..count {
@@ -397,7 +459,8 @@ fn visit(
                     let name_node = decl.child_by_field_name("name");
                     let value_node = decl.child_by_field_name("value");
                     if let (Some(name_n), Some(val)) = (name_node, value_node) {
-                        if name_n.kind() == "identifier" {
+                        let name_is_ident = name_n.kind() == "identifier";
+                        if name_is_ident {
                             let is_fn = matches!(val.kind(),
                                 "arrow_function" | "function_expression"
                                 | "generator_function"
@@ -435,9 +498,57 @@ fn visit(
                                     visit_class_body(body, src, path, cls, idx);
                                 }
                                 cls.pop();
+                            } else {
+                                // `const x = foo()` and similar: the value is not a
+                                // function symbol, but calls inside it still count.
+                                visit(val, src, path, cls, idx);
                             }
+                        } else {
+                            visit(val, src, path, cls, idx);
                         }
                     }
+                }
+            }
+        }
+        // Anonymous functions passed to `export default helper(function () { ... })`
+        // are not variable declarators, so their bodies are not scanned above.
+        "function_expression" | "arrow_function" | "generator_function" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                visit_calls(body, src, "$file", &mut idx.calls, &mut idx.uses);
+            }
+        }
+        "assignment_expression" => {
+            if let Some((name, func)) = exported_function_assignment(node, src) {
+                let stable = if cls.is_empty() {
+                    name
+                } else {
+                    format!("{}.{}", cls.join("."), name)
+                };
+                idx.symbols.push(ParsedSymbol {
+                    stable_key: stable.clone(),
+                    disambiguator: String::new(),
+                    qualified_name: format!("{path}::{stable}"),
+                    kind: NodeKind::Function,
+                    span: span_from_tree_sitter_node(node),
+                });
+                if let Some(body) = func.child_by_field_name("body") {
+                    visit_calls(body, src, &stable, &mut idx.calls, &mut idx.uses);
+                }
+            } else {
+                let count = node.named_child_count();
+                for i in 0..count {
+                    if let Some(c) = node.named_child(i) {
+                        visit(c, src, path, cls, idx);
+                    }
+                }
+            }
+        }
+        "call_expression" | "new_expression" => {
+            record_call(node, src, "$file", &mut idx.calls);
+            let count = node.named_child_count();
+            for i in 0..count {
+                if let Some(c) = node.named_child(i) {
+                    visit(c, src, path, cls, idx);
                 }
             }
         }
@@ -629,6 +740,27 @@ if (true) {
     }
 
     #[test]
+    fn indexes_export_default_anonymous_function_calls() {
+        let src = r#"
+import restArguments from './restArguments.js';
+import difference from './difference.js';
+export default restArguments(function(array, otherArrays) {
+  return difference(array, otherArrays);
+});
+"#;
+        let idx = index_javascript_file("modules/without.js", src).unwrap();
+        let leaves: Vec<_> = idx.calls.iter().map(|c| c.callee.leaf_name().to_string()).collect();
+        assert!(
+            leaves.iter().any(|n| n == "restArguments"),
+            "outer call missing: {leaves:?}"
+        );
+        assert!(
+            leaves.iter().any(|n| n == "difference"),
+            "call inside anonymous function missing: {leaves:?}"
+        );
+    }
+
+    #[test]
     fn indexes_chained_calls() {
         let src = "function run(g) { g.lock().unwrap(); }\n";
         let idx = index_javascript_file("app.js", src).unwrap();
@@ -638,5 +770,22 @@ if (true) {
             "chained unwrap, got {:?}",
             idx.calls.iter().map(|c| c.callee.label()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn indexes_commonjs_require_and_export_assignment() {
+        let src = "\
+var application = require('./application');
+var utils = require('./utils');
+exports.normalizeType = function(type) { return application(type); };
+exports.setCharset = function setCharset(type, charset) { return type; };
+";
+        let idx = index_javascript_file("lib/utils.js", src).unwrap();
+        let modules: Vec<_> = idx.imports.iter().map(|i| i.module.as_str()).collect();
+        assert!(modules.contains(&"./application"), "{modules:?}");
+        assert!(modules.contains(&"./utils"), "{modules:?}");
+        assert!(idx.symbols.iter().any(|s| s.stable_key == "normalizeType"));
+        assert!(idx.symbols.iter().any(|s| s.stable_key == "setCharset"));
+        assert!(idx.calls.iter().any(|c| c.callee.leaf_name() == "application"));
     }
 }

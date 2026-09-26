@@ -16,12 +16,18 @@ use crate::index_model::stable_rev_id_bytes;
 use crate::ranking_policy::RankingPolicySnapshot;
 
 fn is_context_edge(ty: EdgeType) -> bool {
-    // Context expansion includes Uses (type/name usage). Go-to-definition uses a
-    // stricter priority (Calls → Imports/Extends → Uses) via resolve_definition_target.
+    // Context expansion includes Calls and Uses. Go-to-definition does not:
+    // those edges leave a symbol that is already the definition.
     matches!(
         ty,
         EdgeType::Calls | EdgeType::Imports | EdgeType::Uses | EdgeType::Extends
     )
+}
+
+/// Edges that mean "the definition of this revision is elsewhere."
+/// Calls and Uses are dependencies of the defining revision.
+pub(crate) fn is_definition_edge(ty: EdgeType) -> bool {
+    matches!(ty, EdgeType::Imports | EdgeType::Extends)
 }
 
 fn revision_on_chain(chain: &[BranchId], branch_id: BranchId) -> bool {
@@ -437,7 +443,7 @@ pub fn expand_context_bfs_with_absence(
     }
 }
 
-/// First definition edge (Imports/Extends/Calls) respecting ETO + tombstone bridging + file-hub imports.
+/// First Extends or Imports edge on this revision, respecting ETO and tombstone bridging.
 pub fn resolve_definition_target(
     g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
@@ -449,9 +455,11 @@ pub fn resolve_definition_target(
 
 /// Like [`resolve_definition_target`] with deletion absence.
 ///
-/// Priority: Calls, then Imports/Extends, then Uses, on this revision only.
-/// A `File` target (module hub) is used only when no symbol target resolves,
-/// so a file-hub import cannot outrank a real type use.
+/// Priority: Extends, then Imports, on this revision only.
+/// Calls and Uses stay on `get_dependencies` / `get_callers`. Following them
+/// from `find_symbol` opens a callee or a field type instead of the symbol
+/// the caller already resolved. A `File` target is used only when no symbol
+/// target resolves.
 pub fn resolve_definition_target_with_absence(
     g: &impl GraphView,
     eto: &EdgeTargetOverrideStore,
@@ -461,10 +469,9 @@ pub fn resolve_definition_target_with_absence(
 ) -> Option<NodeRevision> {
     let edges = outbound_context_edges(g, chain, source_revision);
     let mut file_fallback = None;
-    let tiers: [fn(&GraphEdge) -> bool; 3] = [
-        |e| e.ty == EdgeType::Calls,
-        |e| matches!(e.ty, EdgeType::Imports | EdgeType::Extends),
-        |e| e.ty == EdgeType::Uses,
+    let tiers: [fn(&GraphEdge) -> bool; 2] = [
+        |e| e.ty == EdgeType::Extends,
+        |e| e.ty == EdgeType::Imports,
     ];
     for pred in tiers {
         for e in &edges {
@@ -496,10 +503,7 @@ pub fn count_unresolved_definition_edges(
     outbound_context_edges(g, chain, source_revision)
         .iter()
         .filter(|e| {
-            matches!(
-                e.ty,
-                EdgeType::Imports | EdgeType::Extends | EdgeType::Calls | EdgeType::Uses
-            ) && resolve_edge_target(g, eto, chain, e).is_none()
+            is_definition_edge(e.ty) && resolve_edge_target(g, eto, chain, e).is_none()
         })
         .count()
 }
@@ -630,7 +634,7 @@ mod tests {
         let edge_id = [7u8; 16];
         let e = GraphEdge {
             edge_id,
-            ty: EdgeType::Calls,
+            ty: EdgeType::Extends,
             source_revision_id: caller,
             target_identity_id: wrong,
             resolution: EdgeResolution {
@@ -701,7 +705,7 @@ mod tests {
         let edge_id = [7u8; 16];
         let e = GraphEdge {
             edge_id,
-            ty: EdgeType::Calls,
+            ty: EdgeType::Extends,
             source_revision_id: caller,
             target_identity_id: wrong,
             resolution: EdgeResolution {
@@ -943,9 +947,10 @@ mod tests {
             }],
         )
         .unwrap();
-        let target = resolve_definition_target(&g, &eto, &chain, symbol).unwrap();
-        assert_eq!(target.qualified_name, "graph.rs::RevisionStatus");
-        assert_ne!(target.identity_id, poisoned);
+        assert!(
+            resolve_definition_target(&g, &eto, &chain, symbol).is_none(),
+            "Uses on the defining revision is a dependency, not a definition hop"
+        );
 
         let bare = rev(&mut g, 3, 3, "Bare", RevisionStatus::Active);
         let mut bare_rev = g.get_revision(bare).unwrap().clone();
@@ -958,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn definition_demotes_file_target_behind_uses() {
+    fn definition_file_import_does_not_follow_uses() {
         let kv = Arc::new(crate::kv::MemoryKv::new());
         let eto = EdgeTargetOverrideStore::new(kv);
         let mut g = InMemoryGraph::default();
@@ -1015,7 +1020,54 @@ mod tests {
         )
         .unwrap();
         let target = resolve_definition_target(&g, &eto, &chain, symbol).unwrap();
-        assert_eq!(target.qualified_name, "graph.rs::RevisionStatus");
+        assert_eq!(
+            target.qualified_name, "wrong.rs",
+            "Uses does not outrank an Import; a File import stays the fallback"
+        );
+        assert_ne!(target.identity_id, type_iid);
+    }
+
+    #[test]
+    fn definition_follows_extends_not_calls() {
+        let kv = Arc::new(crate::kv::MemoryKv::new());
+        let eto = EdgeTargetOverrideStore::new(kv);
+        let mut g = InMemoryGraph::default();
+        let b = branch();
+        let chain = [b];
+        let symbol = rev(&mut g, 1, 1, "Flask", RevisionStatus::Active);
+        let base = IdentityId([2u8; 16]);
+        let _base_rev = rev(&mut g, 2, 2, "sansio/app.py::App", RevisionStatus::Active);
+        let callee = IdentityId([3u8; 16]);
+        let _callee_rev = rev(&mut g, 3, 3, "ctx.py::_AppCtxGlobals.get", RevisionStatus::Active);
+        let resolution = EdgeResolution {
+            target_signature_hash: [0u8; 32],
+            resolver: SourceType::Ast,
+            last_validation_ms: 0,
+        };
+        g.replace_edges_for_revision(
+            symbol,
+            vec![
+                GraphEdge {
+                    edge_id: [1u8; 16],
+                    ty: EdgeType::Calls,
+                    source_revision_id: symbol,
+                    target_identity_id: callee,
+                    resolution: resolution.clone(),
+                    anchor: SourceSpan::UNKNOWN,
+                },
+                GraphEdge {
+                    edge_id: [2u8; 16],
+                    ty: EdgeType::Extends,
+                    source_revision_id: symbol,
+                    target_identity_id: base,
+                    resolution,
+                    anchor: SourceSpan::UNKNOWN,
+                },
+            ],
+        )
+        .unwrap();
+        let target = resolve_definition_target(&g, &eto, &chain, symbol).unwrap();
+        assert_eq!(target.qualified_name, "sansio/app.py::App");
     }
 
     #[test]
