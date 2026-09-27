@@ -289,11 +289,93 @@ fn rust_path_is_anchored(module: &str) -> bool {
         || module.starts_with("super.")
 }
 
+fn unique_go_package(import_path: &str, mod_map: &HashMap<String, String>) -> Option<String> {
+    let dotted = import_path.replace('/', ".");
+    let prefix = format!("{dotted}.");
+    let mut hits: Vec<String> = mod_map
+        .iter()
+        .filter(|(k, path)| {
+            path.ends_with(".go")
+                && (k.as_str() == dotted
+                    || (k.starts_with(&prefix) && !k[prefix.len()..].contains('.')))
+        })
+        .map(|(_, v)| v.clone())
+        .collect();
+    hits.sort();
+    hits.dedup();
+    if hits.len() == 1 {
+        return hits.pop();
+    }
+    if hits.len() > 1 {
+        // Prefer a real source file over `doc.go` when several package files match.
+        hits.sort_by(|a, b| {
+            let a_doc = a.ends_with("doc.go");
+            let b_doc = b.ends_with("doc.go");
+            a_doc.cmp(&b_doc).then_with(|| a.cmp(b))
+        });
+        return hits.into_iter().next();
+    }
+    None
+}
+
 fn python_import_root_prefix(prefix: &str) -> bool {
     if prefix.is_empty() || prefix.contains('.') {
         return false;
     }
     !matches!(prefix, "test" | "tests" | "testing" | "__pycache__")
+}
+
+fn is_python_stdlib_module(module: &str) -> bool {
+    matches!(
+        module,
+        "abc"
+            | "argparse"
+            | "ast"
+            | "asyncio"
+            | "base64"
+            | "collections"
+            | "contextlib"
+            | "copy"
+            | "dataclasses"
+            | "datetime"
+            | "enum"
+            | "functools"
+            | "glob"
+            | "hashlib"
+            | "importlib"
+            | "inspect"
+            | "io"
+            | "itertools"
+            | "json"
+            | "logging"
+            | "math"
+            | "os"
+            | "pathlib"
+            | "pickle"
+            | "pkgutil"
+            | "platform"
+            | "re"
+            | "shutil"
+            | "signal"
+            | "socket"
+            | "string"
+            | "subprocess"
+            | "sys"
+            | "tempfile"
+            | "textwrap"
+            | "threading"
+            | "time"
+            | "traceback"
+            | "types"
+            | "typing"
+            | "unittest"
+            | "uuid"
+            | "warnings"
+            | "weakref"
+    ) || module.starts_with("collections.")
+        || module.starts_with("importlib.")
+        || module.starts_with("os.")
+        || module.starts_with("typing.")
 }
 
 /// Absolute `import flask` matches `flask` or `src.flask`, not
@@ -302,6 +384,12 @@ fn python_absolute_module(module: &str, mod_map: &HashMap<String, String>) -> Op
     let module = module.trim();
     if module.is_empty() || module.starts_with('.') {
         return None;
+    }
+    if is_python_stdlib_module(module) {
+        return None;
+    }
+    if let Some(p) = mod_map.get(module) {
+        return Some(p.clone());
     }
     let suffix = format!(".{module}");
     let mut hits: Vec<String> = mod_map
@@ -580,7 +668,10 @@ pub(crate) fn resolve_module_path_at(
         if let Some(p) = mod_map.get(raw) {
             return Some(p.clone());
         }
-        return mod_map.get(&raw.replace('/', ".")).cloned();
+        if let Some(p) = mod_map.get(&raw.replace('/', ".")) {
+            return Some(p.clone());
+        }
+        return unique_go_package(raw, mod_map);
     }
     // Normalize Rust `::` separators to `.` (indexers may emit either).
     let normalized = raw.replace("::", ".");
@@ -650,6 +741,21 @@ pub(crate) fn resolve_module_path_at(
     None
 }
 
+/// Local identifier for a module-only import (`import cobra`, `var app = require('./app')`).
+pub(crate) fn module_only_local_name(imp: &ParsedImport) -> String {
+    if let Some((_, local)) = imp.names.first() {
+        if !local.is_empty() {
+            return local.clone();
+        }
+    }
+    imp.module
+        .rsplit(['.', '/', ':'])
+        .next()
+        .unwrap_or(&imp.module)
+        .trim_start_matches('.')
+        .to_string()
+}
+
 pub(crate) fn build_import_bindings(
     imports: &[ParsedImport],
     mod_map: &HashMap<String, String>,
@@ -659,7 +765,7 @@ pub(crate) fn build_import_bindings(
     for imp in imports {
         let tp = resolve_module_path_at(&imp.module, Some(from_path), mod_map).or_else(|| {
             if imp.style == ImportStyle::Names && imp.names.len() == 1 {
-                let fq = format!("{}.{}", imp.module, imp.names[0]);
+                let fq = format!("{}.{}", imp.module, imp.names[0].0);
                 unique_module_candidate(&fq, mod_map)
             } else {
                 None
@@ -670,18 +776,18 @@ pub(crate) fn build_import_bindings(
         };
         match imp.style {
             ImportStyle::Names => {
-                for name in &imp.names {
+                for (remote, local) in &imp.names {
                     out.insert(
-                        name.clone(),
+                        local.clone(),
                         ImportBinding {
                             file_path: tp.clone(),
-                            remote_name: name.clone(),
+                            remote_name: remote.clone(),
                         },
                     );
                 }
             }
             ImportStyle::ModuleOnly => {
-                let local = imp.module.rsplit('.').next().unwrap_or(&imp.module).to_string();
+                let local = module_only_local_name(imp);
                 out.insert(
                     local.clone(),
                     ImportBinding {
@@ -1071,7 +1177,9 @@ pub(crate) fn resolve_symbol_in_module(
 pub(crate) fn callee_in_import_scope(imp: &ParsedImport, callee_simple: &str) -> bool {
     match imp.style {
         ImportStyle::Star => true,
-        ImportStyle::Names => imp.names.iter().any(|n| n == callee_simple),
+        ImportStyle::Names => imp.names.iter().any(|(remote, local)| {
+            remote == callee_simple || local == callee_simple
+        }),
         ImportStyle::ModuleOnly => false,
     }
 }
@@ -1559,7 +1667,7 @@ pub(crate) fn attach_import_and_call_edges(
     for imp in &index.imports {
         let Some(tp) = resolve_module_path_at(&imp.module, Some(path), mod_map).or_else(|| {
             if imp.style == ImportStyle::Names && imp.names.len() == 1 {
-                let fq = format!("{}.{}", imp.module, imp.names[0]);
+                let fq = format!("{}.{}", imp.module, imp.names[0].0);
                 unique_module_candidate(&fq, mod_map)
             } else {
                 None
@@ -1583,16 +1691,20 @@ pub(crate) fn attach_import_and_call_edges(
                 ));
             }
             ImportStyle::Names => {
-                for name in &imp.names {
+                for (remote, local) in &imp.names {
                     // A missing symbol is not the module's file hub. Falling back
                     // stored a poisoned Imports edge whenever module resolution
                     // picked the wrong `graph.rs`.
                     let Some(tiid) =
-                        resolve_symbol_in_module(&tp, name, branch, graph, batch_indexes)
+                        resolve_symbol_in_module(&tp, remote, branch, graph, batch_indexes)
                     else {
                         continue;
                     };
-                    let label = format!("{}:{}", imp.module, name);
+                    let label = if remote == local {
+                        format!("{}:{}", imp.module, remote)
+                    } else {
+                        format!("{}:{} as {}", imp.module, remote, local)
+                    };
                     edge_map.entry(file_hub_rid).or_default().push(import_edge(
                         file_hub_rid,
                         tiid,
@@ -1954,7 +2066,7 @@ mod tests {
         index.imports.push(ParsedImport {
             module: "crate.graph".into(),
             style: ImportStyle::Names,
-            names: vec!["InMemoryGraph".into(), "RevisionStatus".into()],
+            names: ParsedImport::named(["InMemoryGraph", "RevisionStatus"]),
             span: span(),
         });
         let mut wrong_idx = FileIndex::default();
@@ -1989,7 +2101,7 @@ mod tests {
         let imports = vec![ParsedImport {
             module: "helpers".to_string(),
             style: ImportStyle::Names,
-            names: vec!["run".to_string()],
+            names: ParsedImport::named(["run"]),
             span: span(),
         }];
         let bindings = build_import_bindings(&imports, &mod_map, "main.py");
@@ -2018,7 +2130,7 @@ mod tests {
         caller_idx.imports.push(ParsedImport {
             module: "helpers".to_string(),
             style: ImportStyle::Names,
-            names: vec!["run".to_string()],
+            names: ParsedImport::named(["run"]),
             span: span(),
         });
         caller_idx.calls.push(ParsedCall {
@@ -2074,7 +2186,7 @@ mod tests {
         caller_idx.imports.push(ParsedImport {
             module: "crate.coordinator".to_string(),
             style: ImportStyle::Names,
-            names: vec!["WriteCoordinator".to_string()],
+            names: ParsedImport::named(["WriteCoordinator"]),
             span: span(),
         });
         caller_idx.symbols.push(ParsedSymbol {
@@ -2306,7 +2418,7 @@ mod tests {
         index_a.imports.push(ParsedImport {
             module: "helpers".into(),
             style: ImportStyle::Names,
-            names: vec!["helper".into()],
+            names: ParsedImport::named(["helper"]),
             span: SourceSpan {
                 start_line: 1,
                 start_col: 1,
@@ -2367,7 +2479,7 @@ mod tests {
         index.imports.push(ParsedImport {
             module: "helpers".to_string(),
             style: ImportStyle::Names,
-            names: vec!["helper".to_string()],
+            names: ParsedImport::named(["helper"]),
             span: span(),
         });
         let mut helpers = FileIndex::default();
@@ -2576,7 +2688,7 @@ mod tests {
         caller_idx.imports.push(ParsedImport {
             module: "crate.graph".to_string(),
             style: ImportStyle::Names,
-            names: vec!["InMemoryGraph".to_string()],
+            names: ParsedImport::named(["InMemoryGraph"]),
             span: span(),
         });
         caller_idx
@@ -2680,7 +2792,7 @@ mod tests {
         let imports = vec![ParsedImport {
             module: "com.google.gson".into(),
             style: ImportStyle::Names,
-            names: vec!["Gson".into()],
+            names: ParsedImport::named(["Gson"]),
             span: span(),
         }];
         let bindings = build_import_bindings(&imports, &mod_map, "src/Main.java");
@@ -2781,7 +2893,7 @@ mod tests {
         caller_idx.imports.push(ParsedImport {
             module: "crate.log".into(),
             style: ImportStyle::Names,
-            names: vec!["MutationLog".into()],
+            names: ParsedImport::named(["MutationLog"]),
             span: span(),
         });
         caller_idx.calls.push(ParsedCall {
@@ -2834,7 +2946,7 @@ mod tests {
         caller_idx.imports.push(ParsedImport {
             module: "crate.security".into(),
             style: ImportStyle::Names,
-            names: vec!["verify_audit_chain".into()],
+            names: ParsedImport::named(["verify_audit_chain"]),
             span: span(),
         });
         caller_idx.calls.push(ParsedCall {
@@ -2946,7 +3058,7 @@ mod tests {
         caller_idx.imports.push(ParsedImport {
             module: "crate.graph".into(),
             style: ImportStyle::Names,
-            names: vec!["InMemoryGraph".into()],
+            names: ParsedImport::named(["InMemoryGraph"]),
             span: span(),
         });
         caller_idx.calls.push(ParsedCall {
@@ -3027,5 +3139,31 @@ mod tests {
         assert_eq!(app.as_deref(), Some("lib/application.js"));
         let fs = resolve_module_path_at("fs", Some("lib/express.js"), &mod_map);
         assert!(fs.is_none(), "bare require must not suffix-match, got {fs:?}");
+    }
+
+    #[test]
+    fn go_import_path_resolves_to_in_tree_package_file() {
+        let mut mod_map = HashMap::new();
+        mod_map.insert("command".into(), "command.go".into());
+        mod_map.insert("cobra".into(), "cobra.go".into());
+        let cobra = resolve_module_path_at(
+            "github.com/spf13/cobra",
+            Some("command.go"),
+            &mod_map,
+        );
+        assert!(cobra.is_none(), "module path without in-tree prefix stays unresolved, got {cobra:?}");
+        mod_map.insert("github.com.spf13.cobra.command".into(), "github.com/spf13/cobra/command.go".into());
+        let hit = resolve_module_path_at(
+            "github.com/spf13/cobra",
+            Some("doc.go"),
+            &mod_map,
+        );
+        assert_eq!(
+            hit.as_deref(),
+            Some("github.com/spf13/cobra/command.go"),
+            "in-tree package should resolve, got {hit:?}"
+        );
+        let fmt = resolve_module_path_at("fmt", Some("command.go"), &mod_map);
+        assert!(fmt.is_none(), "stdlib fmt must stay unresolved, got {fmt:?}");
     }
 }

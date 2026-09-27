@@ -74,16 +74,13 @@ fn extract_imports_ts_regex(content: &str) -> Vec<ParsedImport> {
         let (style, names) = if !names_part.is_empty() {
             (
                 ImportStyle::Names,
-                names_part
-                    .split(',')
-                    .filter_map(|p| {
-                        let n = p.trim().split(':').next()?.trim();
-                        if n.is_empty() { None } else { Some(n.to_string()) }
-                    })
-                    .collect(),
+                ParsedImport::named(names_part.split(',').filter_map(|p| {
+                    let n = p.trim().split(':').next()?.trim();
+                    if n.is_empty() { None } else { Some(n.to_string()) }
+                })),
             )
         } else if let Some(d) = default_name {
-            (ImportStyle::Names, vec![d.to_string()])
+            (ImportStyle::Names, ParsedImport::named([d.to_string()]))
         } else {
             (ImportStyle::ModuleOnly, vec![])
         };
@@ -334,6 +331,8 @@ fn index_typescript_file_tree_sitter(
             let Some(child) = root.named_child(i) else { continue };
             if child.kind() == "import_statement" {
                 extract_single_import(child, src, &mut imports);
+            } else if child.kind() == "export_statement" {
+                extract_reexport(child, src, &mut imports);
             }
         }
         imports
@@ -360,7 +359,8 @@ fn index_typescript_file_tree_sitter(
                         let Some(inner) = child.named_child(j) else { continue };
                         match inner.kind() {
                             "identifier" => {
-                                names.push(node_text(inner, src).to_string());
+                                let n = node_text(inner, src).to_string();
+                                names.push((n.clone(), n));
                                 style = ImportStyle::Names;
                             }
                             "named_imports" => {
@@ -369,9 +369,6 @@ fn index_typescript_file_tree_sitter(
                             }
                             "namespace_import" => {
                                 style = ImportStyle::Star;
-                                if let Some(alias) = inner.child_by_field_name("name") {
-                                    names.push(node_text(alias, src).to_string());
-                                }
                             }
                             _ => {}
                         }
@@ -382,7 +379,8 @@ fn index_typescript_file_tree_sitter(
                     style = ImportStyle::Names;
                 }
                 "identifier" => {
-                    names.push(node_text(child, src).to_string());
+                    let n = node_text(child, src).to_string();
+                    names.push((n.clone(), n));
                     style = ImportStyle::Names;
                 }
                 "namespace_import" => {
@@ -400,17 +398,73 @@ fn index_typescript_file_tree_sitter(
         });
     }
 
-    fn collect_named_imports(node: Node, src: &str, names: &mut Vec<String>) {
+    fn extract_reexport(node: Node, src: &str, imports: &mut Vec<ParsedImport>) {
+        let Some(source_node) = node.child_by_field_name("source") else {
+            return;
+        };
+        let source = node_text(source_node, src)
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+        if source.is_empty() {
+            return;
+        }
+        let mut names = Vec::new();
+        let mut style = ImportStyle::Star;
+        let nc = node.named_child_count();
+        for i in 0..nc {
+            let Some(child) = node.named_child(i) else { continue };
+            if child.kind() == "export_clause" {
+                collect_export_names(child, src, &mut names);
+                style = if names.is_empty() {
+                    ImportStyle::Star
+                } else {
+                    ImportStyle::Names
+                };
+            }
+        }
+        imports.push(ParsedImport {
+            module: source,
+            style,
+            names,
+            span: span_from_tree_sitter_node(node),
+        });
+    }
+
+    fn collect_export_names(node: Node, src: &str, names: &mut Vec<(String, String)>) {
+        let count = node.named_child_count();
+        for i in 0..count {
+            let Some(spec) = node.named_child(i) else { continue };
+            if spec.kind() != "export_specifier" {
+                continue;
+            }
+            let remote = spec
+                .child_by_field_name("name")
+                .map(|n| node_text(n, src).to_string())
+                .filter(|s| !s.is_empty());
+            let Some(remote) = remote else { continue };
+            let local = spec
+                .child_by_field_name("alias")
+                .map(|n| node_text(n, src).to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| remote.clone());
+            names.push((remote, local));
+        }
+    }
+
+    fn collect_named_imports(node: Node, src: &str, names: &mut Vec<(String, String)>) {
         let count = node.named_child_count();
         for i in 0..count {
             let Some(spec) = node.named_child(i) else { continue };
             if spec.kind() == "import_specifier" {
+                let remote = spec.child_by_field_name("name")
+                    .map(|n| node_text(n, src).to_string());
                 let local = spec.child_by_field_name("alias")
                     .or_else(|| spec.child_by_field_name("name"))
                     .map(|n| node_text(n, src).to_string());
-                if let Some(n) = local {
-                    if !n.is_empty() {
-                        names.push(n);
+                if let (Some(remote), Some(local)) = (remote, local) {
+                    if !remote.is_empty() && !local.is_empty() {
+                        names.push((remote, local));
                     }
                 }
             }

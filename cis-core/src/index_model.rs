@@ -330,9 +330,22 @@ pub(crate) enum ImportStyle {
 pub(crate) struct ParsedImport {
     pub(crate) module: String,
     pub(crate) style: ImportStyle,
-    /// Set when `style == Names` (simple names only).
-    pub(crate) names: Vec<String>,
+    /// Set when `style == Names`. Each pair is `(remote_name, local_name)`.
+    /// `from m import Blueprint as SansioBlueprint` is `("Blueprint", "SansioBlueprint")`.
+    pub(crate) names: Vec<(String, String)>,
     pub(crate) span: SourceSpan,
+}
+
+impl ParsedImport {
+    pub(crate) fn named(names: impl IntoIterator<Item = impl Into<String>>) -> Vec<(String, String)> {
+        names
+            .into_iter()
+            .map(|n| {
+                let s = n.into();
+                (s.clone(), s)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -210,7 +210,7 @@ fn extract_usings(root: Node, src: &str) -> Vec<ParsedImport> {
             imports.push(ParsedImport {
                 module,
                 style: ImportStyle::Star,
-                names: vec![short_name],
+                names: ParsedImport::named([short_name]),
                 span: span_from_tree_sitter_node(child),
             });
         }

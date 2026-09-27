@@ -519,17 +519,12 @@ fn import_name_bindings(
         };
         match imp.style {
             ImportStyle::Names => {
-                for name in &imp.names {
-                    out.insert(name.clone(), (tp.clone(), name.clone()));
+                for (remote, local) in &imp.names {
+                    out.insert(local.clone(), (tp.clone(), remote.clone()));
                 }
             }
             ImportStyle::ModuleOnly => {
-                let local = imp
-                    .module
-                    .rsplit(['.', '/', ':'])
-                    .next()
-                    .unwrap_or(&imp.module)
-                    .to_string();
+                let local = crate::call_resolve::module_only_local_name(imp);
                 out.insert(local.clone(), (tp, local));
             }
             ImportStyle::Star => {}

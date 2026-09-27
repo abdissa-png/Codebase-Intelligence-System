@@ -22,26 +22,27 @@ pub fn path_to_python_module_key(rel_path: &str) -> String {
     trimmed.replace('/', ".")
 }
 
-fn parse_import_names(tail: &str) -> Vec<String> {
+fn parse_import_names(tail: &str) -> Vec<(String, String)> {
     tail.split(',')
         .filter_map(|part| {
             let p = part.trim().trim_matches('(').trim_matches(')');
             if p.is_empty() || p == "*" {
                 return None;
             }
-            let name = p.split(" as ").next()?.trim();
-            if name.is_empty() {
-                None
-            } else {
-                Some(name.to_string())
+            let mut it = p.splitn(2, " as ");
+            let remote = it.next()?.trim();
+            if remote.is_empty() {
+                return None;
             }
+            let local = it.next().map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or(remote);
+            Some((remote.to_string(), local.to_string()))
         })
         .collect()
 }
 
 fn extract_imports_regex(content: &str) -> Vec<ParsedImport> {
     let mut out = Vec::new();
-    let Ok(re_imp) = regex::Regex::new(r"(?m)^import\s+([\w.]+)") else {
+    let Ok(re_imp) = regex::Regex::new(r"(?m)^import\s+([\w.]+)(?:\s+as\s+(\w+))?") else {
         return out;
     };
     // Leading dots are relative (`from .cli import AppGroup`, `from . import typing`).
@@ -53,10 +54,15 @@ fn extract_imports_regex(content: &str) -> Vec<ParsedImport> {
     };
     for cap in re_imp.captures_iter(content) {
         if let (Some(full), Some(m)) = (cap.get(0), cap.get(1)) {
+            let module = m.as_str().to_string();
+            let names = cap
+                .get(2)
+                .map(|alias| vec![(module.clone(), alias.as_str().to_string())])
+                .unwrap_or_default();
             out.push(ParsedImport {
-                module: m.as_str().to_string(),
+                module,
                 style: ImportStyle::ModuleOnly,
-                names: vec![],
+                names,
                 span: span_from_byte_range(content, full.start(), full.end()),
             });
         }
@@ -76,11 +82,11 @@ fn extract_imports_regex(content: &str) -> Vec<ParsedImport> {
                         span,
                     });
                 } else {
-                    for name in parse_import_names(tail) {
+                    for (remote, local) in parse_import_names(tail) {
                         out.push(ParsedImport {
-                            module: format!("{module}{name}"),
+                            module: format!("{module}{remote}"),
                             style: ImportStyle::ModuleOnly,
-                            names: vec![],
+                            names: vec![(remote, local)],
                             span,
                         });
                     }
@@ -713,6 +719,29 @@ fn extract_python_file_index_tree_sitter(path: &str, content: &str) -> Result<Fi
                 }
             }
             _ => {
+                if cls.is_empty() && node.kind() == "expression_statement" {
+                    if let Some(assign) = node.named_child(0) {
+                        if matches!(assign.kind(), "assignment" | "augmented_assignment") {
+                            if let Some(left) = assign.child_by_field_name("left") {
+                                if left.kind() == "identifier" {
+                                    if let Some(name) = left.utf8_text(src.as_bytes()).ok() {
+                                        if !name.is_empty()
+                                            && !idx.symbols.iter().any(|s| s.stable_key == name)
+                                        {
+                                            idx.symbols.push(ParsedSymbol {
+                                                stable_key: name.to_string(),
+                                                disambiguator: String::new(),
+                                                qualified_name: format!("{path}::{name}"),
+                                                kind: NodeKind::Function,
+                                                span: span_from_tree_sitter_node(assign),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut i = 0usize;
                 while let Some(c) = node.named_child(i) {
                     visit(c, src, path, cls, idx);
@@ -848,10 +877,28 @@ import typing as t
 import flask
 ";
         let imports = extract_imports_regex(src);
-        assert!(imports.iter().any(|i| i.module == ".cli" && i.names == ["AppGroup"]));
-        assert!(imports.iter().any(|i| i.module == ".sansio.blueprints" && i.names == ["Blueprint"]));
+        assert!(imports.iter().any(|i| i.module == ".cli" && i.names == [("AppGroup".into(), "AppGroup".into())]));
+        assert!(imports.iter().any(|i| {
+            i.module == ".sansio.blueprints"
+                && i.names == [("Blueprint".into(), "SansioBlueprint".into())]
+        }));
         assert!(imports.iter().any(|i| i.module == ".typing" && i.style == ImportStyle::ModuleOnly));
-        assert!(imports.iter().any(|i| i.module == "typing" && i.style == ImportStyle::ModuleOnly));
+        assert!(imports.iter().any(|i| {
+            i.module == "typing"
+                && i.style == ImportStyle::ModuleOnly
+                && i.names == [("typing".into(), "t".into())]
+        }));
         assert!(imports.iter().any(|i| i.module == "flask"));
+    }
+
+    #[test]
+    fn indexes_module_level_assignment() {
+        let src = "current_app = LocalProxy(lambda: _lookup())\n";
+        let idx = index_python_file("src/flask/globals.py", src).unwrap();
+        assert!(
+            idx.symbols.iter().any(|s| s.stable_key == "current_app"),
+            "{:?}",
+            idx.symbols.iter().map(|s| s.stable_key.as_str()).collect::<Vec<_>>()
+        );
     }
 }

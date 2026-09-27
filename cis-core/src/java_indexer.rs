@@ -214,7 +214,7 @@ fn extract_imports(root: Node, src: &str) -> Vec<ParsedImport> {
                 } else {
                     (module_text.clone(), module_text.clone())
                 };
-                (ImportStyle::Names, vec![name], module)
+                (ImportStyle::Names, ParsedImport::named([name]), module)
             };
             imports.push(ParsedImport {
                 module,

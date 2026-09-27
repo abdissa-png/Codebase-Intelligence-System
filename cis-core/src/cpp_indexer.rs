@@ -281,7 +281,7 @@ fn extract_includes(root: Node, src: &str) -> Vec<ParsedImport> {
                 imports.push(ParsedImport {
                     module,
                     style: ImportStyle::Star,
-                    names: vec![header_name],
+                    names: ParsedImport::named([header_name]),
                     span: span_from_tree_sitter_node(child),
                 });
             }

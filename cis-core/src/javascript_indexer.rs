@@ -220,8 +220,10 @@ fn extract_imports(root: Node, src: &str) -> Vec<ParsedImport> {
     let count = root.named_child_count();
     for i in 0..count {
         let Some(child) = root.named_child(i) else { continue };
-        if child.kind() == "import_statement" {
-            extract_single_import(child, src, &mut imports);
+        match child.kind() {
+            "import_statement" => extract_single_import(child, src, &mut imports),
+            "export_statement" => extract_reexport(child, src, &mut imports),
+            _ => {}
         }
     }
     imports
@@ -248,7 +250,8 @@ fn extract_single_import(node: Node, src: &str, imports: &mut Vec<ParsedImport>)
                     let Some(inner) = child.named_child(j) else { continue };
                     match inner.kind() {
                         "identifier" => {
-                            names.push(node_text(inner, src).to_string());
+                            let n = node_text(inner, src).to_string();
+                            names.push((n.clone(), n));
                             style = ImportStyle::Names;
                         }
                         "named_imports" => {
@@ -257,9 +260,6 @@ fn extract_single_import(node: Node, src: &str, imports: &mut Vec<ParsedImport>)
                         }
                         "namespace_import" => {
                             style = ImportStyle::Star;
-                            if let Some(alias) = inner.child_by_field_name("name") {
-                                names.push(node_text(alias, src).to_string());
-                            }
                         }
                         _ => {}
                     }
@@ -270,7 +270,8 @@ fn extract_single_import(node: Node, src: &str, imports: &mut Vec<ParsedImport>)
                 style = ImportStyle::Names;
             }
             "identifier" => {
-                names.push(node_text(child, src).to_string());
+                let n = node_text(child, src).to_string();
+                names.push((n.clone(), n));
                 style = ImportStyle::Names;
             }
             "namespace_import" => {
@@ -288,29 +289,83 @@ fn extract_single_import(node: Node, src: &str, imports: &mut Vec<ParsedImport>)
     });
 }
 
+fn extract_reexport(node: Node, src: &str, imports: &mut Vec<ParsedImport>) {
+    let Some(source_node) = node.child_by_field_name("source") else {
+        return;
+    };
+    let source = node_text(source_node, src)
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_string();
+    if source.is_empty() {
+        return;
+    }
+    let mut names = Vec::new();
+    let mut style = ImportStyle::Star;
+    let nc = node.named_child_count();
+    for i in 0..nc {
+        let Some(child) = node.named_child(i) else { continue };
+        if child.kind() == "export_clause" {
+            collect_export_names(child, src, &mut names);
+            style = if names.is_empty() {
+                ImportStyle::Star
+            } else {
+                ImportStyle::Names
+            };
+        }
+    }
+    imports.push(ParsedImport {
+        module: source,
+        style,
+        names,
+        span: span_from_tree_sitter_node(node),
+    });
+}
+
+fn collect_export_names(node: Node, src: &str, names: &mut Vec<(String, String)>) {
+    let count = node.named_child_count();
+    for i in 0..count {
+        let Some(spec) = node.named_child(i) else { continue };
+        if spec.kind() != "export_specifier" {
+            continue;
+        }
+        let remote = spec
+            .child_by_field_name("name")
+            .map(|n| node_text(n, src).to_string())
+            .filter(|s| !s.is_empty());
+        let Some(remote) = remote else { continue };
+        let local = spec
+            .child_by_field_name("alias")
+            .map(|n| node_text(n, src).to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| remote.clone());
+        names.push((remote, local));
+    }
+}
+
 fn collect_require_imports(node: Node, src: &str, imports: &mut Vec<ParsedImport>) {
-    if node.kind() == "call_expression" {
-        if let Some(func) = node.child_by_field_name("function") {
-            if node_text(func, src) == "require" {
-                if let Some(args) = node.child_by_field_name("arguments") {
-                    let mut i = 0;
-                    while let Some(arg) = args.named_child(i) {
-                        if arg.kind() == "string" {
-                            let module = node_text(arg, src)
-                                .trim_matches(|c| c == '\'' || c == '"' || c == '`')
-                                .to_string();
-                            if !module.is_empty() {
-                                imports.push(ParsedImport {
-                                    module,
-                                    style: ImportStyle::ModuleOnly,
-                                    names: vec![],
-                                    span: span_from_tree_sitter_node(node),
-                                });
-                            }
-                            break;
-                        }
-                        i += 1;
-                    }
+    if node.kind() == "variable_declarator" {
+        if let Some((module, names, style, span_node)) = require_from_declarator(node, src) {
+            imports.push(ParsedImport {
+                module,
+                style,
+                names,
+                span: span_from_tree_sitter_node(span_node),
+            });
+        }
+    } else if node.kind() == "call_expression" {
+        if require_module_from_call(node, src).is_some() {
+            // Handled via the enclosing variable_declarator when present.
+            if node.parent().map(|p| p.kind()) != Some("variable_declarator")
+                && node.parent().and_then(|p| p.parent()).map(|p| p.kind()) != Some("variable_declarator")
+            {
+                if let Some(module) = require_module_from_call(node, src) {
+                    imports.push(ParsedImport {
+                        module,
+                        style: ImportStyle::ModuleOnly,
+                        names: vec![],
+                        span: span_from_tree_sitter_node(node),
+                    });
                 }
             }
         }
@@ -322,7 +377,96 @@ fn collect_require_imports(node: Node, src: &str, imports: &mut Vec<ParsedImport
     }
 }
 
-/// `exports.normalizeType = function () {}` and `module.exports.foo = function () {}`.
+fn require_module_from_call(node: Node, src: &str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    if node_text(func, src) != "require" {
+        return None;
+    }
+    let args = node.child_by_field_name("arguments")?;
+    let mut i = 0;
+    while let Some(arg) = args.named_child(i) {
+        if arg.kind() == "string" {
+            let module = node_text(arg, src)
+                .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                .to_string();
+            if !module.is_empty() {
+                return Some(module);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn require_from_declarator<'a>(node: Node<'a>, src: &str) -> Option<(String, Vec<(String, String)>, ImportStyle, Node<'a>)> {
+    let value = node.child_by_field_name("value")?;
+    let call = if value.kind() == "call_expression" {
+        value
+    } else {
+        return None;
+    };
+    let module = require_module_from_call(call, src)?;
+    let name = node.child_by_field_name("name")?;
+    match name.kind() {
+        "object_pattern" => {
+            let mut names = Vec::new();
+            collect_object_pattern_names(name, src, &mut names);
+            let style = if names.is_empty() {
+                ImportStyle::ModuleOnly
+            } else {
+                ImportStyle::Names
+            };
+            Some((module, names, style, call))
+        }
+        _ => {
+            let local = node_text(name, src).trim().to_string();
+            let names = if local.is_empty() {
+                vec![]
+            } else {
+                vec![(local.clone(), local)]
+            };
+            Some((module, names, ImportStyle::ModuleOnly, call))
+        }
+    }
+}
+
+fn collect_object_pattern_names(node: Node, src: &str, names: &mut Vec<(String, String)>) {
+    let count = node.named_child_count();
+    for i in 0..count {
+        let Some(child) = node.named_child(i) else { continue };
+        match child.kind() {
+            "shorthand_property_identifier_pattern" | "shorthand_property_identifier" => {
+                let n = node_text(child, src).to_string();
+                if !n.is_empty() {
+                    names.push((n.clone(), n));
+                }
+            }
+            "pair_pattern" | "object_assignment_pattern" => {
+                let remote = child
+                    .child_by_field_name("key")
+                    .or_else(|| child.named_child(0))
+                    .map(|n| node_text(n, src).to_string())
+                    .filter(|s| !s.is_empty());
+                let local = child
+                    .child_by_field_name("value")
+                    .or_else(|| child.named_child(1))
+                    .map(|n| node_text(n, src).to_string())
+                    .filter(|s| !s.is_empty());
+                if let Some(remote) = remote {
+                    let local = local.unwrap_or_else(|| remote.clone());
+                    names.push((remote, local));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `exports.normalizeType = function () {}`, `module.exports.foo = function () {}`,
+/// and `application.prototype.listen = function () {}`.
 fn exported_function_assignment<'a>(node: Node<'a>, src: &str) -> Option<(String, Node<'a>)> {
     if node.kind() != "assignment_expression" {
         return None;
@@ -348,10 +492,30 @@ fn exported_function_assignment<'a>(node: Node<'a>, src: &str) -> Option<(String
     if obj_text == "exports" || obj_text == "module.exports" {
         return Some((prop_name, right));
     }
+    if let Some(class_name) = prototype_owner(obj, src) {
+        return Some((format!("{class_name}.{prop_name}"), right));
+    }
     None
 }
 
-fn collect_named_imports(node: Node, src: &str, names: &mut Vec<String>) {
+fn prototype_owner(obj: Node, src: &str) -> Option<String> {
+    if obj.kind() != "member_expression" {
+        return None;
+    }
+    let prop = obj.child_by_field_name("property")?;
+    if node_text(prop, src) != "prototype" {
+        return None;
+    }
+    let owner = obj.child_by_field_name("object")?;
+    let name = node_text(owner, src).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn collect_named_imports(node: Node, src: &str, names: &mut Vec<(String, String)>) {
     let count = node.named_child_count();
     for i in 0..count {
         let Some(spec) = node.named_child(i) else { continue };
@@ -359,9 +523,11 @@ fn collect_named_imports(node: Node, src: &str, names: &mut Vec<String>) {
             let local = spec.child_by_field_name("alias")
                 .or_else(|| spec.child_by_field_name("name"))
                 .map(|n| node_text(n, src).to_string());
-            if let Some(n) = local {
-                if !n.is_empty() {
-                    names.push(n);
+            let remote = spec.child_by_field_name("name")
+                .map(|n| node_text(n, src).to_string());
+            if let (Some(remote), Some(local)) = (remote, local) {
+                if !remote.is_empty() && !local.is_empty() {
+                    names.push((remote, local));
                 }
             }
         }
@@ -784,8 +950,46 @@ exports.setCharset = function setCharset(type, charset) { return type; };
         let modules: Vec<_> = idx.imports.iter().map(|i| i.module.as_str()).collect();
         assert!(modules.contains(&"./application"), "{modules:?}");
         assert!(modules.contains(&"./utils"), "{modules:?}");
+        assert!(idx.imports.iter().any(|i| {
+            i.module == "./application"
+                && i.style == ImportStyle::ModuleOnly
+                && i.names == [("application".into(), "application".into())]
+        }));
         assert!(idx.symbols.iter().any(|s| s.stable_key == "normalizeType"));
         assert!(idx.symbols.iter().any(|s| s.stable_key == "setCharset"));
         assert!(idx.calls.iter().any(|c| c.callee.leaf_name() == "application"));
+    }
+
+    #[test]
+    fn indexes_prototype_assignment_and_destructured_require() {
+        let src = "\
+const { normalizeType } = require('./utils');
+app.prototype.listen = function listen() { return this; };
+";
+        let idx = index_javascript_file("lib/application.js", src).unwrap();
+        assert!(
+            idx.imports.iter().any(|i| {
+                i.module == "./utils"
+                    && i.style == ImportStyle::Names
+                    && i.names == [("normalizeType".into(), "normalizeType".into())]
+            }),
+            "{:?}",
+            idx.imports
+        );
+        assert!(
+            idx.symbols.iter().any(|s| s.stable_key == "app.listen"),
+            "{:?}",
+            idx.symbols.iter().map(|s| s.stable_key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn indexes_reexport_from() {
+        let src = "export { Button } from './components/Button.jsx';\nexport { greet } from './utils.js';\n";
+        let idx = index_javascript_file("src/lib/index.js", src).unwrap();
+        let modules: Vec<_> = idx.imports.iter().map(|i| i.module.as_str()).collect();
+        assert!(modules.contains(&"./components/Button.jsx"), "{modules:?}");
+        assert!(modules.contains(&"./utils.js"), "{modules:?}");
+        assert!(idx.imports.iter().any(|i| i.names.iter().any(|(r, _)| r == "Button")));
     }
 }

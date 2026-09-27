@@ -177,7 +177,7 @@ fn extract_single_import(spec: Node, src: &str, imports: &mut Vec<ParsedImport>)
         let pkg = alias.unwrap_or_else(|| {
             module.rsplit('/').next().unwrap_or(&module).to_string()
         });
-        (ImportStyle::Names, vec![pkg])
+        (ImportStyle::ModuleOnly, vec![(pkg.clone(), pkg)])
     };
 
     imports.push(ParsedImport {
@@ -448,10 +448,16 @@ package main
 import (
     "fmt"
     "os"
+    "github.com/spf13/cobra"
 )
 "#;
         let idx = index_go_file("main.go", src).unwrap();
-        assert!(idx.imports.len() >= 2);
+        assert!(idx.imports.len() >= 3);
+        assert!(idx.imports.iter().any(|i| {
+            i.module == "github.com/spf13/cobra"
+                && i.style == ImportStyle::ModuleOnly
+                && i.names == [("cobra".into(), "cobra".into())]
+        }));
     }
 
     #[test]

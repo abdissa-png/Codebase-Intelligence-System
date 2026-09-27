@@ -373,7 +373,7 @@ fn extract_use_tree(node: Node, src: &str, imports: &mut Vec<ParsedImport>) {
         collect_use_names(node, src, &mut names);
         if names.is_empty() {
             if let Some(last) = module.rsplit("::").next() {
-                names.push(last.to_string());
+                names.push((last.to_string(), last.to_string()));
             }
         }
         (ImportStyle::Names, names)
@@ -409,7 +409,7 @@ fn extract_use_path_module(node: Node, src: &str) -> String {
     }
 }
 
-fn collect_use_names(node: Node, src: &str, names: &mut Vec<String>) {
+fn collect_use_names(node: Node, src: &str, names: &mut Vec<(String, String)>) {
     match node.kind() {
         "use_list" | "scoped_use_list" => {
             let count = node.named_child_count();
@@ -420,20 +420,30 @@ fn collect_use_names(node: Node, src: &str, names: &mut Vec<String>) {
             }
         }
         "use_as_clause" => {
-            if let Some(alias) = node.child_by_field_name("alias") {
-                names.push(node_text(alias, src).to_string());
-            } else if let Some(path) = node.child_by_field_name("path") {
-                if let Some(name) = path.child_by_field_name("name") {
-                    names.push(node_text(name, src).to_string());
-                }
+            let remote = node
+                .child_by_field_name("path")
+                .and_then(|path| path.child_by_field_name("name"))
+                .map(|n| node_text(n, src).to_string())
+                .filter(|s| !s.is_empty());
+            let local = node
+                .child_by_field_name("alias")
+                .map(|n| node_text(n, src).to_string())
+                .filter(|s| !s.is_empty());
+            match (remote, local) {
+                (Some(remote), Some(local)) => names.push((remote, local)),
+                (Some(remote), None) => names.push((remote.clone(), remote)),
+                (None, Some(local)) => names.push((local.clone(), local)),
+                (None, None) => {}
             }
         }
         "identifier" => {
-            names.push(node_text(node, src).to_string());
+            let n = node_text(node, src).to_string();
+            names.push((n.clone(), n));
         }
         "scoped_identifier" => {
             if let Some(name) = node.child_by_field_name("name") {
-                names.push(node_text(name, src).to_string());
+                let n = node_text(name, src).to_string();
+                names.push((n.clone(), n));
             }
         }
         _ => {
@@ -872,8 +882,8 @@ impl Display for Foo {
             .iter()
             .find(|i| i.module == "crate.graph")
             .expect("crate::graph import");
-        assert!(crate_graph.names.iter().any(|n| n == "NodeKind"));
-        assert!(crate_graph.names.iter().any(|n| n == "Language"));
+        assert!(crate_graph.names.iter().any(|(n, _)| n == "NodeKind"));
+        assert!(crate_graph.names.iter().any(|(n, _)| n == "Language"));
     }
 
     #[test]
